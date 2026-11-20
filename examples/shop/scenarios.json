@@ -1,0 +1,42 @@
+{
+  "baseline": {
+    "tenants": 4,
+    "stock_per_sku": 1000,
+    "balance": 100000,
+    "sku_numbers": [1, 2, 7],
+    "quantities": [1, 2],
+    "reserve_timeout_s": 2.0
+  },
+  "scenarios": [
+    {
+      "name": "baseline",
+      "reason": "Ordinary trading: a central warehouse with ample stock and accounts with ample funds.",
+      "changes": {}
+    },
+    {
+      "name": "limited-stock",
+      "reason": "A small store keeps a dozen units of each item, just above the 10 to 11 units a tenant's orders take.",
+      "changes": {"stock_per_sku": 12}
+    },
+    {
+      "name": "tight-budget",
+      "reason": "Prepaid accounts topped up with about a tenth more than the usual orders cost (2982), not enough for prices a quarter higher.",
+      "changes": {"balance": 3300}
+    },
+    {
+      "name": "strict-timeout",
+      "reason": "A mobile checkout keeps requests short, so orders gives each call to its dependencies 0.3 s.",
+      "changes": {"reserve_timeout_s": 0.3}
+    },
+    {
+      "name": "clearance-sale",
+      "reason": "A clearance sale offers only items whose number ends in 7, which pricing discounts.",
+      "changes": {"sku_numbers": [7, 17, 27]}
+    },
+    {
+      "name": "bulk-orders",
+      "reason": "Wholesale customers order cases of five and ten units, within the gateway's limit of ten.",
+      "changes": {"quantities": [5, 10]}
+    }
+  ]
+}

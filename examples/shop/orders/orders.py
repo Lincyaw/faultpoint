@@ -13,7 +13,7 @@ PRICING_URL: Final = os.environ.get("PRICING_URL", "http://127.0.0.1:8083")
 LEDGER_URL: Final = os.environ.get("LEDGER_URL", "http://127.0.0.1:8084")
 DATABASE: Final = os.environ.get("ORDERS_DATABASE", "orders.db")
 RESERVE_ATTEMPTS: Final = 3
-RESERVE_TIMEOUT_S: Final = 2.0
+RESERVE_TIMEOUT_S: Final = float(os.environ.get("RESERVE_TIMEOUT_S", "2.0"))
 
 
 class OutOfStock(Exception):
