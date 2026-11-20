@@ -47,6 +47,7 @@ type core struct {
 	source     RuleSource
 	sink       ObservationSink
 	context    ContextProvider
+	start      sync.Once
 	started    atomic.Bool
 	state      atomic.Pointer[ruleState]
 	mu         sync.Mutex
@@ -85,9 +86,11 @@ func UseSink(sink ObservationSink) { current.sink = sink }
 // UseContext installs the context provider; a plugin calls it from its init.
 func UseContext(provider ContextProvider) { current.context = provider }
 
-// Start brings the observation sink and the rules into force once every plugin of the build has registered;
-// the rewriter calls it from an init of each main package.
-func Start() {
+// Start brings the observation sink and the rules into force once every plugin of the build has registered; the
+// rewriter calls it from an init of every rewritten package, and only the first call starts.
+func Start() { current.start.Do(start) }
+
+func start() {
 	if !current.enabled {
 		return
 	}

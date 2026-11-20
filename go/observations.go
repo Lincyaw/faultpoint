@@ -44,7 +44,8 @@ type ObservationRecord struct {
 	Exemplars  []string `json:"exemplars"`
 }
 
-// JSONLOptions are the options of the JSON Lines sink, given under "jsonl" in the configuration.
+// JSONLOptions are the options of the JSON Lines sink, given under "jsonl" in the configuration; a flush interval of
+// 0 writes every observation as it comes, for processes such as test binaries that end without a last flush.
 type JSONLOptions struct {
 	FlushSeconds float64 `json:"flush_seconds"`
 	Exemplars    int     `json:"exemplars"`
@@ -66,33 +67,36 @@ type tally struct {
 // JSONLSink counts observations per experiment, point, outcome, scope and rule, and appends the counts of each
 // window to a JSON Lines file.
 type JSONLSink struct {
-	path      string
-	service   string
-	process   string
-	exemplars int
-	mu        sync.Mutex
-	start     time.Time
-	tallies   map[tallyKey]*tally
+	path         string
+	service      string
+	process      string
+	exemplars    int
+	writeThrough bool
+	mu           sync.Mutex
+	start        time.Time
+	tallies      map[tallyKey]*tally
 }
 
 // NewJSONLSink starts a sink that writes to path at the interval its options give.
 func NewJSONLSink(path, service string, options JSONLOptions) (*JSONLSink, error) {
-	if options.FlushSeconds <= 0 || options.Exemplars < 0 {
-		return nil, fmt.Errorf("jsonl flushes after a positive number of seconds and keeps at least 0 exemplars: %+v", options)
+	if options.FlushSeconds < 0 || options.Exemplars < 0 {
+		return nil, fmt.Errorf("jsonl flushes after at least 0 seconds and keeps at least 0 exemplars: %+v", options)
 	}
 	host, err := os.Hostname()
 	if err != nil {
 		return nil, err
 	}
 	sink := &JSONLSink{
-		path: path, service: service, process: fmt.Sprintf("%s:%d", host, os.Getpid()),
-		exemplars: options.Exemplars, start: time.Now(), tallies: map[tallyKey]*tally{},
+		path: path, service: service, process: fmt.Sprintf("%s:%d", host, os.Getpid()), exemplars: options.Exemplars,
+		writeThrough: options.FlushSeconds == 0, start: time.Now(), tallies: map[tallyKey]*tally{},
 	}
-	go func() {
-		for range time.Tick(time.Duration(options.FlushSeconds * float64(time.Second))) {
-			sink.Flush()
-		}
-	}()
+	if !sink.writeThrough {
+		go func() {
+			for range time.Tick(time.Duration(options.FlushSeconds * float64(time.Second))) {
+				sink.Flush()
+			}
+		}()
+	}
 	return sink, nil
 }
 
@@ -101,7 +105,6 @@ func (s *JSONLSink) Add(observation Observation) {
 	key := tallyKey{experiment: observation.Experiment, point: observation.Point, outcome: observation.Outcome,
 		scope: observation.Scope, rule: observation.Rule}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	counted := s.tallies[key]
 	if counted == nil {
 		counted = &tally{}
@@ -111,6 +114,10 @@ func (s *JSONLSink) Add(observation Observation) {
 	counted.total += observation.Total
 	if observation.TraceID != "" && len(counted.exemplars) < s.exemplars {
 		counted.exemplars = append(counted.exemplars, observation.TraceID)
+	}
+	s.mu.Unlock()
+	if s.writeThrough {
+		s.Flush()
 	}
 }
 
