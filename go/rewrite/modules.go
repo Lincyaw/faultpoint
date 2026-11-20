@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"io/fs"
 	"log"
@@ -14,6 +15,12 @@ import (
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 	"golang.org/x/tools/go/packages"
+)
+
+// The shared Redis command table of a faultpoint checkout, and the copy the go-redis plugin embeds, relative to the SDK.
+const (
+	sharedCommandTable   = "../spec/redis-commands.json"
+	embeddedCommandTable = "fpredis/commands.json"
 )
 
 // module is a Go module the rewriter instruments; a point in a module other than the service's own is identified by
@@ -101,6 +108,26 @@ func copyTree(source, target string) error {
 		}
 		return os.WriteFile(destination, content, 0o644)
 	})
+}
+
+// checkCommandTable stops when the SDK is a checkout of the faultpoint repository and its embedded copy of the
+// shared Redis command table differs from the table, as when go generate was not run after the table changed.
+func checkCommandTable(sdk string) {
+	shared, err := os.ReadFile(filepath.Join(sdk, sharedCommandTable))
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	embedded, err := os.ReadFile(filepath.Join(sdk, embeddedCommandTable))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if !bytes.Equal(shared, embedded) {
+		log.Fatalf("%s differs from the shared table %s; run go generate ./fpredis in %s",
+			filepath.Join(sdk, embeddedCommandTable), filepath.Join(sdk, sharedCommandTable), sdk)
+	}
 }
 
 // requireSDK makes a copied module require the SDK from its local path and tidies it, for a copy without go.work.

@@ -174,6 +174,9 @@ func instrument(arguments []string) {
 		libraries = scopedLibraries(graph, config.Placement)
 	}
 	root, targetRoot, sdkRoot := commonDir(modules), absolutePath(*target), absolutePath(*sdk)
+	if slices.Contains(config.Plugins, redisPlugin) {
+		checkCommandTable(sdkRoot)
+	}
 	if _, err := os.Stat(targetRoot); !errors.Is(err, fs.ErrNotExist) {
 		log.Fatalf("the target %s exists; fprewrite writes a fresh copy", targetRoot)
 	}
