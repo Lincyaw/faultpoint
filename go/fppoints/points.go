@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"faultpoint"
+	"faultpoint/fpaction"
 )
 
 var enabled = faultpoint.Register(faultpoint.Plugin{Name: "points", Actions: map[string][]string{
@@ -32,24 +33,6 @@ type injectedError struct{ point string }
 
 func (e *injectedError) Error() string { return "faultpoint: injected error at " + e.point }
 
-// hold performs delay and crash, blocking the goroutine as contention does.
-func hold(rule *faultpoint.Rule) {
-	switch rule.Action.Kind {
-	case "delay":
-		var params struct {
-			MS int `json:"ms"`
-		}
-		rule.DecodeParams(&params)
-		time.Sleep(time.Duration(params.MS) * time.Millisecond)
-	case "crash":
-		params := struct {
-			Code int `json:"code"`
-		}{Code: 1}
-		rule.DecodeParams(&params)
-		faultpoint.Crash(params.Code)
-	}
-}
-
 // Branch is whether a guarded error path runs: its natural condition, or forced by a fail rule.
 func Branch(ctx context.Context, point string, taken bool) bool {
 	if !enabled {
@@ -57,7 +40,7 @@ func Branch(ctx context.Context, point string, taken bool) bool {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		hold(rule)
+		fpaction.Hold(rule)
 		taken = taken || rule.Action.Kind == "fail"
 	}
 	outcome := "not_taken"
@@ -76,7 +59,7 @@ func Failed(ctx context.Context, point string, err *error) bool {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		hold(rule)
+		fpaction.Hold(rule)
 	}
 	if rule != nil && rule.Action.Kind == "fail" {
 		var params struct {
@@ -107,7 +90,7 @@ func Check(ctx context.Context, point string, result bool) bool {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		hold(rule)
+		fpaction.Hold(rule)
 		result = result != (rule.Action.Kind == "negate")
 	}
 	outcome := "false"
@@ -125,7 +108,7 @@ func Loop(ctx context.Context, point string) {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		hold(rule)
+		fpaction.Hold(rule)
 	}
 	faultpoint.Observe(ctx, point, "iteration", 0, rule)
 }
@@ -138,7 +121,7 @@ func Value[T any](ctx context.Context, point string, observed T) T {
 	rule := faultpoint.Decide(ctx, point)
 	result := observed
 	if rule != nil {
-		hold(rule)
+		fpaction.Hold(rule)
 	}
 	if rule != nil && rule.Action.Kind == "set" {
 		var params struct {
@@ -196,7 +179,7 @@ func Clock(ctx context.Context, point string, reading time.Time) time.Time {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		hold(rule)
+		fpaction.Hold(rule)
 	}
 	if rule != nil && rule.Action.Kind == "shift" {
 		var params struct {
@@ -216,7 +199,7 @@ func Acquire(ctx context.Context, point string, acquired bool) bool {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		hold(rule)
+		fpaction.Hold(rule)
 		acquired = acquired && rule.Action.Kind != "fail"
 	}
 	outcome := "rejected"

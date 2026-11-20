@@ -4,41 +4,25 @@ package fpsql
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
-	"encoding/hex"
-	"errors"
 	"io"
-	"net"
-	"os"
 	"slices"
-	"strings"
 	"sync"
-	"syscall"
-	"time"
 
 	"faultpoint"
+	"faultpoint/fpaction"
+	"faultpoint/sqlpoint"
 
-	"github.com/DataDog/go-sqllexer"
 	"github.com/ngrok/sqlmw"
 )
 
-const (
-	instrumentedPrefix = "faultpoint:"
-	errorTimeout       = "timeout"
-	errorRefused       = "refused"
-)
-
-var errInjected = errors.New("faultpoint: injected store failure")
+const instrumentedPrefix = "faultpoint:"
 
 var (
-	enabled      bool
-	readCommands []string
-	obfuscator   = sqllexer.NewObfuscator()
-	normalizer   = sqllexer.NewNormalizer(sqllexer.WithCollectTables(true), sqllexer.WithCollectCommands(true))
-	statements   sync.Map
-	drivers      sync.Mutex
+	enabled    bool
+	classifier *sqlpoint.Classifier
+	drivers    sync.Mutex
 )
 
 func init() {
@@ -49,7 +33,7 @@ func init() {
 		"store_read":  {"fail", "empty", "delay", "crash"},
 		"store_write": {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
 	}})
-	readCommands = options.ReadCommands
+	classifier = sqlpoint.NewClassifier(options.ReadCommands)
 }
 
 // DriverName is the name of a driver whose statements are store points, wrapping the driver registered under
@@ -74,87 +58,15 @@ func DriverName(name string) string {
 	return instrumented
 }
 
-type statement struct {
-	kind    string
-	locator string
-}
-
-// statementPoint is the kind of a statement, read when all its commands are read commands, and its locator: the
-// tables it touches and the hash of its shape with literals removed.
-func statementPoint(query string) statement {
-	if known, found := statements.Load(query); found {
-		return known.(statement)
-	}
-	shape, metadata, err := sqllexer.ObfuscateAndNormalize(query, obfuscator, normalizer)
-	if err != nil {
-		faultpoint.Abort("cannot normalize a statement: %v", err)
-	}
-	kind := "store_read"
-	for _, command := range metadata.Commands {
-		if !slices.ContainsFunc(readCommands, func(read string) bool { return strings.EqualFold(read, command) }) {
-			kind = "store_write"
-		}
-	}
-	if len(metadata.Commands) == 0 {
-		kind = "store_write"
-	}
-	tables := slices.Sorted(slices.Values(metadata.Tables))
-	tableList := strings.Join(tables, "+")
-	if tableList == "" {
-		tableList = "-"
-	}
-	digest := sha256.Sum256([]byte(shape))
-	known := statement{kind: kind, locator: tableList + "#" + hex.EncodeToString(digest[:])[:8]}
-	statements.Store(query, known)
-	return known
-}
-
-// hold performs delay and crash; a delay holds back only the statement it applies to, as a slow store does.
-func hold(rule *faultpoint.Rule) {
-	switch rule.Action.Kind {
-	case "delay":
-		var params struct {
-			MS int `json:"ms"`
-		}
-		rule.DecodeParams(&params)
-		time.Sleep(time.Duration(params.MS) * time.Millisecond)
-	case "crash":
-		params := struct {
-			Code int `json:"code"`
-		}{Code: 1}
-		rule.DecodeParams(&params)
-		faultpoint.Crash(params.Code)
-	}
-}
-
-// failure is the error a fail or fail_after rule gives the caller: the store timed out, refused the connection,
-// or failed.
-func failure(rule *faultpoint.Rule) error {
-	var params struct {
-		Error string `json:"error"`
-	}
-	rule.DecodeParams(&params)
-	switch params.Error {
-	case "":
-		return errInjected
-	case errorTimeout:
-		return context.DeadlineExceeded
-	case errorRefused:
-		return &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
-	}
-	faultpoint.Abort("rule %s: a store fails with %s or %s, not %q", rule.ID, errorTimeout, errorRefused, params.Error)
-	return nil
-}
-
 // begin decides the rule of a statement's point and performs its delay or crash.
 func begin(ctx context.Context, query string) (string, *faultpoint.Rule, string) {
-	known := statementPoint(query)
-	point := faultpoint.PointID(faultpoint.Service(), known.kind, known.locator)
+	known := classifier.Classify(query)
+	point := faultpoint.PointID(faultpoint.Service(), known.Kind, known.Locator)
 	rule := faultpoint.Decide(ctx, point)
 	if rule == nil {
 		return point, nil, ""
 	}
-	hold(rule)
+	fpaction.Hold(rule)
 	return point, rule, rule.Action.Kind
 }
 
@@ -164,7 +76,7 @@ func exec(ctx context.Context, query string, run func() (driver.Result, error)) 
 	var err error
 	switch action {
 	case "fail":
-		err = failure(rule)
+		err = fpaction.Failure(rule)
 	case "drop":
 		result = driver.RowsAffected(1)
 	default:
@@ -174,7 +86,7 @@ func exec(ctx context.Context, query string, run func() (driver.Result, error)) 
 		result, err = run()
 	}
 	if err == nil && action == "fail_after" {
-		err = failure(rule)
+		err = fpaction.Failure(rule)
 	}
 	if err != nil {
 		faultpoint.Observe(ctx, point, "error", 0, rule)
@@ -203,7 +115,7 @@ func read(ctx context.Context, sql string, run func() (driver.Rows, error)) (con
 	var rows driver.Rows
 	var err error
 	if action == "fail" {
-		err = failure(rule)
+		err = fpaction.Failure(rule)
 	} else {
 		rows, err = run()
 	}

@@ -4,12 +4,10 @@ package fphttp
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,6 +15,7 @@ import (
 	"time"
 
 	"faultpoint"
+	"faultpoint/fpaction"
 
 	"github.com/felixge/httpsnoop"
 	"go.opentelemetry.io/otel/propagation"
@@ -25,8 +24,6 @@ import (
 const (
 	defaultFailureStatus     = http.StatusServiceUnavailable
 	defaultIdentifierSegment = `^(\d+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,})$`
-	errorTimeout             = "timeout"
-	errorRefused             = "refused"
 )
 
 var (
@@ -67,24 +64,6 @@ func milliseconds(started time.Time) float64 {
 	return float64(time.Since(started).Microseconds()) / 1000
 }
 
-// hold performs delay and crash; a delay holds back only the request it applies to, as a slow peer does.
-func hold(rule *faultpoint.Rule) {
-	switch rule.Action.Kind {
-	case "delay":
-		var params struct {
-			MS int `json:"ms"`
-		}
-		rule.DecodeParams(&params)
-		time.Sleep(time.Duration(params.MS) * time.Millisecond)
-	case "crash":
-		params := struct {
-			Code int `json:"code"`
-		}{Code: 1}
-		rule.DecodeParams(&params)
-		faultpoint.Crash(params.Code)
-	}
-}
-
 type server struct{ next http.Handler }
 
 // Handler is the rpc_server point of every route of a handler, nil meaning http.DefaultServeMux as for an
@@ -120,7 +99,7 @@ func (s server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}()
 	action := ""
 	if rule != nil {
-		hold(rule)
+		fpaction.Hold(rule)
 		action = rule.Action.Kind
 	}
 	var status int
@@ -158,9 +137,9 @@ func errorOutcome(err error) string {
 	var netError net.Error
 	switch {
 	case errors.As(err, &netError) && netError.Timeout():
-		return errorTimeout
+		return fpaction.Timeout
 	case errors.Is(err, syscall.ECONNREFUSED):
-		return errorRefused
+		return fpaction.Refused
 	}
 	return "error"
 }
@@ -175,21 +154,15 @@ func syntheticResponse(request *http.Request, status int) *http.Response {
 // failure is what a fail or fail_after rule gives the caller instead of the peer's response: a response with its
 // status, or the error of a peer that timed out, the default, or refused the connection.
 func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, error) {
-	var params struct {
+	params := struct {
 		Status int    `json:"status"`
 		Error  string `json:"error"`
-	}
+	}{Error: fpaction.Timeout}
 	rule.DecodeParams(&params)
-	switch {
-	case params.Status != 0:
+	if params.Status != 0 {
 		return syntheticResponse(request, params.Status), nil
-	case params.Error == "" || params.Error == errorTimeout:
-		return nil, context.DeadlineExceeded
-	case params.Error == errorRefused:
-		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
 	}
-	faultpoint.Abort("rule %s: a peer fails with a status, %s or %s, not %q", rule.ID, errorTimeout, errorRefused, params.Error)
-	return nil, nil
+	return nil, fpaction.PeerError(rule, params.Error)
 }
 
 // RoundTrip sends a request under the rule of its point.
@@ -207,7 +180,7 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	started := time.Now()
 	action := ""
 	if rule != nil {
-		hold(rule)
+		fpaction.Hold(rule)
 		action = rule.Action.Kind
 	}
 	if action == "duplicate" && request.Body != nil && request.GetBody == nil {
