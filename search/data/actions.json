@@ -1,0 +1,24 @@
+{
+  "kinds": {
+    "branch": [{"kind": "fail"}, {"kind": "delay", "ms": 500}],
+    "call": [{"kind": "fail"}, {"kind": "delay", "ms": 500}],
+    "check": [{"kind": "negate"}, {"kind": "delay", "ms": 500}],
+    "loop": [{"kind": "delay", "ms": 500}],
+    "rpc_client": [
+      {"kind": "fail", "status": 503},
+      {"kind": "fail", "error": "timeout"},
+      {"kind": "fail_after", "error": "timeout"},
+      {"kind": "duplicate"},
+      {"kind": "delay", "ms": 500}
+    ],
+    "rpc_server": [{"kind": "fail", "status": 503}, {"kind": "fail_after", "status": 503}, {"kind": "delay", "ms": 500}],
+    "store_read": [{"kind": "fail"}, {"kind": "empty"}, {"kind": "delay", "ms": 500}],
+    "store_write": [
+      {"kind": "fail"},
+      {"kind": "fail_after"},
+      {"kind": "drop"},
+      {"kind": "duplicate"},
+      {"kind": "delay", "ms": 500}
+    ]
+  }
+}
