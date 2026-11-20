@@ -3,6 +3,8 @@ import sqlite3
 from typing import Final
 
 import httpx
+import redis
+import redis.asyncio
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -14,6 +16,10 @@ LEDGER_URL: Final = os.environ.get("LEDGER_URL", "http://127.0.0.1:8084")
 DATABASE: Final = os.environ.get("ORDERS_DATABASE", "orders.db")
 RESERVE_ATTEMPTS: Final = 3
 RESERVE_TIMEOUT_S: Final = float(os.environ.get("RESERVE_TIMEOUT_S", "2.0"))
+REDIS_URL: Final = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+PRICE_CACHE_TTL_S: Final = int(os.environ.get("PRICE_CACHE_TTL_S", "60"))
+CACHE_TIMEOUT_S: Final = 0.25
+"""A cache slower than pricing itself is worth nothing, so orders gives it a quarter of a second."""
 
 
 class OutOfStock(Exception):
@@ -36,6 +42,8 @@ def connect() -> sqlite3.Connection:
 
 DB: Final = connect()
 CLIENT: Final = httpx.AsyncClient(timeout=RESERVE_TIMEOUT_S)
+CACHE: Final = redis.asyncio.Redis.from_url(REDIS_URL, socket_timeout=CACHE_TIMEOUT_S,
+                                            socket_connect_timeout=CACHE_TIMEOUT_S)
 
 
 def retryable(status: int) -> bool:
@@ -58,11 +66,32 @@ async def reserve(sku: str, quantity: int) -> None:
     raise DependencyFailed(f"inventory did not reserve {sku} after {RESERVE_ATTEMPTS} attempts")
 
 
+async def cached_unit(sku: str) -> int | None:
+    """The unit price the cache holds; none on a miss or when the cache fails, since pricing can always answer."""
+    try:
+        cached = await CACHE.get(f"price:{sku}")
+    except redis.RedisError:
+        return None
+    return None if cached is None else int(cached)
+
+
+async def remember_unit(sku: str, unit: int) -> None:
+    try:
+        await CACHE.set(f"price:{sku}", unit, ex=PRICE_CACHE_TTL_S)
+    except redis.RedisError:
+        return
+
+
 async def price(sku: str, quantity: int) -> int:
-    response = await CLIENT.get(f"{PRICING_URL}/price/{sku}")
-    if response.status_code != 200:
-        raise DependencyFailed(f"pricing answered {response.status_code}")
-    return response.json()["unit"] * quantity
+    """The price of an order line, with the unit price from the cache when it holds one."""
+    unit = await cached_unit(sku)
+    if unit is None:
+        response = await CLIENT.get(f"{PRICING_URL}/price/{sku}")
+        if response.status_code != 200:
+            raise DependencyFailed(f"pricing answered {response.status_code}")
+        unit = response.json()["unit"]
+        await remember_unit(sku, unit)
+    return unit * quantity
 
 
 async def charge(tenant: str, amount: int) -> None:

@@ -3,14 +3,13 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"os"
 
-	_ "modernc.org/sqlite"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ErrOutOfStock is returned when a reservation asks for more than is available.
@@ -21,18 +20,18 @@ type reservation struct {
 	Quantity int    `json:"quantity"`
 }
 
-type store struct{ db *sql.DB }
+type store struct{ pool *pgxpool.Pool }
 
 func (s *store) reserve(ctx context.Context, sku string, quantity int) error {
 	var available int
-	err := s.db.QueryRowContext(ctx, "SELECT available FROM stock WHERE sku = ?", sku).Scan(&available)
+	err := s.pool.QueryRow(ctx, "SELECT available FROM stock WHERE sku = $1", sku).Scan(&available)
 	if err != nil {
 		return err
 	}
 	if available < quantity {
 		return ErrOutOfStock
 	}
-	_, err = s.db.ExecContext(ctx, "UPDATE stock SET available = available - ? WHERE sku = ?", quantity, sku)
+	_, err = s.pool.Exec(ctx, "UPDATE stock SET available = available - $1 WHERE sku = $2", quantity, sku)
 	return err
 }
 
@@ -55,12 +54,16 @@ func (s *store) handleReserve(writer http.ResponseWriter, request *http.Request)
 }
 
 func main() {
-	db, err := sql.Open("sqlite", os.Getenv("INVENTORY_DATABASE"))
+	// One connection, so that reservations of the same item never interleave.
+	config, err := pgxpool.ParseConfig(os.Getenv("INVENTORY_DATABASE") + " pool_max_conns=1")
 	if err != nil {
 		log.Fatal(err)
 	}
-	db.SetMaxOpenConns(1)
-	inventory := &store{db: db}
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	inventory := &store{pool: pool}
 	http.HandleFunc("/reserve", inventory.handleReserve)
 	address := ":" + os.Getenv("PORT")
 	log.Printf("inventory listening on %s", address)

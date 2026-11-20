@@ -24,6 +24,8 @@ class Workload(BaseModel):
     """The quantity pattern, cycled over a tenant's checkouts."""
     reserve_timeout_s: float = Field(gt=0)
     """The timeout of the orders service's client, which retries the inventory call."""
+    price_cache_ttl_s: PositiveInt
+    """How long orders keeps a unit price in Redis."""
 
     def tenant_names(self) -> list[str]:
         return list(ascii_lowercase[:self.tenants])

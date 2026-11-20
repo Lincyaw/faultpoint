@@ -5,7 +5,8 @@
     "balance": 100000,
     "sku_numbers": [1, 2, 7],
     "quantities": [1, 2],
-    "reserve_timeout_s": 2.0
+    "reserve_timeout_s": 2.0,
+    "price_cache_ttl_s": 60
   },
   "scenarios": [
     {
@@ -37,6 +38,11 @@
       "name": "bulk-orders",
       "reason": "Wholesale customers order cases of five and ten units, within the gateway's limit of ten.",
       "changes": {"quantities": [5, 10]}
+    },
+    {
+      "name": "fresh-prices",
+      "reason": "While prices are being changed, orders may keep a unit price in its cache for one second only.",
+      "changes": {"price_cache_ttl_s": 1}
     }
   ]
 }
