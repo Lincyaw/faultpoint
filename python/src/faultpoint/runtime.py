@@ -1,143 +1,202 @@
 import atexit
+import functools
 import os
 import random
-import socket
 import sys
 import threading
 import time
 import traceback
 from collections import Counter
-from pathlib import Path
-from typing import Final
+from collections.abc import Callable, Iterable, Mapping
+from importlib.metadata import entry_points
+from typing import Annotated, Final, NoReturn, Union
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from faultpoint.context import current_scope, current_trace_id, scope_matches
-from faultpoint.observations import Tally, append_records
-from faultpoint.rules import Action, Crash, Delay, Rule, RuleSet
+from faultpoint.config import Config, Settings
+from faultpoint.context import ContextProvider, OtelContext
+from faultpoint.observations import (JSONL_OPTIONS, JsonlOptions, JsonlSink, Observation,
+                                     ObservationSink)
+from faultpoint.rules import FileRuleSource, Rule, RuleSet, RuleSource
 
-WATCH_INTERVAL_S: Final = 0.5
-INVALID_RULES_EXIT: Final = 70
+PLUGIN_GROUP: Final = "faultpoint.plugins"
+POLL_INTERVAL_S: Final = 0.5
+STOP_EXIT_CODE: Final = 70
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="FAULTPOINT_")
+def implemented_actions(*models: type[BaseModel]) -> object:
+    """The actions a plugin implements at one kind, a union the models' `kind` fields discriminate."""
+    return Annotated[Union[models], Field(discriminator="kind")]
 
-    service: str = ""
-    rules: Path | None = None
-    report: Path | None = None
-    scope_key: str = "fp.scope"
-    flush_seconds: float = Field(default=2.0, gt=0)
-    seed: int = 0
+
+class Decision(BaseModel):
+    """A rule of this process with the action its plugin parsed from it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    rule: Rule
+    action: BaseModel
+
+
+class RulesInForce:
+    """The rule set a process obeys, its rules by point, and how often each rule matched and injected."""
+
+    def __init__(self, experiment: str, decisions: Iterable[Decision], seed: int) -> None:
+        self.experiment = experiment
+        self.by_point: dict[str, tuple[Decision, ...]] = {}
+        for decision in decisions:
+            self.by_point[decision.rule.point] = (*self.by_point.get(decision.rule.point, ()), decision)
+        self.lock = threading.Lock()
+        self.matches: Counter[str] = Counter()
+        self.injections: Counter[str] = Counter()
+        self.randoms = {decision.rule.id: random.Random(f"{seed}:{decision.rule.id}")
+                        for decisions in self.by_point.values() for decision in decisions}
+
+    def fires(self, rule: Rule) -> bool:
+        """Count a matching execution, and whether the rule's trigger injects at it."""
+        trigger = rule.trigger
+        with self.lock:
+            seen = self.matches[rule.id]
+            self.matches[rule.id] = seen + 1
+            fired = (seen >= trigger.skip
+                     and (trigger.limit is None or self.injections[rule.id] < trigger.limit)
+                     and self.randoms[rule.id].random() < trigger.probability)
+            if fired:
+                self.injections[rule.id] += 1
+        return fired
 
 
 class Runtime:
-    """The rules a process obeys and the observations it has not yet written."""
+    """The kinds this process's plugins serve, the rules it obeys, and where its observations go."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, config: Config, plugins: Mapping[str, "Plugin"]) -> None:
         self.settings = settings
-        self.enabled = settings.rules is not None or settings.report is not None
-        if self.enabled and not settings.service:
-            raise ValueError("FAULTPOINT_SERVICE is required when faultpoint is enabled")
-        self.process = f"{socket.gethostname()}:{os.getpid()}"
-        self.lock = threading.Lock()
-        self.experiment = ""
-        self.rules: dict[str, tuple[Rule, ...]] = {}
-        self.matches: Counter[str] = Counter()
-        self.injections: Counter[str] = Counter()
-        self.randoms: dict[str, random.Random] = {}
-        self.tally = Tally()
-        self.window_start = time.time()
-        self.rules_mtime: float | None = None
-        if settings.rules is not None:
-            self.load_rules(settings.rules)
-        if self.enabled:
-            threading.Thread(target=self.watch, name="faultpoint", daemon=True).start()
-            atexit.register(self.flush)
+        self.config = config
+        self.kinds: dict[str, TypeAdapter[dict[str, BaseModel]]] = {}
+        for name, plugin in plugins.items():
+            for kind, actions in plugin.actions.items():
+                if kind in self.kinds:
+                    raise ValueError(f"plugin {name} serves the kind {kind}, which another plugin serves")
+                self.kinds[kind] = TypeAdapter(dict[str, actions])
+        self.context = provided((plugin.context for plugin in plugins.values()), otel_context)(config)
+        self.sink = provided((plugin.sink for plugin in plugins.values()), jsonl_sink)(settings, config)
+        self.rules = RulesInForce("", (), settings.seed)
 
-    def load_rules(self, path: Path) -> None:
-        mtime = path.stat().st_mtime
-        ruleset = RuleSet.model_validate_json(path.read_bytes())
-        self.flush()
-        by_point: dict[str, list[Rule]] = {}
-        for rule in ruleset.rules:
-            by_point.setdefault(rule.point, []).append(rule)
-        with self.lock:
-            self.experiment = ruleset.experiment
-            self.rules = {point: tuple(rules) for point, rules in by_point.items()}
-            self.matches = Counter()
-            self.injections = Counter()
-            self.randoms = {rule.id: random.Random(f"{self.settings.seed}:{rule.id}")
-                            for rule in ruleset.rules}
-            self.rules_mtime = mtime
+    def load(self, ruleset: RuleSet) -> None:
+        """Obey a rule set once the plugins that serve the kinds of its rules here parse their actions."""
+        applicable = [rule for rule in ruleset.rules
+                      if rule.service == self.settings.service and rule.kind in self.kinds]
+        actions: dict[str, BaseModel] = {}
+        for kind, adapter in self.kinds.items():
+            actions |= adapter.validate_python(
+                {rule.id: rule.action.model_dump() for rule in applicable if rule.kind == kind})
+        if self.sink is not None:
+            self.sink.flush()
+        self.rules = RulesInForce(ruleset.experiment,
+                                  (Decision(rule=rule, action=actions[rule.id]) for rule in applicable),
+                                  self.settings.seed)
 
-    def watch(self) -> None:
-        last_flush = time.monotonic()
-        while True:
-            time.sleep(WATCH_INTERVAL_S)
-            # An unusable rule file ends the process so that no experiment runs under rules it did not ask for.
-            try:
-                rules = self.settings.rules
-                if rules is not None and rules.stat().st_mtime != self.rules_mtime:
-                    self.load_rules(rules)
-                if time.monotonic() - last_flush >= self.settings.flush_seconds:
-                    self.flush()
-                    last_flush = time.monotonic()
-            except Exception:
-                traceback.print_exc()
-                print("faultpoint: stopping the process", file=sys.stderr, flush=True)
-                os._exit(INVALID_RULES_EXIT)
+    def reload(self, source: RuleSource) -> None:
+        ruleset = source.poll()
+        if ruleset is not None:
+            self.load(ruleset)
 
-    def decide(self, point: str) -> Rule | None:
-        """The first rule of a point whose scope matches the current request and whose trigger
-        fires for this execution."""
-        for rule in self.rules.get(point, ()):
-            if not scope_matches(rule.scope):
-                continue
-            with self.lock:
-                seen = self.matches[rule.id]
-                self.matches[rule.id] = seen + 1
-                if seen < rule.trigger.skip:
-                    continue
-                if rule.trigger.limit is not None and self.injections[rule.id] >= rule.trigger.limit:
-                    continue
-                if self.randoms[rule.id].random() >= rule.trigger.probability:
-                    continue
-                self.injections[rule.id] += 1
-            return rule
-        return None
+    def decide(self, point: str) -> Decision | None:
+        """The first rule of a point whose scope matches the current request and whose trigger fires now."""
+        rules = self.rules
+        return next((decision for decision in rules.by_point.get(point, ())
+                     if all(self.context.baggage(key) == value
+                            for key, value in decision.rule.scope.items())
+                     and rules.fires(decision.rule)), None)
 
-    def record(self, point: str, outcome: str, total: float, rule: Rule | None) -> None:
-        if self.settings.report is None:
-            return
-        scope = current_scope(self.settings.scope_key)
-        trace_id = current_trace_id()
-        with self.lock:
-            self.tally.add(point, outcome, scope, None if rule is None else rule.id, total,
-                           trace_id)
+    def observe(self, point: str, outcome: str, quantity: float, decision: Decision | None) -> None:
+        if self.sink is not None:
+            self.sink.add(Observation(
+                experiment=self.rules.experiment, point=point, outcome=outcome,
+                scope=self.context.baggage(self.settings.scope_key) or "",
+                rule=None if decision is None else decision.rule.id, quantity=quantity,
+                trace_id=self.context.trace_id()))
 
-    def hold(self, action: Action) -> None:
-        """Perform the actions every point shares, blocking the current thread."""
-        if isinstance(action, Delay):
-            time.sleep(action.ms / 1000)
-        if isinstance(action, Crash):
-            self.crash(action.code)
-
-    def crash(self, code: int) -> None:
-        self.flush()
+    def crash(self, code: int) -> NoReturn:
+        if self.sink is not None:
+            self.sink.flush()
         os._exit(code)
 
-    def flush(self) -> None:
-        report = self.settings.report
-        if report is None:
-            return
-        end = time.time()
-        with self.lock:
-            records = self.tally.drain(self.experiment, self.settings.service, self.process,
-                                       self.window_start, end)
-            self.window_start = end
-        append_records(report, records)
+
+class Plugin(BaseModel):
+    """The actions a plugin implements per kind, its installation, and the components it replaces."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    actions: dict[str, object] = Field(default_factory=dict)
+    install: Callable[[Runtime], None] | None = None
+    source: Callable[[Settings, Config], RuleSource | None] | None = None
+    sink: Callable[[Settings, Config], ObservationSink | None] | None = None
+    context: Callable[[Config], ContextProvider] | None = None
 
 
-RUNTIME: Final = Runtime(Settings())
+def provided[T](factories: Iterable[T | None], default: T) -> T:
+    """The factory of a component that one plugin provides, or the default when none does."""
+    present = [factory for factory in factories if factory is not None]
+    if len(present) > 1:
+        raise ValueError("two plugins provide the same component")
+    return present[0] if present else default
+
+
+def otel_context(config: Config) -> ContextProvider:
+    return OtelContext()
+
+
+def jsonl_sink(settings: Settings, config: Config) -> ObservationSink | None:
+    return None if settings.report is None else JsonlSink(
+        settings.report, settings.service,
+        JsonlOptions.model_validate(config.options.get(JSONL_OPTIONS, {})))
+
+
+def file_rule_source(settings: Settings, config: Config) -> RuleSource | None:
+    return None if settings.rules is None else FileRuleSource(settings.rules)
+
+
+def stop() -> NoReturn:
+    """End the process, so that no experiment runs without the rules and plugins it asked for."""
+    traceback.print_exc()
+    print("faultpoint: stopping the process", file=sys.stderr, flush=True)
+    os._exit(STOP_EXIT_CODE)
+
+
+def repeat(interval: float, step: Callable[[], None]) -> NoReturn:
+    while True:
+        time.sleep(interval)
+        try:
+            step()
+        except Exception:
+            stop()
+
+
+RUNTIME: Runtime
+"""The runtime of a process in which faultpoint is enabled, which placed points use."""
+
+
+def start() -> None:
+    """Enable faultpoint in this process: load its plugins, obey its rules, then install the plugins."""
+    global RUNTIME
+    try:
+        settings = Settings()
+        config = Config.read(settings.config)
+        available = {point.name: point for point in entry_points(group=PLUGIN_GROUP)}
+        plugins: dict[str, Plugin] = {name: available[name].load() for name in config.plugins}
+        RUNTIME = Runtime(settings, config, plugins)
+        source = provided((plugin.source for plugin in plugins.values()), file_rule_source)(settings, config)
+        if source is not None:
+            RUNTIME.reload(source)
+            threading.Thread(target=repeat, args=(POLL_INTERVAL_S, functools.partial(RUNTIME.reload, source)),
+                             name="faultpoint-rules", daemon=True).start()
+        for plugin in plugins.values():
+            if plugin.install is not None:
+                plugin.install(RUNTIME)
+        if RUNTIME.sink is not None:
+            atexit.register(RUNTIME.sink.flush)
+            threading.Thread(target=repeat, args=(RUNTIME.sink.interval, RUNTIME.sink.flush),
+                             name="faultpoint-observations", daemon=True).start()
+    except Exception:
+        stop()

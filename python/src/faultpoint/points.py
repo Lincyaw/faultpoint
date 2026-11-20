@@ -1,82 +1,115 @@
-from datetime import datetime, timedelta
+import time
+from datetime import date, timedelta
+from enum import StrEnum
+from typing import Any, Final
 
-from faultpoint.rules import Fail, Negate, SetValue, Shift
-from faultpoint.runtime import RUNTIME
+import faultpoint.runtime
+from faultpoint.actions import Crash, Delay, Fail, Negate, SetValue, Shift
+from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
+
+
+class PointKind(StrEnum):
+    """The in-process kinds; placed code calls the function of this module named after the kind."""
+
+    BRANCH = "branch"
+    CHECK = "check"
+    LOOP = "loop"
+    VALUE = "value"
+    CLOCK = "clock"
+    ACQUIRE = "acquire"
+
+
+class PointOutcome(StrEnum):
+    TAKEN = "taken"
+    NOT_TAKEN = "not_taken"
+    TRUE = "true"
+    FALSE = "false"
+    ITERATION = "iteration"
+    OBSERVED = "observed"
+    READ = "read"
+    ACQUIRED = "acquired"
+    REJECTED = "rejected"
+
+
+PLUGIN: Final = Plugin(actions={
+    PointKind.BRANCH: implemented_actions(Fail, Delay, Crash),
+    PointKind.CHECK: implemented_actions(Negate, Delay, Crash),
+    PointKind.LOOP: implemented_actions(Delay, Crash),
+    PointKind.VALUE: implemented_actions(SetValue, Shift, Delay, Crash),
+    PointKind.CLOCK: implemented_actions(Shift, Delay, Crash),
+    PointKind.ACQUIRE: implemented_actions(Fail, Delay, Crash),
+})
+
+
+def decide_in_process(runtime: Runtime, point: str) -> Decision | None:
+    """The decision of an in-process point, whose delay blocks the thread as contention does."""
+    decision = runtime.decide(point)
+    match decision:
+        case Decision(action=Delay(ms=ms)):
+            time.sleep(ms / 1000)
+        case Decision(action=Crash(code=code)):
+            runtime.crash(code)
+    return decision
 
 
 def branch(point: str, taken: bool) -> bool:
     """Whether a guarded error path runs: its natural condition, or forced by a fail rule."""
-    if not RUNTIME.enabled:
-        return taken
-    rule = RUNTIME.decide(point)
-    if rule is not None:
-        RUNTIME.hold(rule.action)
-        taken = taken or isinstance(rule.action, Fail)
-    RUNTIME.record(point, "taken" if taken else "not_taken", 0.0, rule)
+    runtime = faultpoint.runtime.RUNTIME
+    decision = decide_in_process(runtime, point)
+    match decision:
+        case Decision(action=Fail()):
+            taken = True
+    runtime.observe(point, PointOutcome.TAKEN if taken else PointOutcome.NOT_TAKEN, 0.0, decision)
     return taken
 
 
 def check(point: str, result: bool) -> bool:
     """The result of a detector, negated by a negate rule."""
-    if not RUNTIME.enabled:
-        return result
-    rule = RUNTIME.decide(point)
-    if rule is not None:
-        RUNTIME.hold(rule.action)
-        result = result != isinstance(rule.action, Negate)
-    RUNTIME.record(point, "true" if result else "false", 0.0, rule)
+    runtime = faultpoint.runtime.RUNTIME
+    decision = decide_in_process(runtime, point)
+    match decision:
+        case Decision(action=Negate()):
+            result = not result
+    runtime.observe(point, PointOutcome.TRUE if result else PointOutcome.FALSE, 0.0, decision)
     return result
 
 
 def loop(point: str) -> None:
-    """One iteration of a loop, delayed by a delay rule to model contention."""
-    if not RUNTIME.enabled:
-        return
-    rule = RUNTIME.decide(point)
-    if rule is not None:
-        RUNTIME.hold(rule.action)
-    RUNTIME.record(point, "iteration", 0.0, rule)
+    runtime = faultpoint.runtime.RUNTIME
+    runtime.observe(point, PointOutcome.ITERATION, 0.0, decide_in_process(runtime, point))
 
 
-def value[T](point: str, observed: T) -> T:
+def value(point: str, observed: Any) -> Any:
     """A business value, replaced by a set rule or offset by a shift rule."""
-    if not RUNTIME.enabled:
-        return observed
-    rule = RUNTIME.decide(point)
-    result = observed
-    if rule is not None:
-        RUNTIME.hold(rule.action)
-        if isinstance(rule.action, SetValue):
-            result = rule.action.value
-        if isinstance(rule.action, Shift):
-            result = observed + rule.action.amount
-    RUNTIME.record(point, "observed", float(result) if isinstance(result, int | float) else 0.0,
-                   rule)
-    return result
+    runtime = faultpoint.runtime.RUNTIME
+    decision = decide_in_process(runtime, point)
+    match decision:
+        case Decision(action=SetValue(value=replacement)):
+            observed = replacement
+        case Decision(action=Shift(amount=amount)):
+            observed = observed + amount
+    runtime.observe(point, PointOutcome.OBSERVED,
+                    float(observed) if isinstance(observed, int | float) else 0.0, decision)
+    return observed
 
 
-def clock[T: (float, datetime)](point: str, reading: T) -> T:
-    """A clock reading, epoch seconds or a datetime, moved by a shift rule."""
-    if not RUNTIME.enabled:
-        return reading
-    rule = RUNTIME.decide(point)
-    result = reading
-    if rule is not None:
-        RUNTIME.hold(rule.action)
-        if isinstance(rule.action, Shift):
-            result = reading + (timedelta(seconds=rule.action.amount)
-                                if isinstance(reading, datetime) else rule.action.amount)
-    RUNTIME.record(point, "read", 0.0, rule)
-    return result
+def clock(point: str, reading: Any) -> Any:
+    """A clock reading, epoch seconds or a date, moved by a shift rule of seconds."""
+    runtime = faultpoint.runtime.RUNTIME
+    decision = decide_in_process(runtime, point)
+    match decision:
+        case Decision(action=Shift(amount=amount)):
+            reading = reading + (timedelta(seconds=amount) if isinstance(reading, date) else amount)
+    runtime.observe(point, PointOutcome.READ, 0.0, decision)
+    return reading
 
 
 def acquire(point: str, acquired: bool) -> bool:
     """Whether a resource was acquired: its natural outcome, or rejected by a fail rule."""
-    if not RUNTIME.enabled:
-        return acquired
-    rule = RUNTIME.decide(point)
-    if rule is not None:
-        RUNTIME.hold(rule.action)
-        acquired = acquired and not isinstance(rule.action, Fail)
-    RUNTIME.record(point, "acquired" if acquired else "rejected", 0.0, rule)
+    runtime = faultpoint.runtime.RUNTIME
+    decision = decide_in_process(runtime, point)
+    match decision:
+        case Decision(action=Fail()):
+            acquired = False
+    runtime.observe(point, PointOutcome.ACQUIRED if acquired else PointOutcome.REJECTED, 0.0, decision)
     return acquired

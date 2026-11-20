@@ -1,19 +1,61 @@
 import ast
 import hashlib
-import shutil
+import importlib.util
 from collections import Counter
 from pathlib import Path
 from typing import Final
 
-from faultpoint.manifest import Manifest, PointEntry
-from faultpoint.rules import PointKind, point_id
+from pydantic import BaseModel
 
+from faultpoint.points import PointKind
+from faultpoint.rules import STRICT, point_id
+
+POINTS_MODULE: Final = "faultpoint.points"
 MANIFEST_FILE: Final = "faultpoint-manifest.json"
-IGNORED: Final = (".git", ".venv", "__pycache__", "node_modules")
-CLOCK_CALLS: Final = frozenset({("time", "time"), ("datetime", "now"), ("datetime", "utcnow")})
+EXCLUDED_DIRECTORIES: Final = frozenset({"site-packages", "dist-packages", ".venv", "__pycache__", ".git",
+                                         "node_modules"})
+DEFAULT_CLOCK: Final = ("time.time", "datetime.now", "datetime.utcnow")
 CODE_WIDTH: Final = 120
 
 type Function = ast.FunctionDef | ast.AsyncFunctionDef
+
+
+class Placement(BaseModel):
+    """The placement rules that run, and the dotted names of the calls that read the clock."""
+
+    model_config = STRICT
+
+    branch: bool = True
+    check: bool = True
+    loop: bool = True
+    clock: tuple[str, ...] = DEFAULT_CLOCK
+
+
+class PointEntry(BaseModel):
+    """One fault point placed in a source file."""
+
+    model_config = STRICT
+
+    id: str
+    kind: str
+    file: str
+    line: int
+    function: str
+    code: str
+    """The first line of the instrumented source."""
+
+
+class Manifest(BaseModel):
+    model_config = STRICT
+
+    service: str
+    language: str
+    points: tuple[PointEntry, ...]
+
+
+def placeable(path: Path, root: Path) -> bool:
+    """Whether a module is the service's own source under the root rather than an installed package."""
+    return path.is_relative_to(root) and EXCLUDED_DIRECTORIES.isdisjoint(path.relative_to(root).parts)
 
 
 def own_returns(function: Function) -> list[ast.Return]:
@@ -44,29 +86,29 @@ def constant_range(loop: ast.For | ast.AsyncFor) -> bool:
     return False
 
 
-def clock_call(call: ast.Call) -> bool:
-    match call.func:
-        case ast.Attribute(value=ast.Name(id=owner), attr=name):
-            return (owner, name) in CLOCK_CALLS
-        case ast.Attribute(value=ast.Attribute(attr=owner), attr=name):
-            return (owner, name) in CLOCK_CALLS
-    return False
+def dotted_name(expression: ast.expr) -> tuple[str, ...]:
+    match expression:
+        case ast.Name(id=name):
+            return (name,)
+        case ast.Attribute(value=owner, attr=name):
+            return (*dotted_name(owner), name)
+    return ()
 
 
-def point_call(function: str, point: str, *arguments: ast.expr) -> ast.Call:
-    target = ast.Attribute(value=ast.Attribute(value=ast.Name(id="faultpoint", ctx=ast.Load()),
-                                               attr="points", ctx=ast.Load()),
-                           attr=function, ctx=ast.Load())
+def point_call(kind: PointKind, point: str, *arguments: ast.expr) -> ast.Call:
+    target = ast.parse(f"{POINTS_MODULE}.{kind}", mode="eval").body
     return ast.Call(func=target, args=[ast.Constant(value=point), *arguments], keywords=[])
 
 
 class PointPlacer(ast.NodeTransformer):
-    """Places branch, check, loop and clock points in one module."""
+    """Places branch, check, loop and clock points in one module, as the placement rules allow."""
 
-    def __init__(self, service: str, path: str, source: str) -> None:
+    def __init__(self, service: str, path: str, source: str, placement: Placement) -> None:
         self.service = service
         self.path = path
         self.source = source
+        self.placement = placement
+        self.clocks = [tuple(name.split(".")) for name in placement.clock]
         self.scopes: list[str] = []
         self.checks: list[str | None] = []
         self.ordinals: Counter[str] = Counter()
@@ -74,14 +116,13 @@ class PointPlacer(ast.NodeTransformer):
 
     def place(self, kind: PointKind, node: ast.stmt | ast.expr, anchor: ast.AST | None) -> str:
         function = ".".join(self.scopes) or "<module>"
-        locator = f"{self.path}:{function}"
+        identity = point_id(self.service, kind, f"{self.path}:{function}")
         if anchor is not None:
             digest = hashlib.sha256(ast.dump(anchor, annotate_fields=False).encode()).hexdigest()[:8]
-            base = f"{locator}#{digest}"
+            base = f"{identity}#{digest}"
             ordinal = self.ordinals[base]
             self.ordinals[base] += 1
-            locator = base if ordinal == 0 else f"{base}.{ordinal}"
-        identity = point_id(self.service, kind, locator)
+            identity = base if ordinal == 0 else f"{base}.{ordinal}"
         code = (ast.get_source_segment(self.source, node) or "").splitlines()[0][:CODE_WIDTH]
         self.points.append(PointEntry(id=identity, kind=kind, file=self.path, line=node.lineno,
                                       function=function, code=code))
@@ -93,9 +134,10 @@ class PointPlacer(ast.NodeTransformer):
         self.scopes.pop()
         return node
 
-    def visit_function(self, node: Function) -> Function:
+    def visit_function[F: (ast.FunctionDef, ast.AsyncFunctionDef)](self, node: F) -> F:
         self.scopes.append(node.name)
-        self.checks.append(self.place(PointKind.CHECK, node, None) if returns_bool(node) else None)
+        placed = self.placement.check and returns_bool(node)
+        self.checks.append(self.place(PointKind.CHECK, node, None) if placed else None)
         self.generic_visit(node)
         self.checks.pop()
         self.scopes.pop()
@@ -117,22 +159,23 @@ class PointPlacer(ast.NodeTransformer):
         self.generic_visit(node)
         check = self.checks[-1] if self.checks else None
         if check is not None and node.value is not None:
-            node.value = point_call("check", check, node.value)
+            node.value = point_call(PointKind.CHECK, check, node.value)
         return node
 
     def visit_If(self, node: ast.If) -> ast.If:
-        guards = any(isinstance(statement, ast.Raise) and statement.exc is not None
-                     for statement in node.body)
+        guards = self.placement.branch and any(
+            isinstance(statement, ast.Raise) and statement.exc is not None for statement in node.body)
         point = self.place(PointKind.BRANCH, node, node.test) if guards else None
         self.generic_visit(node)
         if point is not None:
-            node.test = point_call("branch", point, node.test)
+            node.test = point_call(PointKind.BRANCH, point, node.test)
         return node
 
     def visit_loop(self, node: ast.For | ast.AsyncFor | ast.While, anchor: ast.AST) -> ast.stmt:
-        point = self.place(PointKind.LOOP, node, anchor)
+        point = self.place(PointKind.LOOP, node, anchor) if self.placement.loop else None
         self.generic_visit(node)
-        node.body.insert(0, ast.Expr(value=point_call("loop", point)))
+        if point is not None:
+            node.body.insert(0, ast.Expr(value=point_call(PointKind.LOOP, point)))
         return node
 
     def visit_For(self, node: ast.For) -> ast.stmt:
@@ -148,9 +191,11 @@ class PointPlacer(ast.NodeTransformer):
         return self.visit_loop(node, node.test)
 
     def visit_Call(self, node: ast.Call) -> ast.expr:
-        point = self.place(PointKind.CLOCK, node, node) if clock_call(node) else None
+        name = dotted_name(node.func)
+        reads_clock = any(name[-len(clock):] == clock for clock in self.clocks)
+        point = self.place(PointKind.CLOCK, node, node) if reads_clock else None
         self.generic_visit(node)
-        return node if point is None else point_call("clock", point, node)
+        return node if point is None else point_call(PointKind.CLOCK, point, node)
 
 
 def import_position(module: ast.Module) -> int:
@@ -165,28 +210,25 @@ def import_position(module: ast.Module) -> int:
     return position
 
 
-def rewrite_module(source: str, service: str, path: str) -> tuple[str | None, list[PointEntry]]:
-    """A module's instrumented source and its points; no source when it holds no point."""
+def place_points(source: str, service: str, path: str, placement: Placement) -> tuple[ast.Module, list[PointEntry]]:
+    """A module's syntax tree with its points placed, and the points; `path` is relative to the source root."""
     module = ast.parse(source)
-    placer = PointPlacer(service, path, source)
+    placer = PointPlacer(service, path, source, placement)
     placer.visit(module)
-    if not placer.points:
-        return None, []
-    module.body.insert(import_position(module),
-                       ast.Import(names=[ast.alias(name="faultpoint.points")]))
-    return ast.unparse(ast.fix_missing_locations(module)) + "\n", placer.points
+    if placer.points:
+        module.body.insert(import_position(module), ast.Import(names=[ast.alias(name=POINTS_MODULE)]))
+    return ast.fix_missing_locations(module), placer.points
 
 
-def rewrite_tree(source: Path, target: Path, service: str) -> Manifest:
-    """Copy a source tree to a target and instrument every Python module of the copy."""
-    shutil.copytree(source, target, ignore=shutil.ignore_patterns(*IGNORED))
+def scan_tree(root: Path, service: str, placement: Placement) -> Manifest:
+    """The points the import hook places in the modules under a source root."""
+    base = root.resolve()
     points: list[PointEntry] = []
-    for module in sorted(target.rglob("*.py")):
-        relative = module.relative_to(target).as_posix()
-        rewritten, placed = rewrite_module(module.read_text(encoding="utf-8"), service, relative)
-        if rewritten is not None:
-            module.write_text(rewritten, encoding="utf-8")
-        points.extend(placed)
-    manifest = Manifest(service=service, language="python", points=tuple(points))
-    (target / MANIFEST_FILE).write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
-    return manifest
+    for directory, directories, files in base.walk():
+        # Pruning the listed directories in place keeps the walk out of excluded trees.
+        directories[:] = sorted(name for name in directories if name not in EXCLUDED_DIRECTORIES)
+        for name in sorted(name for name in files if name.endswith(".py")):
+            path = directory / name
+            source = importlib.util.decode_source(path.read_bytes())
+            points.extend(place_points(source, service, path.relative_to(base).as_posix(), placement)[1])
+    return Manifest(service=service, language="python", points=tuple(points))

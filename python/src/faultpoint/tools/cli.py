@@ -6,11 +6,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from faultpoint.analysis import Selection, compare
-from faultpoint.manifest import Manifest
+from faultpoint.config import Config
 from faultpoint.observations import ObservationRecord, read_records
-from faultpoint.rewrite import rewrite_tree
+from faultpoint.placement import MANIFEST_FILE, Manifest, Placement, scan_tree
 from faultpoint.rules import RuleSet
+from faultpoint.tools.analysis import Selection, compare
+from faultpoint.tools.kinds import KindTable
 
 app = typer.Typer(no_args_is_help=True, help="Fault points that inject and observe faults.")
 
@@ -27,18 +28,26 @@ def schema(directory: Annotated[Path, typer.Argument(help="Where the JSON Schema
 
 @app.command()
 def check(rules: Annotated[Path, typer.Argument(help="A rule set file.")]) -> None:
-    """Validate a rule set before a controller installs it."""
+    """Validate a rule set against the kind table before a controller installs it."""
     ruleset = RuleSet.model_validate_json(rules.read_bytes())
+    violations = KindTable.installed().violations(ruleset)
+    for violation in violations:
+        typer.echo(violation, err=True)
+    if violations:
+        raise typer.Exit(1)
     typer.echo(f"{ruleset.experiment}: {len(ruleset.rules)} rules")
 
 
 @app.command()
-def rewrite(source: Annotated[Path, typer.Argument(help="The source tree.")],
-            target: Annotated[Path, typer.Argument(help="Where the instrumented copy is written.")],
-            service: Annotated[str, typer.Option(help="The service the points belong to.")]) -> None:
-    """Copy a Python source tree and place branch, check, loop and clock points in the copy."""
-    manifest = rewrite_tree(source, target, service)
-    typer.echo(f"{len(manifest.points)} points placed in {target}")
+def scan(root: Annotated[Path, typer.Argument(help="The source root, as FAULTPOINT_SOURCE_ROOT.")],
+         service: Annotated[str, typer.Option(envvar="FAULTPOINT_SERVICE", help="The service of the points.")],
+         config: Annotated[Path | None, typer.Option(envvar="FAULTPOINT_CONFIG",
+                                                     help="The configuration whose placement applies.")] = None,
+         output: Annotated[Path, typer.Option(help="Where the manifest is written.")] = Path(MANIFEST_FILE)) -> None:
+    """List the points the import hook places under a source root, without running the service."""
+    manifest = scan_tree(root, service, Placement.model_validate(Config.read(config).placement))
+    output.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    typer.echo(f"{len(manifest.points)} points written to {output}")
 
 
 @app.command()

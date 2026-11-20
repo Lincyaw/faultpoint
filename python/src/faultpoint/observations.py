@@ -1,12 +1,30 @@
+import os
+import socket
+import threading
+import time
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol
 
 from pydantic import BaseModel, Field
 
 from faultpoint.rules import STRICT
 
-EXEMPLAR_LIMIT: Final = 5
+JSONL_OPTIONS: Final = "jsonl"
+
+
+class Observation(BaseModel):
+    """One execution of a point."""
+
+    model_config = STRICT
+
+    experiment: str
+    point: str
+    outcome: str
+    scope: str
+    rule: str | None
+    quantity: float
+    trace_id: str | None
 
 
 class ObservationRecord(BaseModel):
@@ -32,42 +50,64 @@ class ObservationRecord(BaseModel):
     """Trace ids of some of the executions."""
 
 
+class ObservationSink(Protocol):
+    interval: float
+    """Seconds between the flushes the runtime asks for."""
+
+    def add(self, observation: Observation) -> None: ...
+
+    def flush(self) -> None: ...
+
+
+class JsonlOptions(BaseModel):
+    model_config = STRICT
+
+    flush_seconds: float = Field(default=2.0, gt=0)
+    exemplars: int = Field(default=5, ge=0)
+
+
 class TallyEntry(BaseModel):
     count: int = 0
     total: float = 0.0
     exemplars: list[str] = Field(default_factory=list)
 
 
-class Tally:
-    """Observations aggregated in a process between two flushes."""
+class JsonlSink:
+    """Observations aggregated in the process and appended to a JSON Lines file at every flush."""
 
-    def __init__(self) -> None:
-        self.entries: dict[tuple[str, str, str, str | None], TallyEntry] = {}
+    def __init__(self, path: Path, service: str, options: JsonlOptions) -> None:
+        self.path = path
+        self.service = service
+        self.process = f"{socket.gethostname()}:{os.getpid()}"
+        self.interval = options.flush_seconds
+        self.exemplars = options.exemplars
+        self.lock = threading.Lock()
+        self.tally: dict[tuple[str, str, str, str, str | None], TallyEntry] = {}
+        self.window_start = time.time()
 
-    def add(self, point: str, outcome: str, scope: str, rule: str | None, total: float,
-            trace_id: str | None) -> None:
-        entry = self.entries.setdefault((point, outcome, scope, rule), TallyEntry())
-        entry.count += 1
-        entry.total += total
-        if trace_id is not None and len(entry.exemplars) < EXEMPLAR_LIMIT:
-            entry.exemplars.append(trace_id)
+    def add(self, observation: Observation) -> None:
+        key = (observation.experiment, observation.point, observation.outcome, observation.scope,
+               observation.rule)
+        with self.lock:
+            entry = self.tally.setdefault(key, TallyEntry())
+            entry.count += 1
+            entry.total += observation.quantity
+            if observation.trace_id is not None and len(entry.exemplars) < self.exemplars:
+                entry.exemplars.append(observation.trace_id)
 
-    def drain(self, experiment: str, service: str, process: str, start: float,
-              end: float) -> list[ObservationRecord]:
-        records = [ObservationRecord(
-            experiment=experiment, service=service, process=process, start=start, end=end,
-            point=point, outcome=outcome, scope=scope, rule=rule, count=entry.count,
-            total=entry.total, exemplars=tuple(entry.exemplars))
-            for (point, outcome, scope, rule), entry in self.entries.items()]
-        self.entries = {}
-        return records
-
-
-def append_records(path: Path, records: Iterable[ObservationRecord]) -> None:
-    lines = "".join(record.model_dump_json() + "\n" for record in records)
-    if lines:
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(lines)
+    def flush(self) -> None:
+        end = time.time()
+        with self.lock:
+            records = [ObservationRecord(
+                experiment=experiment, service=self.service, process=self.process,
+                start=self.window_start, end=end, point=point, outcome=outcome, scope=scope,
+                rule=rule, count=entry.count, total=entry.total, exemplars=tuple(entry.exemplars))
+                for (experiment, point, outcome, scope, rule), entry in self.tally.items()]
+            self.tally = {}
+            self.window_start = end
+            lines = "".join(record.model_dump_json() + "\n" for record in records)
+            with self.path.open("a", encoding="utf-8") as stream:
+                stream.write(lines)
 
 
 def read_records(paths: Iterable[Path]) -> list[ObservationRecord]:
