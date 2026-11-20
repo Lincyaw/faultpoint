@@ -1,16 +1,22 @@
-// Package fpsql places store_read and store_write points on a database/sql driver.
+// Package fpsql is the adapter plugin of database/sql: store_read and store_write points on the statements of a
+// wrapped driver, classified by their SQL commands.
 package fpsql
 
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"io"
-	"sort"
+	"net"
+	"os"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"faultpoint"
 
@@ -18,41 +24,81 @@ import (
 	"github.com/ngrok/sqlmw"
 )
 
-// ErrInjected is the error of a store point under a fail or fail_after rule.
-var ErrInjected = errors.New("faultpoint: injected store failure")
+const (
+	instrumentedPrefix = "faultpoint:"
+	errorTimeout       = "timeout"
+	errorRefused       = "refused"
+)
+
+var errInjected = errors.New("faultpoint: injected store failure")
+
+var (
+	enabled      bool
+	readCommands []string
+	obfuscator   = sqllexer.NewObfuscator()
+	normalizer   = sqllexer.NewNormalizer(sqllexer.WithCollectTables(true), sqllexer.WithCollectCommands(true))
+	statements   sync.Map
+	drivers      sync.Mutex
+)
+
+func init() {
+	options := struct {
+		ReadCommands []string `json:"read_commands"`
+	}{ReadCommands: []string{"SELECT"}}
+	enabled = faultpoint.Register(faultpoint.Plugin{Name: "sql", Options: &options, Actions: map[string][]string{
+		"store_read":  {"fail", "empty", "delay", "crash"},
+		"store_write": {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
+	}})
+	readCommands = options.ReadCommands
+}
+
+// DriverName is the name of a driver whose statements are store points, wrapping the driver registered under
+// name; it returns name unchanged when the plugin is not enabled.
+func DriverName(name string) string {
+	if !enabled {
+		return name
+	}
+	drivers.Lock()
+	defer drivers.Unlock()
+	instrumented := instrumentedPrefix + name
+	if slices.Contains(sql.Drivers(), instrumented) {
+		return instrumented
+	}
+	// An unknown driver name is left for the caller's sql.Open to report as it would without faultpoint.
+	database, err := sql.Open(name, "")
+	if err != nil {
+		return name
+	}
+	defer database.Close()
+	sql.Register(instrumented, sqlmw.Driver(database.Driver(), interceptor{}))
+	return instrumented
+}
 
 type statement struct {
-	kind    faultpoint.Kind
+	kind    string
 	locator string
 }
 
-var (
-	statements sync.Map
-	obfuscator = sqllexer.NewObfuscator()
-	normalizer = sqllexer.NewNormalizer(sqllexer.WithCollectTables(true), sqllexer.WithCollectCommands(true))
-)
-
-// statementPoint is the kind and locator of a statement: the tables it touches and the hash of
-// its shape with literals removed.
+// statementPoint is the kind of a statement, read when all its commands are read commands, and its locator: the
+// tables it touches and the hash of its shape with literals removed.
 func statementPoint(query string) statement {
 	if known, found := statements.Load(query); found {
 		return known.(statement)
 	}
 	shape, metadata, err := sqllexer.ObfuscateAndNormalize(query, obfuscator, normalizer)
 	if err != nil {
-		panic("faultpoint: cannot normalize a statement: " + err.Error())
+		faultpoint.Abort("cannot normalize a statement: %v", err)
 	}
-	kind := faultpoint.KindStoreRead
+	kind := "store_read"
 	for _, command := range metadata.Commands {
-		if !strings.EqualFold(command, "SELECT") {
-			kind = faultpoint.KindStoreWrite
+		if !slices.ContainsFunc(readCommands, func(read string) bool { return strings.EqualFold(read, command) }) {
+			kind = "store_write"
 		}
 	}
 	if len(metadata.Commands) == 0 {
-		kind = faultpoint.KindStoreWrite
+		kind = "store_write"
 	}
-	tables := append([]string{}, metadata.Tables...)
-	sort.Strings(tables)
+	tables := slices.Sorted(slices.Values(metadata.Tables))
 	tableList := strings.Join(tables, "+")
 	if tableList == "" {
 		tableList = "-"
@@ -63,8 +109,88 @@ func statementPoint(query string) statement {
 	return known
 }
 
+// hold performs delay and crash; a delay holds back only the statement it applies to, as a slow store does.
+func hold(rule *faultpoint.Rule) {
+	switch rule.Action.Kind {
+	case "delay":
+		var params struct {
+			MS int `json:"ms"`
+		}
+		rule.DecodeParams(&params)
+		time.Sleep(time.Duration(params.MS) * time.Millisecond)
+	case "crash":
+		params := struct {
+			Code int `json:"code"`
+		}{Code: 1}
+		rule.DecodeParams(&params)
+		faultpoint.Crash(params.Code)
+	}
+}
+
+// failure is the error a fail or fail_after rule gives the caller: the store timed out, refused the connection,
+// or failed.
+func failure(rule *faultpoint.Rule) error {
+	var params struct {
+		Error string `json:"error"`
+	}
+	rule.DecodeParams(&params)
+	switch params.Error {
+	case "":
+		return errInjected
+	case errorTimeout:
+		return context.DeadlineExceeded
+	case errorRefused:
+		return &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+	}
+	faultpoint.Abort("rule %s: a store fails with %s or %s, not %q", rule.ID, errorTimeout, errorRefused, params.Error)
+	return nil
+}
+
+// begin decides the rule of a statement's point and performs its delay or crash.
+func begin(ctx context.Context, query string) (string, *faultpoint.Rule, string) {
+	known := statementPoint(query)
+	point := faultpoint.PointID(faultpoint.Service(), known.kind, known.locator)
+	rule := faultpoint.Decide(ctx, point)
+	if rule == nil {
+		return point, nil, ""
+	}
+	hold(rule)
+	return point, rule, rule.Action.Kind
+}
+
+func exec(ctx context.Context, query string, run func() (driver.Result, error)) (driver.Result, error) {
+	point, rule, action := begin(ctx, query)
+	var result driver.Result
+	var err error
+	switch action {
+	case "fail":
+		err = failure(rule)
+	case "drop":
+		result = driver.RowsAffected(1)
+	default:
+		result, err = run()
+	}
+	if err == nil && action == "duplicate" {
+		result, err = run()
+	}
+	if err == nil && action == "fail_after" {
+		err = failure(rule)
+	}
+	if err != nil {
+		faultpoint.Observe(ctx, point, "error", 0, rule)
+		return nil, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		affected = 0
+	}
+	faultpoint.Observe(ctx, point, "ok", float64(affected), rule)
+	return result, nil
+}
+
 type queryKey struct{}
 
+// query is a read in progress, whose outcome is observed when its rows are closed.
 type query struct {
 	point string
 	rule  *faultpoint.Rule
@@ -72,70 +198,23 @@ type query struct {
 	rows  int
 }
 
-type interceptor struct{ sqlmw.NullInterceptor }
-
-// Wrap returns a driver whose statements are store points; register it with sql.Register.
-func Wrap(base driver.Driver) driver.Driver { return sqlmw.Driver(base, interceptor{}) }
-
-func begin(ctx context.Context, sql string) (string, *faultpoint.Rule, faultpoint.Action) {
-	known := statementPoint(sql)
-	point := faultpoint.PointID(faultpoint.Service(), known.kind, known.locator)
-	rule := faultpoint.Decide(ctx, point)
-	if rule == nil {
-		return point, nil, faultpoint.Action{}
-	}
-	faultpoint.Hold(rule.Action)
-	return point, rule, rule.Action
-}
-
-func exec(ctx context.Context, sql string, run func() (driver.Result, error)) (driver.Result, error) {
-	if !faultpoint.Enabled() {
-		return run()
-	}
+func read(ctx context.Context, sql string, run func() (driver.Rows, error)) (context.Context, driver.Rows, error) {
 	point, rule, action := begin(ctx, sql)
-	switch action.Kind {
-	case faultpoint.ActionFail:
-		faultpoint.Record(ctx, point, "error", 0, rule)
-		return nil, ErrInjected
-	case faultpoint.ActionDrop:
-		faultpoint.Record(ctx, point, "ok", 1, rule)
-		return driver.RowsAffected(1), nil
-	}
-	result, err := run()
-	if err == nil && action.Kind == faultpoint.ActionDuplicate {
-		result, err = run()
-	}
-	if err == nil && action.Kind == faultpoint.ActionFailAfter {
-		err = ErrInjected
+	var rows driver.Rows
+	var err error
+	if action == "fail" {
+		err = failure(rule)
+	} else {
+		rows, err = run()
 	}
 	if err != nil {
-		faultpoint.Record(ctx, point, "error", 0, rule)
-		return nil, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		affected = 0
-	}
-	faultpoint.Record(ctx, point, "ok", float64(affected), rule)
-	return result, nil
-}
-
-func read(ctx context.Context, sql string, run func() (context.Context, driver.Rows, error)) (context.Context, driver.Rows, error) {
-	if !faultpoint.Enabled() {
-		return run()
-	}
-	point, rule, action := begin(ctx, sql)
-	if action.Kind == faultpoint.ActionFail {
-		faultpoint.Record(ctx, point, "error", 0, rule)
-		return ctx, nil, ErrInjected
-	}
-	ctx, rows, err := run()
-	if err != nil {
-		faultpoint.Record(ctx, point, "error", 0, rule)
+		faultpoint.Observe(ctx, point, "error", 0, rule)
 		return ctx, nil, err
 	}
-	return context.WithValue(ctx, queryKey{}, &query{point: point, rule: rule, empty: action.Kind == faultpoint.ActionEmpty}), rows, nil
+	return context.WithValue(ctx, queryKey{}, &query{point: point, rule: rule, empty: action == "empty"}), rows, nil
 }
+
+type interceptor struct{ sqlmw.NullInterceptor }
 
 func (interceptor) ConnExecContext(ctx context.Context, conn driver.ExecerContext, sql string, args []driver.NamedValue) (driver.Result, error) {
 	return exec(ctx, sql, func() (driver.Result, error) { return conn.ExecContext(ctx, sql, args) })
@@ -146,17 +225,11 @@ func (interceptor) StmtExecContext(ctx context.Context, stmt driver.StmtExecCont
 }
 
 func (interceptor) ConnQueryContext(ctx context.Context, conn driver.QueryerContext, sql string, args []driver.NamedValue) (context.Context, driver.Rows, error) {
-	return read(ctx, sql, func() (context.Context, driver.Rows, error) {
-		rows, err := conn.QueryContext(ctx, sql, args)
-		return ctx, rows, err
-	})
+	return read(ctx, sql, func() (driver.Rows, error) { return conn.QueryContext(ctx, sql, args) })
 }
 
 func (interceptor) StmtQueryContext(ctx context.Context, stmt driver.StmtQueryContext, sql string, args []driver.NamedValue) (context.Context, driver.Rows, error) {
-	return read(ctx, sql, func() (context.Context, driver.Rows, error) {
-		rows, err := stmt.QueryContext(ctx, args)
-		return ctx, rows, err
-	})
+	return read(ctx, sql, func() (driver.Rows, error) { return stmt.QueryContext(ctx, args) })
 }
 
 func (interceptor) RowsNext(ctx context.Context, rows driver.Rows, dest []driver.Value) error {
@@ -171,14 +244,14 @@ func (interceptor) RowsNext(ctx context.Context, rows driver.Rows, dest []driver
 	return err
 }
 
-// RowsClose records a read's outcome once its rows are counted.
+// RowsClose observes a read's outcome once its rows are counted.
 func (interceptor) RowsClose(ctx context.Context, rows driver.Rows) error {
 	if state, found := ctx.Value(queryKey{}).(*query); found {
 		outcome := "empty"
 		if state.rows > 0 {
 			outcome = "rows"
 		}
-		faultpoint.Record(ctx, state.point, outcome, float64(state.rows), state.rule)
+		faultpoint.Observe(ctx, state.point, outcome, float64(state.rows), state.rule)
 	}
 	return rows.Close()
 }

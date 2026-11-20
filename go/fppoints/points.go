@@ -1,4 +1,6 @@
-package faultpoint
+// Package fppoints is the plugin of the in-process points the rewriter places: branch, call, check, loop, value,
+// clock and acquire.
+package fppoints
 
 import (
 	"context"
@@ -6,125 +8,172 @@ import (
 	"reflect"
 	"sync"
 	"time"
+
+	"faultpoint"
 )
 
-var registry sync.Map
+var enabled = faultpoint.Register(faultpoint.Plugin{Name: "points", Actions: map[string][]string{
+	"branch":  {"fail", "delay", "crash"},
+	"call":    {"fail", "delay", "crash"},
+	"check":   {"negate", "delay", "crash"},
+	"loop":    {"delay", "crash"},
+	"value":   {"set", "shift", "delay", "crash"},
+	"clock":   {"shift", "delay", "crash"},
+	"acquire": {"fail", "delay", "crash"},
+}})
 
-// RegisterError names an error a call point can return when a fail rule names it, so that an
-// injection returns a sentinel the code really returns.
-func RegisterError(name string, err error) { registry.Store(name, err) }
+var registeredErrors sync.Map
 
-// InjectedError is returned by a call point whose fail rule names no registered error.
-type InjectedError struct{ Point string }
+// RegisterError names an error a call point returns when a fail rule names it, so that an injection returns a
+// sentinel the code really returns.
+func RegisterError(name string, err error) { registeredErrors.Store(name, err) }
 
-func (e *InjectedError) Error() string { return "faultpoint: injected error at " + e.Point }
+type injectedError struct{ point string }
+
+func (e *injectedError) Error() string { return "faultpoint: injected error at " + e.point }
+
+// hold performs delay and crash, blocking the goroutine as contention does.
+func hold(rule *faultpoint.Rule) {
+	switch rule.Action.Kind {
+	case "delay":
+		var params struct {
+			MS int `json:"ms"`
+		}
+		rule.DecodeParams(&params)
+		time.Sleep(time.Duration(params.MS) * time.Millisecond)
+	case "crash":
+		params := struct {
+			Code int `json:"code"`
+		}{Code: 1}
+		rule.DecodeParams(&params)
+		faultpoint.Crash(params.Code)
+	}
+}
 
 // Branch is whether a guarded error path runs: its natural condition, or forced by a fail rule.
 func Branch(ctx context.Context, point string, taken bool) bool {
-	if !current.enabled {
+	if !enabled {
 		return taken
 	}
-	rule := current.decide(ctx, point)
+	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		Hold(rule.Action)
-		taken = taken || rule.Action.Kind == ActionFail
+		hold(rule)
+		taken = taken || rule.Action.Kind == "fail"
 	}
 	outcome := "not_taken"
 	if taken {
 		outcome = "taken"
 	}
-	current.record(ctx, point, outcome, 0, rule)
+	faultpoint.Observe(ctx, point, outcome, 0, rule)
 	return taken
 }
 
-// Failed observes the error a call returned and, under a fail rule, replaces it; it reports
-// whether the error is not nil.
+// Failed observes the error a call returned and, under a fail rule, replaces it with the registered error the
+// rule names or an injected one; it reports whether the error is not nil.
 func Failed(ctx context.Context, point string, err *error) bool {
-	if !current.enabled {
+	if !enabled {
 		return *err != nil
 	}
-	rule := current.decide(ctx, point)
+	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		Hold(rule.Action)
-		if rule.Action.Kind == ActionFail {
-			*err = &InjectedError{Point: point}
-			if rule.Action.Error != "" {
-				registered, found := registry.Load(rule.Action.Error)
-				if !found {
-					Abort("rule %s names unregistered error %q", rule.ID, rule.Action.Error)
-				}
-				*err = registered.(error)
+		hold(rule)
+	}
+	if rule != nil && rule.Action.Kind == "fail" {
+		var params struct {
+			Error string `json:"error"`
+		}
+		rule.DecodeParams(&params)
+		*err = &injectedError{point: point}
+		if params.Error != "" {
+			registered, found := registeredErrors.Load(params.Error)
+			if !found {
+				faultpoint.Abort("rule %s names unregistered error %q", rule.ID, params.Error)
 			}
+			*err = registered.(error)
 		}
 	}
 	outcome := "ok"
 	if *err != nil {
 		outcome = "error"
 	}
-	current.record(ctx, point, outcome, 0, rule)
+	faultpoint.Observe(ctx, point, outcome, 0, rule)
 	return *err != nil
 }
 
 // Check is the result of a detector, negated by a negate rule.
 func Check(ctx context.Context, point string, result bool) bool {
-	if !current.enabled {
+	if !enabled {
 		return result
 	}
-	rule := current.decide(ctx, point)
+	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		Hold(rule.Action)
-		result = result != (rule.Action.Kind == ActionNegate)
+		hold(rule)
+		result = result != (rule.Action.Kind == "negate")
 	}
 	outcome := "false"
 	if result {
 		outcome = "true"
 	}
-	current.record(ctx, point, outcome, 0, rule)
+	faultpoint.Observe(ctx, point, outcome, 0, rule)
 	return result
 }
 
 // Loop marks one iteration of a loop, delayed by a delay rule to model contention.
 func Loop(ctx context.Context, point string) {
-	if !current.enabled {
+	if !enabled {
 		return
 	}
-	rule := current.decide(ctx, point)
+	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		Hold(rule.Action)
+		hold(rule)
 	}
-	current.record(ctx, point, "iteration", 0, rule)
+	faultpoint.Observe(ctx, point, "iteration", 0, rule)
 }
 
 // Value is a business value, replaced by a set rule or offset by a shift rule.
 func Value[T any](ctx context.Context, point string, observed T) T {
-	if !current.enabled {
+	if !enabled {
 		return observed
 	}
-	rule := current.decide(ctx, point)
+	rule := faultpoint.Decide(ctx, point)
 	result := observed
 	if rule != nil {
-		Hold(rule.Action)
-		switch rule.Action.Kind {
-		case ActionSet:
-			if err := json.Unmarshal(rule.Action.Value, &result); err != nil {
-				Abort("rule %s sets a value that does not fit %T: %v", rule.ID, observed, err)
-			}
-		case ActionShift:
-			value := reflect.ValueOf(&result).Elem()
-			switch {
-			case value.CanInt():
-				value.SetInt(value.Int() + int64(rule.Action.Amount))
-			case value.CanUint():
-				value.SetUint(uint64(int64(value.Uint()) + int64(rule.Action.Amount)))
-			case value.CanFloat():
-				value.SetFloat(value.Float() + rule.Action.Amount)
-			default:
-				Abort("rule %s shifts a value of non-numeric type %T", rule.ID, observed)
-			}
+		hold(rule)
+	}
+	if rule != nil && rule.Action.Kind == "set" {
+		var params struct {
+			Value json.RawMessage `json:"value"`
+		}
+		rule.DecodeParams(&params)
+		if err := json.Unmarshal(params.Value, &result); err != nil {
+			faultpoint.Abort("rule %s sets a value that does not fit %T: %v", rule.ID, observed, err)
 		}
 	}
-	current.record(ctx, point, "observed", numeric(result), rule)
+	if rule != nil && rule.Action.Kind == "shift" {
+		result = shifted(rule, result)
+	}
+	faultpoint.Observe(ctx, point, "observed", numeric(result), rule)
 	return result
+}
+
+// shifted offsets a numeric value by a shift rule's amount.
+func shifted[T any](rule *faultpoint.Rule, observed T) T {
+	var params struct {
+		Amount float64 `json:"amount"`
+	}
+	rule.DecodeParams(&params)
+	value := reflect.ValueOf(&observed).Elem()
+	switch {
+	case value.CanInt():
+		value.SetInt(value.Int() + int64(params.Amount))
+	case value.CanUint():
+		value.SetUint(uint64(int64(value.Uint()) + int64(params.Amount)))
+	case value.CanFloat():
+		value.SetFloat(value.Float() + params.Amount)
+	default:
+		faultpoint.Abort("rule %s shifts a value of non-numeric type %T", rule.ID, observed)
+	}
+	return observed
 }
 
 func numeric(value any) float64 {
@@ -142,34 +191,38 @@ func numeric(value any) float64 {
 
 // Clock is a clock reading, moved by a shift rule's seconds.
 func Clock(ctx context.Context, point string, reading time.Time) time.Time {
-	if !current.enabled {
+	if !enabled {
 		return reading
 	}
-	rule := current.decide(ctx, point)
+	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		Hold(rule.Action)
-		if rule.Action.Kind == ActionShift {
-			reading = reading.Add(time.Duration(rule.Action.Amount * float64(time.Second)))
-		}
+		hold(rule)
 	}
-	current.record(ctx, point, "read", 0, rule)
+	if rule != nil && rule.Action.Kind == "shift" {
+		var params struct {
+			Amount float64 `json:"amount"`
+		}
+		rule.DecodeParams(&params)
+		reading = reading.Add(time.Duration(params.Amount * float64(time.Second)))
+	}
+	faultpoint.Observe(ctx, point, "read", 0, rule)
 	return reading
 }
 
 // Acquire is whether a resource was acquired: its natural outcome, or rejected by a fail rule.
 func Acquire(ctx context.Context, point string, acquired bool) bool {
-	if !current.enabled {
+	if !enabled {
 		return acquired
 	}
-	rule := current.decide(ctx, point)
+	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		Hold(rule.Action)
-		acquired = acquired && rule.Action.Kind != ActionFail
+		hold(rule)
+		acquired = acquired && rule.Action.Kind != "fail"
 	}
 	outcome := "rejected"
 	if acquired {
 		outcome = "acquired"
 	}
-	current.record(ctx, point, outcome, 0, rule)
+	faultpoint.Observe(ctx, point, outcome, 0, rule)
 	return acquired
 }

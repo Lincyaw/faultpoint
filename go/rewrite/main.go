@@ -1,24 +1,21 @@
-// Command fprewrite copies a Go module and places call, branch, check, loop and clock points in
-// the copy, using type information to recognise errors, booleans and clock reads.
+// Command fprewrite places fault points in a build copy of a Go module and wires its net/http and database/sql
+// boundaries to the faultpoint adapters, so that the service's own source never contains the SDK; its scan
+// command writes the manifest of the same points without a copy.
 package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"go/ast"
 	"go/format"
-	"go/printer"
-	"go/token"
-	"go/types"
 	"io/fs"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"strconv"
+	"slices"
 	"strings"
 
 	"golang.org/x/mod/modfile"
@@ -27,290 +24,97 @@ import (
 )
 
 const (
-	sdkModule    = "faultpoint"
 	manifestFile = "faultpoint-manifest.json"
 	registryFile = "faultpoint_errors.go"
-	codeWidth    = 120
+	wiringFile   = "faultpoint_main.go"
+	usage        = `usage:
+  fprewrite instrument -service NAME -source DIR -target DIR -sdk DIR [-config FILE]
+  fprewrite scan -service NAME -source DIR [-manifest FILE] [-config FILE]`
 )
 
-var errorType = types.Universe.Lookup("error").Type()
-
-// PointEntry is one point of the manifest, as spec/manifest.schema.json defines.
-type PointEntry struct {
-	ID       string `json:"id"`
-	Kind     string `json:"kind"`
-	File     string `json:"file"`
-	Line     int    `json:"line"`
-	Function string `json:"function"`
-	Code     string `json:"code"`
+// Config is the file FAULTPOINT_CONFIG names; the rewriter reads the plugins to wire and the placement.
+type Config struct {
+	Plugins   []string                   `json:"plugins"`
+	Options   map[string]json.RawMessage `json:"options"`
+	Placement Placement                  `json:"placement"`
 }
 
-// Manifest lists every point placed in a service.
-type Manifest struct {
-	Service  string       `json:"service"`
-	Language string       `json:"language"`
-	Points   []PointEntry `json:"points"`
-}
-
-type function struct {
-	name     string
-	context  func() ast.Expr
-	check    string
-	literals int
-}
-
-// placer places the points of one file.
-type placer struct {
-	service   string
-	path      string
-	fset      *token.FileSet
-	info      *types.Info
-	functions []*function
-	anchors   map[ast.Node]string
-	ordinals  map[string]int
-	points    []PointEntry
-}
-
-func (p *placer) text(node ast.Node) string {
-	var buffer bytes.Buffer
-	if err := printer.Fprint(&buffer, p.fset, node); err != nil {
+func readConfig(path string) Config {
+	config := Config{Plugins: []string{pointsPlugin, httpPlugin, sqlPlugin},
+		Placement: Placement{Branch: true, Call: true, Check: true, Loop: true, Clock: []string{"time.Now"}, Errors: true}}
+	if path == "" {
+		return config
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
 		log.Fatal(err)
 	}
-	return buffer.String()
-}
-
-func (p *placer) current() *function { return p.functions[len(p.functions)-1] }
-
-func (p *placer) place(kind string, node ast.Node, anchor string, hashed bool) string {
-	name := "<package>"
-	if len(p.functions) > 0 {
-		name = p.current().name
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&config); err != nil {
+		log.Fatalf("invalid configuration in %s: %v", path, err)
 	}
-	locator := p.path + ":" + name
-	if hashed {
-		digest := sha256.Sum256([]byte(anchor))
-		base := locator + "#" + hex.EncodeToString(digest[:])[:8]
-		ordinal := p.ordinals[base]
-		p.ordinals[base]++
-		locator = base
-		if ordinal > 0 {
-			locator = base + "." + strconv.Itoa(ordinal)
+	for _, plugin := range config.Plugins {
+		if _, known := pluginPackages[plugin]; !known {
+			log.Fatalf("the configuration enables %q, which is not a Go plugin: points, http or sql", plugin)
 		}
 	}
-	id := p.service + ":" + kind + ":" + locator
-	code := strings.SplitN(anchor, "\n", 2)[0]
-	if len(code) > codeWidth {
-		code = code[:codeWidth]
-	}
-	p.points = append(p.points, PointEntry{ID: id, Kind: kind, File: p.path,
-		Line: p.fset.Position(node.Pos()).Line, Function: name, Code: code})
-	return id
+	return config
 }
 
-func (p *placer) contextOf(parameters *ast.FieldList) func() ast.Expr {
-	for _, field := range parameters.List {
-		for _, name := range field.Names {
-			if name.Name == "_" {
-				continue
-			}
-			named, ok := p.info.TypeOf(name).(*types.Named)
-			if ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "context" && named.Obj().Name() == "Context" {
-				identifier := name.Name
-				return func() ast.Expr { return ast.NewIdent(identifier) }
-			}
-			pointer, ok := p.info.TypeOf(name).(*types.Pointer)
-			if !ok {
-				continue
-			}
-			named, ok = pointer.Elem().(*types.Named)
-			if ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "net/http" && named.Obj().Name() == "Request" {
-				identifier := name.Name
-				return func() ast.Expr {
-					return &ast.CallExpr{Fun: &ast.SelectorExpr{X: ast.NewIdent(identifier), Sel: ast.NewIdent("Context")}}
-				}
-			}
-		}
+func loadPackages(source string) []*packages.Package {
+	config := &packages.Config{Dir: source, Mode: packages.NeedName | packages.NeedFiles |
+		packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo}
+	loaded, err := packages.Load(config, "./...")
+	if err != nil {
+		log.Fatal(err)
 	}
-	if len(p.functions) > 0 {
-		return p.current().context
+	if packages.PrintErrors(loaded) > 0 {
+		os.Exit(1)
 	}
-	return func() ast.Expr { return ast.NewIdent("nil") }
+	return loaded
 }
 
-// ownReturns are the return statements of a function body, not of the literals it holds.
-func ownReturns(body *ast.BlockStmt) []*ast.ReturnStmt {
-	var returns []*ast.ReturnStmt
-	ast.Inspect(body, func(node ast.Node) bool {
-		switch statement := node.(type) {
-		case *ast.FuncLit:
-			return false
-		case *ast.ReturnStmt:
-			returns = append(returns, statement)
-		}
-		return true
-	})
-	return returns
+func relativePath(root, path string) string {
+	relative, err := filepath.Rel(root, path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return filepath.ToSlash(relative)
 }
 
-// checkable is whether a function's only result is an unnamed bool that some return computes.
-func (p *placer) checkable(signature *ast.FuncType, body *ast.BlockStmt) bool {
-	results := signature.Results
-	if body == nil || results == nil || len(results.List) != 1 || len(results.List[0].Names) > 0 {
-		return false
+func absolutePath(path string) string {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		log.Fatal(err)
 	}
-	if !types.Identical(p.info.TypeOf(results.List[0].Type), types.Typ[types.Bool]) {
-		return false
-	}
-	for _, statement := range ownReturns(body) {
-		if len(statement.Results) == 1 && p.info.Types[statement.Results[0]].Value == nil {
-			return true
-		}
-	}
-	return false
+	return absolute
 }
 
-func (p *placer) enter(name string, signature *ast.FuncType, body *ast.BlockStmt, node ast.Node) {
-	entered := &function{name: name, context: p.contextOf(signature.Params)}
-	p.functions = append(p.functions, entered)
-	if p.checkable(signature, body) {
-		entered.check = p.place("check", node, p.text(signature), false)
+func writeFile(path string, content []byte) {
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		log.Fatal(err)
 	}
 }
 
-func (p *placer) call(name string, point string, arguments ...ast.Expr) *ast.CallExpr {
-	return &ast.CallExpr{
-		Fun:  &ast.SelectorExpr{X: ast.NewIdent(sdkModule), Sel: ast.NewIdent(name)},
-		Args: append([]ast.Expr{p.current().context(), &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(point)}}, arguments...),
+func writeManifest(path string, manifest Manifest) {
+	encoded, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		log.Fatal(err)
 	}
+	writeFile(path, append(encoded, '\n'))
 }
 
-// errorVariable is the variable of an `err != nil` condition whose type is exactly error.
-func (p *placer) errorVariable(condition ast.Expr) *ast.Ident {
-	binary, ok := condition.(*ast.BinaryExpr)
-	if !ok || binary.Op != token.NEQ {
-		return nil
-	}
-	variable, ok := binary.X.(*ast.Ident)
-	if !ok || !p.info.Types[binary.Y].IsNil() || !types.Identical(p.info.TypeOf(variable), errorType) {
-		return nil
-	}
-	return variable
-}
-
-// guardsError is whether a block returns a non-nil error directly.
-func (p *placer) guardsError(body *ast.BlockStmt) bool {
-	for _, statement := range body.List {
-		returned, ok := statement.(*ast.ReturnStmt)
-		if !ok || len(returned.Results) == 0 {
-			continue
-		}
-		last := returned.Results[len(returned.Results)-1]
-		value := p.info.Types[last]
-		if !value.IsNil() && value.Type != nil && types.Implements(value.Type, errorType.Underlying().(*types.Interface)) {
-			return true
-		}
-	}
-	return false
-}
-
-func (p *placer) constantLoop(node ast.Node) bool {
-	switch loop := node.(type) {
-	case *ast.ForStmt:
-		binary, ok := loop.Cond.(*ast.BinaryExpr)
-		return ok && p.info.Types[binary.Y].Value != nil
-	case *ast.RangeStmt:
-		return p.info.Types[loop.X].Value != nil
-	}
-	return false
-}
-
-func (p *placer) clockCall(call *ast.CallExpr) bool {
-	selector, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-	callee, ok := p.info.Uses[selector.Sel].(*types.Func)
-	return ok && callee.Pkg() != nil && callee.Pkg().Path() == "time" && callee.Name() == "Now"
-}
-
-func (p *placer) pre(cursor *astutil.Cursor) bool {
-	switch node := cursor.Node().(type) {
-	case *ast.FuncDecl:
-		name := node.Name.Name
-		if node.Recv != nil && len(node.Recv.List) == 1 {
-			name = strings.TrimLeft(p.text(node.Recv.List[0].Type), "*") + "." + name
-		}
-		p.enter(name, node.Type, node.Body, node)
-	case *ast.FuncLit:
-		outer := "<package>"
-		if len(p.functions) > 0 {
-			outer = p.current().name
-			p.current().literals++
-			outer += ".func" + strconv.Itoa(p.current().literals)
-		}
-		p.enter(outer, node.Type, node.Body, node)
-	case *ast.IfStmt:
-		p.anchors[node] = p.text(node.Cond)
-	case *ast.ForStmt, *ast.RangeStmt, *ast.CallExpr:
-		p.anchors[node] = p.text(node)
-	}
-	return true
-}
-
-func (p *placer) post(cursor *astutil.Cursor) bool {
-	switch node := cursor.Node().(type) {
-	case *ast.FuncDecl, *ast.FuncLit:
-		p.functions = p.functions[:len(p.functions)-1]
-	case *ast.ReturnStmt:
-		if len(p.functions) > 0 && p.current().check != "" && len(node.Results) == 1 {
-			node.Results[0] = p.call("Check", p.current().check, node.Results[0])
-		}
-	case *ast.IfStmt:
-		if len(p.functions) == 0 {
-			break
-		}
-		if variable := p.errorVariable(node.Cond); variable != nil {
-			point := p.place("call", node, p.anchors[node], true)
-			node.Cond = p.call("Failed", point, &ast.UnaryExpr{Op: token.AND, X: ast.NewIdent(variable.Name)})
-		} else if p.guardsError(node.Body) {
-			point := p.place("branch", node, p.anchors[node], true)
-			node.Cond = p.call("Branch", point, node.Cond)
-		}
-	case *ast.ForStmt:
-		if len(p.functions) > 0 && !p.constantLoop(node) {
-			p.placeLoop(node, node.Body)
-		}
-	case *ast.RangeStmt:
-		if len(p.functions) > 0 && !p.constantLoop(node) {
-			p.placeLoop(node, node.Body)
-		}
-	case *ast.CallExpr:
-		if len(p.functions) > 0 && p.clockCall(node) {
-			point := p.place("clock", node, p.anchors[node], true)
-			cursor.Replace(p.call("Clock", point, node))
-		}
-	}
-	return true
-}
-
-func (p *placer) placeLoop(node ast.Node, body *ast.BlockStmt) {
-	point := p.place("loop", node, p.anchors[node], true)
-	body.List = append([]ast.Stmt{&ast.ExprStmt{X: p.call("Loop", point)}}, body.List...)
-}
-
+// copyTree copies a module without its version control and vendor directories.
 func copyTree(source, target string) error {
 	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(source, path)
 		if err != nil {
 			return err
 		}
 		if entry.IsDir() && (entry.Name() == ".git" || entry.Name() == "vendor") {
 			return filepath.SkipDir
 		}
-		destination := filepath.Join(target, relative)
+		destination := filepath.Join(target, relativePath(source, path))
 		if entry.IsDir() {
 			return os.MkdirAll(destination, 0o755)
 		}
@@ -322,28 +126,7 @@ func copyTree(source, target string) error {
 	})
 }
 
-// registry is the source of a file that registers a package's error variables by name.
-func registry(pkg *packages.Package) []byte {
-	scope := pkg.Types.Scope()
-	var lines []string
-	for _, name := range scope.Names() {
-		variable, ok := scope.Lookup(name).(*types.Var)
-		if ok && types.Identical(variable.Type(), errorType) {
-			lines = append(lines, fmt.Sprintf("\t%s.RegisterError(%q, %s)", sdkModule, pkg.PkgPath+"."+name, name))
-		}
-	}
-	if len(lines) == 0 {
-		return nil
-	}
-	source := fmt.Sprintf("// Code generated by fprewrite. DO NOT EDIT.\n\npackage %s\n\nimport %q\n\nfunc init() {\n%s\n}\n",
-		pkg.Name, sdkModule, strings.Join(lines, "\n"))
-	formatted, err := format.Source([]byte(source))
-	if err != nil {
-		log.Fatal(err)
-	}
-	return formatted
-}
-
+// requireSDK makes the copy's module require the SDK from its local path.
 func requireSDK(target, sdk string) error {
 	path := filepath.Join(target, "go.mod")
 	content, err := os.ReadFile(path)
@@ -354,10 +137,10 @@ func requireSDK(target, sdk string) error {
 	if err != nil {
 		return err
 	}
-	if err := module.AddRequire(sdkModule, "v0.0.0"); err != nil {
+	if err := module.AddRequire(corePackage, "v0.0.0"); err != nil {
 		return err
 	}
-	if err := module.AddReplace(sdkModule, "", sdk, ""); err != nil {
+	if err := module.AddReplace(corePackage, "", sdk, ""); err != nil {
 		return err
 	}
 	formatted, err := module.Format()
@@ -367,79 +150,115 @@ func requireSDK(target, sdk string) error {
 	return os.WriteFile(path, formatted, 0o644)
 }
 
-func main() {
-	service := flag.String("service", "", "the service the points belong to")
-	source := flag.String("source", "", "the Go module to instrument")
-	target := flag.String("target", "", "where the instrumented copy is written")
-	sdk := flag.String("sdk", "", "the path of the faultpoint Go module")
-	flag.Parse()
+// instrumentPackage writes the rewritten files of a package into the copy, with its error registry and, for a
+// main package, its wiring, and returns the points it placed.
+func instrumentPackage(service, sourceRoot, target string, config Config, pkg *packages.Package) []PointEntry {
+	var placed []PointEntry
+	for _, file := range pkg.Syntax {
+		relative := relativePath(sourceRoot, pkg.Fset.Position(file.Pos()).Filename)
+		points := placePoints(service, relative, config, pkg, file)
+		imports := wireBoundaries(pkg.TypesInfo, config.Plugins, file)
+		if len(points) > 0 {
+			imports = append(imports, pointsPackage)
+		}
+		if len(imports) == 0 {
+			continue
+		}
+		for _, imported := range imports {
+			astutil.AddImport(pkg.Fset, file, imported)
+		}
+		var rewritten bytes.Buffer
+		if err := format.Node(&rewritten, pkg.Fset, file); err != nil {
+			log.Fatal(err)
+		}
+		writeFile(filepath.Join(target, relative), rewritten.Bytes())
+		placed = append(placed, points...)
+	}
+	directory := filepath.Join(target, relativePath(sourceRoot, filepath.Dir(pkg.GoFiles[0])))
+	if slices.Contains(config.Plugins, pointsPlugin) && config.Placement.Errors {
+		if registry := errorRegistry(pkg); registry != nil {
+			writeFile(filepath.Join(directory, registryFile), registry)
+		}
+	}
+	if pkg.Name == "main" {
+		writeFile(filepath.Join(directory, wiringFile), mainWiring(config.Plugins))
+	}
+	return placed
+}
+
+func instrument(arguments []string) {
+	flags := flag.NewFlagSet("instrument", flag.ExitOnError)
+	service := flags.String("service", "", "the service the points belong to")
+	source := flags.String("source", "", "the Go module to instrument")
+	target := flags.String("target", "", "where the instrumented copy is written; it must not exist")
+	sdk := flags.String("sdk", "", "the path of the faultpoint Go module")
+	configPath := flags.String("config", "", "the faultpoint configuration, for its plugins and placement")
+	flags.Parse(arguments)
 	if *service == "" || *source == "" || *target == "" || *sdk == "" {
-		flag.Usage()
-		os.Exit(2)
+		log.Fatal(usage)
 	}
-	sourceRoot, err := filepath.Abs(*source)
-	if err != nil {
+	config := readConfig(*configPath)
+	sourceRoot, targetRoot := absolutePath(*source), absolutePath(*target)
+	if _, err := os.Stat(targetRoot); !errors.Is(err, fs.ErrNotExist) {
+		log.Fatalf("the target %s exists; fprewrite writes a fresh copy", targetRoot)
+	}
+	if strings.HasPrefix(targetRoot, sourceRoot+string(filepath.Separator)) {
+		log.Fatalf("the target %s lies inside the source %s", targetRoot, sourceRoot)
+	}
+	if err := copyTree(sourceRoot, targetRoot); err != nil {
 		log.Fatal(err)
-	}
-	sdkRoot, err := filepath.Abs(*sdk)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := copyTree(sourceRoot, *target); err != nil {
-		log.Fatal(err)
-	}
-	config := &packages.Config{Dir: sourceRoot, Mode: packages.NeedName | packages.NeedFiles |
-		packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo}
-	loaded, err := packages.Load(config, "./...")
-	if err != nil {
-		log.Fatal(err)
-	}
-	if packages.PrintErrors(loaded) > 0 {
-		os.Exit(1)
 	}
 	manifest := Manifest{Service: *service, Language: "go", Points: []PointEntry{}}
-	for _, pkg := range loaded {
+	for _, pkg := range loadPackages(sourceRoot) {
+		manifest.Points = append(manifest.Points, instrumentPackage(*service, sourceRoot, targetRoot, config, pkg)...)
+	}
+	if err := requireSDK(targetRoot, absolutePath(*sdk)); err != nil {
+		log.Fatal(err)
+	}
+	tidy := exec.Command("go", "mod", "tidy")
+	tidy.Dir, tidy.Stdout, tidy.Stderr = targetRoot, os.Stderr, os.Stderr
+	if err := tidy.Run(); err != nil {
+		log.Fatalf("go mod tidy in the copy: %v", err)
+	}
+	writeManifest(filepath.Join(targetRoot, manifestFile), manifest)
+	fmt.Printf("%d points placed in %s\n", len(manifest.Points), targetRoot)
+}
+
+func scan(arguments []string) {
+	flags := flag.NewFlagSet("scan", flag.ExitOnError)
+	service := flags.String("service", "", "the service the points belong to")
+	source := flags.String("source", "", "the Go module to scan")
+	manifestPath := flags.String("manifest", manifestFile, "where the manifest is written")
+	configPath := flags.String("config", "", "the faultpoint configuration, for its plugins and placement")
+	flags.Parse(arguments)
+	if *service == "" || *source == "" {
+		log.Fatal(usage)
+	}
+	config := readConfig(*configPath)
+	sourceRoot := absolutePath(*source)
+	manifest := Manifest{Service: *service, Language: "go", Points: []PointEntry{}}
+	for _, pkg := range loadPackages(sourceRoot) {
 		for _, file := range pkg.Syntax {
-			original := pkg.Fset.Position(file.Pos()).Filename
-			relative, err := filepath.Rel(sourceRoot, original)
-			if err != nil {
-				log.Fatal(err)
-			}
-			p := &placer{service: *service, path: filepath.ToSlash(relative), fset: pkg.Fset,
-				info: pkg.TypesInfo, anchors: map[ast.Node]string{}, ordinals: map[string]int{}}
-			astutil.Apply(file, p.pre, p.post)
-			if len(p.points) == 0 {
-				continue
-			}
-			astutil.AddImport(pkg.Fset, file, sdkModule)
-			var buffer bytes.Buffer
-			if err := format.Node(&buffer, pkg.Fset, file); err != nil {
-				log.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(*target, relative), buffer.Bytes(), 0o644); err != nil {
-				log.Fatal(err)
-			}
-			manifest.Points = append(manifest.Points, p.points...)
-		}
-		if source := registry(pkg); source != nil {
-			directory, err := filepath.Rel(sourceRoot, filepath.Dir(pkg.GoFiles[0]))
-			if err != nil {
-				log.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(*target, directory, registryFile), source, 0o644); err != nil {
-				log.Fatal(err)
-			}
+			relative := relativePath(sourceRoot, pkg.Fset.Position(file.Pos()).Filename)
+			manifest.Points = append(manifest.Points, placePoints(*service, relative, config, pkg, file)...)
 		}
 	}
-	if err := requireSDK(*target, sdkRoot); err != nil {
-		log.Fatal(err)
+	writeManifest(*manifestPath, manifest)
+	fmt.Printf("%d points listed in %s\n", len(manifest.Points), *manifestPath)
+}
+
+func main() {
+	log.SetFlags(0)
+	log.SetPrefix("fprewrite: ")
+	if len(os.Args) < 2 {
+		log.Fatal(usage)
 	}
-	encoded, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		log.Fatal(err)
+	switch os.Args[1] {
+	case "instrument":
+		instrument(os.Args[2:])
+	case "scan":
+		scan(os.Args[2:])
+	default:
+		log.Fatal(usage)
 	}
-	if err := os.WriteFile(filepath.Join(*target, manifestFile), append(encoded, '\n'), 0o644); err != nil {
-		log.Fatal(err)
-	}
-	fmt.Printf("%d points placed in %s\n", len(manifest.Points), *target)
 }
