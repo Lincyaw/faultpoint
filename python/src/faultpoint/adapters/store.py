@@ -27,4 +27,4 @@ class StoreOutcome(StrEnum):
 READ_ACTIONS: Final = implemented_actions(BoundaryFail, Empty, Delay, Crash)
 WRITE_ACTIONS: Final = implemented_actions(BoundaryFail, FailAfter, Drop, Duplicate, Delay, Crash)
 """The actions of store_write and publish points."""
-CONSUME_ACTIONS: Final = implemented_actions(BoundaryFail, FailAfter, Duplicate, Delay, Crash)
+CONSUME_ACTIONS: Final = implemented_actions(BoundaryFail, FailAfter, Duplicate, Empty, Delay, Crash)

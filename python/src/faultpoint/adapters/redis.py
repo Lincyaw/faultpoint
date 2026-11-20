@@ -1,6 +1,5 @@
 import asyncio
 import functools
-import json
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -58,13 +57,22 @@ class Command(BaseModel):
 
 
 class CommandTable(BaseModel):
-    """spec/redis-commands.json, whose key_identifier and commands the plugin's options may replace."""
+    """spec/redis-commands.json."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     comment: str = Field(alias="$comment")
     key_identifier: re.Pattern[str]
     commands: dict[str, Command]
+
+
+class RedisOptions(BaseModel):
+    """A key_identifier that replaces the table's, and commands that extend or override its commands."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    key_identifier: re.Pattern[str] | None = None
+    commands: dict[str, Command] = Field(default_factory=dict)
 
 
 class Decided(BaseModel):
@@ -116,14 +124,26 @@ def is_empty(reply: Any, empty: EmptyReply | None) -> bool:
     return False
 
 
+def empty_reply(client: Any, args: tuple[Any, ...], options: dict[str, Any], empty: EmptyReply | None) -> Any:
+    """The empty reply a command gets without reaching Redis, parsed by the client's own callback for the command."""
+    match empty:
+        case EmptyReply.EMPTY_STRING:
+            raw: Any = "" if client.get_encoder().decode_responses else b""
+        case EmptyReply.ZERO:
+            raw = 0
+        case _:
+            raw = None
+    callback = client.response_callbacks.get(argument_text(args[0]))
+    return raw if callback is None else callback(raw, **options)
+
+
 def emptied(reply: Any, empty: EmptyReply | None) -> Any:
-    """The empty reply of a read, of its actual reply's type; a command whose reply is never empty keeps it."""
+    """The empty reply of a read that reached Redis, of its reply's own container type or nils for all its items;
+    a reply that is never empty stays."""
     match empty:
         case EmptyReply.ALL_NIL:
             return [None] * len(reply)
-        case EmptyReply.NIL if not isinstance(reply, CONTAINERS):
-            return None
-        case EmptyReply.NIL | EmptyReply.EMPTY_ARRAY | EmptyReply.EMPTY_STRING | EmptyReply.ZERO:
+        case EmptyReply.EMPTY_ARRAY:
             return type(reply)()
     return reply
 
@@ -155,9 +175,13 @@ def delivered_twice(command: Command, reply: Any) -> Any:
 
 
 def copies(decided: Decided | None) -> int:
-    """How often a command is sent: never when dropped, twice when a write or publish is duplicated."""
+    """How often a command is sent: never when dropped or emptied, twice when a write or publish is duplicated; a
+    read emptied into an array, whose container type RESP3 decides, or into nils for each item it asks for, is sent
+    and its reply replaced, which leaves Redis as it was."""
     match decided:
         case Decided(action=Drop()):
+            return 0
+        case Decided(action=Empty(), command=Command(empty=EmptyReply.NIL | EmptyReply.EMPTY_STRING | EmptyReply.ZERO)):
             return 0
         case Decided(action=Duplicate(), command=Command(kind=StoreKind.WRITE | MessageKind.PUBLISH)):
             return 2
@@ -173,20 +197,22 @@ class CommandPoints:
     """The commands of every redis-py client and pipeline, sync or asyncio, that the command table lists, as
     points; a dropped command is acknowledged with True, and a duplicated consume delivers each entry twice."""
 
-    def __init__(self, runtime: Runtime, table: CommandTable, exceptions: ModuleType) -> None:
+    def __init__(self, runtime: Runtime, key_identifier: re.Pattern[str], commands: dict[str, Command],
+                 exceptions: ModuleType) -> None:
         self.runtime = runtime
-        self.table = table
+        self.key_identifier = key_identifier
+        self.commands = commands
         self.exceptions = exceptions
 
     def decide(self, args: tuple[Any, ...]) -> Decided | None:
         """The point and decision of a command; none for a command that is not a point."""
         words = argument_text(args[0]).split()
         name, arguments = words[0].upper(), [*words[1:], *(argument_text(argument) for argument in args[1:])]
-        command = self.table.commands.get(name)
+        command = self.commands.get(name)
         if command is None:
             return None
         key = command_key(arguments, command.key)
-        locator = name if key is None else f"{name} {self.table.key_identifier.sub('{}', key)}"
+        locator = name if key is None else f"{name} {self.key_identifier.sub('{}', key)}"
         point = point_id(self.runtime.settings.service, command.kind, locator)
         return Decided(command=command, point=point, decision=self.runtime.decide(point))
 
@@ -211,23 +237,30 @@ class CommandPoints:
             if decided is not None:
                 self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decided.decision)
 
-    def settle(self, decisions: list[Decided | None], replies: list[Any]) -> list[Any]:
+    def settle(self, client: Any, queue: list[Queued], decisions: list[Decided | None],
+               replies: list[Any]) -> list[Any]:
         """Each command's reply out of the replies of what was sent, observed, and a failure after the effect."""
         sent = iter(replies)
-        settled = [self.reply(decided, [next(sent) for _ in range(copies(decided))]) for decided in decisions]
+        settled = [self.reply(client, queued, decided, [next(sent) for _ in range(copies(decided))])
+                   for queued, decided in zip(queue, decisions, strict=True)]
         failures = [decided.action for decided in decisions
                     if decided is not None and isinstance(decided.action, FailAfter)]
         if failures:
             raise self.failure(failures[0])
         return settled
 
-    def reply(self, decided: Decided | None, sent: list[Any]) -> Any:
-        reply = sent[-1] if sent else True
-        match decided:
-            case Decided(action=Empty()):
-                reply = emptied(reply, decided.command.empty)
-            case Decided(action=Duplicate(), command=Command(kind=MessageKind.CONSUME)):
-                reply = delivered_twice(decided.command, reply)
+    def reply(self, client: Any, queued: Queued, decided: Decided | None, sent: list[Any]) -> Any:
+        match decided, sent:
+            case Decided(action=Drop()), []:
+                reply = True
+            case Decided(action=Empty()), []:
+                reply = empty_reply(client, *queued, decided.command.empty)
+            case Decided(action=Empty()), [*_, last]:
+                reply = emptied(last, decided.command.empty)
+            case Decided(action=Duplicate(), command=Command(kind=MessageKind.CONSUME)), [*_, last]:
+                reply = delivered_twice(decided.command, last)
+            case _:
+                reply = sent[-1]
         if decided is not None:
             self.observe_reply(decided, reply)
         return reply
@@ -259,7 +292,7 @@ class CommandPoints:
         except Exception:
             self.failed(decisions)
             raise
-        return self.settle(decisions, replies)[0]
+        return self.settle(client, [(args, kwargs)], decisions, replies)[0]
 
     def execute_pipeline(self, execute: Callable[..., list[Any]], pipeline: Any, args: tuple[Any, ...],
                          kwargs: dict[str, Any]) -> list[Any]:
@@ -275,7 +308,7 @@ class CommandPoints:
         except Exception:
             self.failed(decisions)
             raise
-        return self.settle(decisions, replies)
+        return self.settle(pipeline, stack, decisions, replies)
 
     async def execute_async(self, execute_command: Callable[..., Awaitable[Any]], client: Any,
                             args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -288,7 +321,7 @@ class CommandPoints:
         except Exception:
             self.failed(decisions)
             raise
-        return self.settle(decisions, replies)[0]
+        return self.settle(client, [(args, kwargs)], decisions, replies)[0]
 
     async def execute_pipeline_async(self, execute: Callable[..., Awaitable[list[Any]]], pipeline: Any,
                                      args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
@@ -304,7 +337,7 @@ class CommandPoints:
         except Exception:
             self.failed(decisions)
             raise
-        return self.settle(decisions, replies)
+        return self.settle(pipeline, stack, decisions, replies)
 
 
 def patch_asyncio(points: CommandPoints, module: ModuleType) -> None:
@@ -312,17 +345,20 @@ def patch_asyncio(points: CommandPoints, module: ModuleType) -> None:
     wrapt.wrap_function_wrapper(module, "client.Pipeline.execute", points.execute_pipeline_async)
 
 
-def patch(runtime: Runtime, table: CommandTable, module: ModuleType) -> None:
-    points = CommandPoints(runtime, table, module.exceptions)
+def patch(runtime: Runtime, key_identifier: re.Pattern[str], commands: dict[str, Command], module: ModuleType) -> None:
+    points = CommandPoints(runtime, key_identifier, commands, module.exceptions)
     wrapt.wrap_function_wrapper(module, "Redis.execute_command", points.execute)
     wrapt.wrap_function_wrapper(module, "client.Pipeline.execute", points.execute_pipeline)
     wrapt.register_post_import_hook(functools.partial(patch_asyncio, points), REDIS_ASYNCIO_MODULE)
 
 
 def install(runtime: Runtime, options: dict[str, JsonValue]) -> None:
-    shipped = json.loads(Path(str(distribution(DISTRIBUTION).locate_file(COMMANDS_FILE))).read_bytes())
-    table = CommandTable.model_validate({**shipped, **options})
-    wrapt.register_post_import_hook(functools.partial(patch, runtime, table), REDIS_MODULE)
+    table = CommandTable.model_validate_json(
+        Path(str(distribution(DISTRIBUTION).locate_file(COMMANDS_FILE))).read_bytes())
+    extension = RedisOptions.model_validate(options)
+    key_identifier = table.key_identifier if extension.key_identifier is None else extension.key_identifier
+    commands = {name.upper(): command for name, command in {**table.commands, **extension.commands}.items()}
+    wrapt.register_post_import_hook(functools.partial(patch, runtime, key_identifier, commands), REDIS_MODULE)
 
 
 PLUGIN: Final = Plugin(actions={StoreKind.READ: READ_ACTIONS, StoreKind.WRITE: WRITE_ACTIONS,
