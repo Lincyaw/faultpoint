@@ -72,24 +72,23 @@ class Runtime:
     def __init__(self, settings: Settings, config: Config, plugins: Mapping[str, "Plugin"]) -> None:
         self.settings = settings
         self.config = config
-        self.kinds: dict[str, TypeAdapter[dict[str, BaseModel]]] = {}
-        for name, plugin in plugins.items():
+        self.kinds: dict[str, list[TypeAdapter[dict[str, BaseModel]]]] = {}
+        for plugin in plugins.values():
             for kind, actions in plugin.actions.items():
-                if kind in self.kinds:
-                    raise ValueError(f"plugin {name} serves the kind {kind}, which another plugin serves")
-                self.kinds[kind] = TypeAdapter(dict[str, actions])
+                self.kinds.setdefault(kind, []).append(TypeAdapter(dict[str, actions]))
         self.context = provided((plugin.context for plugin in plugins.values()), otel_context)(config)
         self.sink = provided((plugin.sink for plugin in plugins.values()), jsonl_sink)(settings, config)
         self.rules = RulesInForce("", (), settings.seed)
 
     def load(self, ruleset: RuleSet) -> None:
-        """Obey a rule set once the plugins that serve the kinds of its rules here parse their actions."""
+        """Obey a rule set once every plugin that serves the kind of one of its rules here parses its action."""
         applicable = [rule for rule in ruleset.rules
                       if rule.service == self.settings.service and rule.kind in self.kinds]
         actions: dict[str, BaseModel] = {}
-        for kind, adapter in self.kinds.items():
-            actions |= adapter.validate_python(
-                {rule.id: rule.action.model_dump() for rule in applicable if rule.kind == kind})
+        for kind, adapters in self.kinds.items():
+            declared = {rule.id: rule.action.model_dump() for rule in applicable if rule.kind == kind}
+            parsed = [adapter.validate_python(declared) for adapter in adapters]
+            actions |= parsed[0]
         if self.sink is not None:
             self.sink.flush()
         self.rules = RulesInForce(ruleset.experiment,
@@ -129,6 +128,8 @@ class Plugin(BaseModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     actions: dict[str, object] = Field(default_factory=dict)
+    """The actions per kind; plugins serving one kind parse its actions into the same models, since a point id
+    does not say which of them reaches the point."""
     install: Callable[[Runtime, dict[str, JsonValue]], None] | None = None
     """Called with the options the configuration gives under the plugin's name."""
     source: Callable[[Settings, Config], RuleSource | None] | None = None
