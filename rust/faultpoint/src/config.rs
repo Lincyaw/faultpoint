@@ -3,7 +3,16 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-/** Which placement rules the rewriter applies, and the clock reads it recognises. */
+/// A dependency crate whose code gets points, limited to some kinds when kinds is given.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeEntry {
+    pub include: String,
+    pub kinds: Option<Vec<String>>,
+}
+
+/// Which placement rules the rewriter applies, the clock reads it recognises, and the dependency crates whose
+/// code gets points besides the crate being rewritten.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Placement {
@@ -13,6 +22,8 @@ pub struct Placement {
     pub loops: bool,
     pub call: bool,
     pub clock: Vec<String>,
+    pub scope: Vec<ScopeEntry>,
+    pub exclude: Vec<String>,
 }
 
 impl Default for Placement {
@@ -23,6 +34,8 @@ impl Default for Placement {
             loops: true,
             call: true,
             clock: vec!["SystemTime::now".into(), "Instant::now".into()],
+            scope: Vec::new(),
+            exclude: Vec::new(),
         }
     }
 }

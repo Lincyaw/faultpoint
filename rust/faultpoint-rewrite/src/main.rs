@@ -14,7 +14,11 @@ use syn::visit_mut::{self, VisitMut};
 use syn::{Block, Expr, ExprIf, ExprReturn, ImplItemFn, ItemFn, ItemImpl, ReturnType, Stmt, Type, parse_quote};
 
 const MANIFEST_FILE: &str = "faultpoint-manifest.json";
-const IGNORED: [&str; 2] = ["target", ".git"];
+const IGNORED: [&str; 3] = ["target", ".git", SCOPE_DIRECTORY];
+/// Where the copies of the dependency crates the placement scope names go, inside the rewritten copy.
+const SCOPE_DIRECTORY: &str = "faultpoint-scope";
+/// Crates that never get points: the SDK, what it observes through, and logging.
+const ALWAYS_EXCLUDED: [&str; 6] = ["faultpoint", "tracing", "tracing-core", "log", "opentelemetry", "opentelemetry_sdk"];
 const CODE_WIDTH: usize = 120;
 
 /// One point of the manifest, as spec/manifest.schema.json defines.
@@ -41,6 +45,10 @@ struct Placer<'a> {
     service: &'a str,
     path: String,
     placement: &'a Placement,
+    /// "<crate>@<version>/" for a dependency crate, empty for the crate being rewritten, which alone gets boundaries.
+    prefix: &'a str,
+    /// The kinds a dependency crate's scope entry allows; None allows every kind.
+    kinds: Option<&'a [String]>,
     scopes: Vec<Scope>,
     owner: Option<String>,
     ordinals: HashMap<String, usize>,
@@ -119,11 +127,23 @@ fn constant_range(expression: &Expr) -> bool {
 }
 
 impl Placer<'_> {
+    /// Whether a placement rule is switched on and the code's scope allows its kind.
+    fn allows(&self, kind: &str) -> bool {
+        let switched = match kind {
+            "branch" => self.placement.branch,
+            "check" => self.placement.check,
+            "loop" => self.placement.loops,
+            "call" => self.placement.call,
+            _ => !self.placement.clock.is_empty(),
+        };
+        switched && self.kinds.is_none_or(|kinds| kinds.iter().any(|allowed| allowed == kind))
+    }
+
     fn place(&mut self, kind: &'static str, node: &impl ToTokens, hashed: bool) -> String {
         let function = self.scopes.last().map_or("<module>".to_owned(), |scope| scope.name.clone());
         let tokens = node.to_token_stream();
         let text = tokens.to_string();
-        let mut locator = format!("{}:{function}", self.path);
+        let mut locator = format!("{}{}:{function}", self.prefix, self.path);
         if hashed {
             let digest = Sha256::digest(text.as_bytes());
             let base = format!("{locator}#{}", digest[..4].iter().map(|byte| format!("{byte:02x}")).collect::<String>());
@@ -133,7 +153,7 @@ impl Placer<'_> {
         }
         let id = point_id(self.service, kind, &locator);
         self.points.push(PointEntry {
-            id: id.clone(), kind, file: self.path.clone(), line: tokens.span().start().line, function,
+            id: id.clone(), kind, file: format!("{}{}", self.prefix, self.path), line: tokens.span().start().line, function,
             code: text.lines().next().unwrap_or_default().chars().take(CODE_WIDTH).collect(),
         });
         id
@@ -141,11 +161,11 @@ impl Placer<'_> {
 
     fn enter(&mut self, name: String, signature: &syn::Signature, block: &Block) {
         let mut scope = Scope { name, check: None, error: None, closures: 0 };
-        if self.placement.call {
+        if self.allows("call") {
             scope.error = injectable_error(&signature.output);
         }
         self.scopes.push(scope);
-        if self.placement.check && returns_bool(&signature.output) && computes_bool(block) {
+        if self.allows("check") && returns_bool(&signature.output) && computes_bool(block) {
             let check = self.place("check", &signature.ident, false);
             self.scopes.last_mut().expect("entered").check = Some(check);
         }
@@ -198,13 +218,20 @@ impl VisitMut for Placer<'_> {
         self.owner = owner;
     }
 
+    /// A const fn is left alone: it cannot call the SDK.
     fn visit_item_fn_mut(&mut self, node: &mut ItemFn) {
+        if node.sig.constness.is_some() {
+            return;
+        }
         self.enter(node.sig.ident.to_string(), &node.sig, &node.block);
         visit_mut::visit_item_fn_mut(self, node);
         self.leave(&mut node.block);
     }
 
     fn visit_impl_item_fn_mut(&mut self, node: &mut ImplItemFn) {
+        if node.sig.constness.is_some() {
+            return;
+        }
         let name = format!("{}.{}", self.owner.clone().unwrap_or_default(), node.sig.ident);
         self.enter(name, &node.sig, &node.block);
         visit_mut::visit_impl_item_fn_mut(self, node);
@@ -231,7 +258,7 @@ impl VisitMut for Placer<'_> {
     }
 
     fn visit_expr_if_mut(&mut self, node: &mut ExprIf) {
-        let guards = self.placement.branch && !self.scopes.is_empty() && !matches!(node.cond.as_ref(), Expr::Let(_))
+        let guards = self.allows("branch") && !self.scopes.is_empty() && !matches!(node.cond.as_ref(), Expr::Let(_))
             && guards_error(&node.then_branch);
         let id = guards.then(|| self.place("branch", &node.cond, true));
         visit_mut::visit_expr_if_mut(self, node);
@@ -243,7 +270,7 @@ impl VisitMut for Placer<'_> {
 
     fn visit_expr_for_loop_mut(&mut self, node: &mut syn::ExprForLoop) {
         visit_mut::visit_expr_for_loop_mut(self, node);
-        if self.placement.loops && !self.scopes.is_empty() && !constant_range(&node.expr) {
+        if self.allows("loop") && !self.scopes.is_empty() && !constant_range(&node.expr) {
             let (pattern, iterated) = (&node.pat, &node.expr);
             let anchor = quote!(#pattern in #iterated);
             self.mark_loop(&anchor, &mut node.body);
@@ -252,7 +279,7 @@ impl VisitMut for Placer<'_> {
 
     fn visit_expr_while_mut(&mut self, node: &mut syn::ExprWhile) {
         visit_mut::visit_expr_while_mut(self, node);
-        if self.placement.loops && !self.scopes.is_empty() {
+        if self.allows("loop") && !self.scopes.is_empty() {
             let anchor = node.cond.clone();
             self.mark_loop(&anchor, &mut node.body);
         }
@@ -260,7 +287,7 @@ impl VisitMut for Placer<'_> {
 
     fn visit_expr_loop_mut(&mut self, node: &mut syn::ExprLoop) {
         visit_mut::visit_expr_loop_mut(self, node);
-        if self.placement.loops && !self.scopes.is_empty() {
+        if self.allows("loop") && !self.scopes.is_empty() {
             let anchor = node.body.clone();
             self.mark_loop(&anchor, &mut node.body);
         }
@@ -271,7 +298,7 @@ impl VisitMut for Placer<'_> {
             visit_mut::visit_expr_mut(self, node);
             return;
         }
-        if self.clock_read(node) {
+        if self.allows("clock") && self.clock_read(node) {
             let id = self.place("clock", node, true);
             visit_mut::visit_expr_mut(self, node);
             *node = parse_quote!(::faultpoint::clock(#id, #node));
@@ -287,6 +314,9 @@ impl VisitMut for Placer<'_> {
             return;
         }
         visit_mut::visit_expr_mut(self, node);
+        if !self.prefix.is_empty() {
+            return;
+        }
         if let Expr::Call(call) = node
             && let Expr::Path(path) = call.func.as_ref()
             && last_segments(&path.path, 2) == "axum::serve"
@@ -459,6 +489,66 @@ fn require_sdk(target: &Path, sdk: &Path, features: &[&str]) {
     std::fs::write(&manifest_path, manifest.to_string()).expect("cannot write Cargo.toml");
 }
 
+/// The points placed in the given files of a copy, which are rewritten in place, and whether they wired a server
+/// boundary and a store boundary.
+fn place_files(files: &[PathBuf], root: &Path, prefix: &str, kinds: Option<&[String]>, service: &str,
+               placement: &Placement) -> (Vec<PointEntry>, bool, bool) {
+    let (mut points, mut serves, mut stores) = (Vec::new(), false, false);
+    for file in files {
+        let path = file.strip_prefix(root).expect("under the root").display().to_string();
+        let mut syntax = syn::parse_file(&std::fs::read_to_string(file).expect("cannot read a source file"))
+            .unwrap_or_else(|error| panic!("cannot parse {path}: {error}"));
+        let mut placer = Placer { service, path, placement, prefix, kinds, scopes: Vec::new(), owner: None,
+                                  ordinals: HashMap::new(), points: Vec::new(), serves: false, stores: false };
+        placer.visit_file_mut(&mut syntax);
+        serves |= placer.serves;
+        stores |= placer.stores;
+        if !placer.points.is_empty() || placer.serves || placer.stores {
+            std::fs::write(file, prettyplease::unparse(&syntax)).expect("cannot write a source file");
+        }
+        points.extend(placer.points);
+    }
+    (points, serves, stores)
+}
+
+/// Copies each dependency crate the placement scope names into the copy, places points in its library sources under
+/// "<crate>@<version>/", and patches the copy's crates.io dependency onto that copy.
+fn place_scope(target: &Path, sdk: &Path, service: &str, placement: &Placement) -> Vec<PointEntry> {
+    let metadata = cargo_metadata::MetadataCommand::new().manifest_path(target.join("Cargo.toml")).exec()
+        .expect("cargo metadata failed on the copy");
+    let manifest_path = target.join("Cargo.toml");
+    let mut manifest: toml_edit::DocumentMut = std::fs::read_to_string(&manifest_path).expect("cannot read Cargo.toml")
+        .parse().expect("Cargo.toml is not valid TOML");
+    let mut points = Vec::new();
+    let excluded: Vec<&str> = ALWAYS_EXCLUDED.iter().copied().chain(placement.exclude.iter().map(String::as_str)).collect();
+    for entry in placement.scope.iter().filter(|entry| !excluded.contains(&entry.include.as_str())) {
+        let packages: Vec<_> = metadata.packages.iter().filter(|package| package.name == entry.include).collect();
+        let [package] = packages[..] else {
+            panic!("the scope names {}, which the dependency graph holds {} times", entry.include, packages.len());
+        };
+        let name = format!("{}-{}", package.name, package.version);
+        let copy = target.join(SCOPE_DIRECTORY).join(&name);
+        let mut files = Vec::new();
+        copy_tree(package.manifest_path.parent().expect("a manifest is in a directory").as_std_path(), &copy, &mut files);
+        let library = package.targets.iter().find(|each| each.is_kind(cargo_metadata::TargetKind::Lib))
+            .unwrap_or_else(|| panic!("{name} has no library target"));
+        let sources = copy.join(library.src_path.parent().expect("a source file is in a directory")
+            .strip_prefix(package.manifest_path.parent().expect("a manifest is in a directory")).expect("sources are in the package"));
+        files.retain(|file| file.starts_with(&sources));
+        files.sort();
+        let prefix = format!("{}@{}/", package.name, package.version);
+        points.extend(place_files(&files, &copy, &prefix, entry.kinds.as_deref(), service, placement).0);
+        require_sdk(&copy, sdk, &[]);
+        let mut patch = toml_edit::InlineTable::new();
+        patch.insert("path", format!("{SCOPE_DIRECTORY}/{name}").into());
+        let patches = manifest["patch"].or_insert(toml_edit::table()).as_table_mut().expect("[patch] is a table");
+        patches.set_implicit(true);
+        patches["crates-io"].or_insert(toml_edit::table())[package.name.as_str()] = toml_edit::value(patch);
+    }
+    std::fs::write(&manifest_path, manifest.to_string()).expect("cannot write Cargo.toml");
+    points
+}
+
 fn argument(arguments: &[String], name: &str) -> Option<String> {
     arguments.iter().position(|argument| argument == name).and_then(|index| arguments.get(index + 1)).cloned()
 }
@@ -482,25 +572,11 @@ fn main() {
     let mut files = Vec::new();
     copy_tree(&source, &target, &mut files);
     files.sort();
-    let mut points = Vec::new();
-    let (mut serves, mut stores) = (false, false);
-    for file in files {
-        let path = file.strip_prefix(&target).expect("under the target").display().to_string();
-        let mut syntax = syn::parse_file(&std::fs::read_to_string(&file).expect("cannot read a source file"))
-            .unwrap_or_else(|error| panic!("cannot parse {path}: {error}"));
-        let mut placer = Placer { service: &service, path, placement: &config.placement, scopes: Vec::new(), owner: None,
-                                  ordinals: HashMap::new(), points: Vec::new(), serves: false, stores: false };
-        placer.visit_file_mut(&mut syntax);
-        serves |= placer.serves;
-        stores |= placer.stores;
-        if !placer.points.is_empty() || placer.serves || placer.stores {
-            std::fs::write(&file, prettyplease::unparse(&syntax)).expect("cannot write a source file");
-        }
-        points.extend(placer.points);
-    }
+    let (mut points, serves, stores) = place_files(&files, &target, "", None, &service, &config.placement);
     let features: Vec<&str> = [(serves, "tower"), (stores, "store")].into_iter()
         .filter_map(|(wired, feature)| wired.then_some(feature)).collect();
     require_sdk(&target, &sdk, &features);
+    points.extend(place_scope(&target, &sdk, &service, &config.placement));
     let manifest = serde_json::json!({"service": service, "language": "rust", "points": points});
     std::fs::write(target.join(MANIFEST_FILE), serde_json::to_string_pretty(&manifest).expect("serialises") + "\n")
         .expect("cannot write the manifest");
