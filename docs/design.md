@@ -166,8 +166,9 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | 语言运行时钩子 | 只改启动参数或环境变量 | 请求级范围、语义级故障点、库边界 | 需要运行时提供钩子 |
 | 编译期改写（构建副本、Go 的 `-toolexec`） | 只改构建流程 | 同上，并有完整的类型信息 | 需要重新构建 |
 | 服务网格（Envoy 故障过滤器） | 只改部署 | HTTP 拒绝和延迟，可按请求头（包括 baggage）匹配 | 不支持 `fail_after` 和 `duplicate`；需要部署网格 |
+| 用户态 eBPF（bpftime） | 只改环境变量（`LD_PRELOAD`），对原生库不需要 root | 在 Python、Node、JVM、Rust 进程的原生 C 库函数上观测与覆盖返回值，每次命中比内核 uprobe 便宜约 5–6 倍 | 同一函数上的覆盖与返回观测互斥；覆盖标记按钩子而不按线程保存，多线程下注入次数不准；Go 函数会使运行时崩溃；系统调用钩子需要 `CAP_SYS_RAWIO`；延迟只能忙等 |
 
-**结论**：请求级、语义级的故障点由语言运行时钩子承担，编译型语言改用构建副本；与请求无关的环境故障（系统调用、网络包）由 eBPF 代理承担。服务网格可以替代 RPC 边界的一部分，第一版不实现。uprobe 写寄存器第一版也不实现，只作为编译型语言免构建放置 `check` 的后续选项，在内核 7.0 上可用。
+**结论**：请求级、语义级的故障点由语言运行时钩子承担，编译型语言改用构建副本；与请求无关的环境故障（系统调用、网络包）由 eBPF 代理承担；原生函数和上游组件中的故障点由内核 uprobe 承担（第 6.5 节）。用户态 eBPF 因为同一函数不能既注入又观测、多线程下注入不准，不满足故障点的基本要求，暂不采用；它可以作为不需要特权的“只观测”选项，前提是先修正这两点。服务网格可以替代 RPC 边界的一部分，第一版不实现。
 
 参考：[bpf_override_return](https://docs.ebpf.io/linux/helper-function/bpf_override_return/)、[Tetragon 的 uprobe Override 条件](https://tetragon.io/docs/concepts/tracing-policy/selectors/)、[Node `module.registerHooks`](https://nodejs.org/api/module.html)、[OpenTelemetry Go 编译期插桩](https://opentelemetry.io/docs/zero-code/go/compile-time/)、[Cargo 的 rustc 包装器](https://doc.rust-lang.org/cargo/reference/config.html)。
 
