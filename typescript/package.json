@@ -13,12 +13,13 @@
     "faultpoint-scan": "./dist/scan.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json && cp ../spec/redis-commands.json dist/"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/context-async-hooks": "^2.0.0",
     "@opentelemetry/core": "^2.0.0",
+    "libpg-query": "^18.2.4",
     "typescript": "~5.9.3",
     "zod": "^4.1.0"
   },

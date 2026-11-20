@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import { OtelContext } from "./context.js";
 import { CORE, type Core, type Plugin } from "./core.js";
 import { httpPlugin } from "./http.js";
+import { ioredisPlugin } from "./ioredis.js";
 import { JsonlOptions, JsonlSink } from "./observations.js";
+import { pgPlugin } from "./pg.js";
 import { pointsPlugin } from "./points.js";
 import { FileRuleSource } from "./rules.js";
 import { instrumentModule } from "./transform.js";
@@ -36,7 +38,7 @@ const loadHookPlugin: Plugin = {
 };
 
 const BUILTIN_PLUGINS: ReadonlyMap<string, Plugin> = new Map(
-  [pointsPlugin, loadHookPlugin, httpPlugin].map((plugin) => [plugin.name, plugin]));
+  [pointsPlugin, loadHookPlugin, httpPlugin, pgPlugin, ioredisPlugin].map((plugin) => [plugin.name, plugin]));
 
 /** A built-in plugin, or the default export of the package of that name. */
 async function resolvePlugin(name: string): Promise<Plugin> {

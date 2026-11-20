@@ -1,8 +1,24 @@
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { join } from "node:path";
 
 import { z } from "zod";
 
-export const DEFAULT_PLUGINS = ["points", "load-hook", "http"];
+export const DEFAULT_PLUGINS = ["points", "load-hook", "http", "pg", "ioredis"];
+
+/** A CommonJS package as the application under the source root resolves it, so that a patch reaches the very
+ * module instance the application imports; null when the application does not depend on it. */
+export function applicationModule<T>(sourceRoot: string, name: string): T | null {
+  const require = createRequire(join(sourceRoot, "package.json"));
+  try {
+    return require(name) as T;
+  } catch (error) {
+    if ((error as { code?: string }).code === "MODULE_NOT_FOUND" && (error as Error).message.includes(`'${name}'`)) {
+      return null;
+    }
+    throw error;
+  }
+}
 
 /** The global placed code reaches the point functions through, so that CommonJS and ES modules need no import. */
 export const POINTS_SYMBOL = "faultpoint";
