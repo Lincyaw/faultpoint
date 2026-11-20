@@ -76,6 +76,13 @@ final class Defaults {
         private final String service;
         private final String process = ManagementFactory.getRuntimeMXBean().getName();
         private final int exemplars;
+        /** The share of traces whose ids are kept as exemplars, for hot library paths; counts stay exact. */
+        private final double exemplarRate;
+
+        /** Whether a trace is sampled, by its id, so that every process keeps or skips the same traces. */
+        boolean sampled(String traceId) {
+            return Math.floorMod(traceId.hashCode(), 10_000) < exemplarRate * 10_000;
+        }
         private Map<Key, Tally> tally = new LinkedHashMap<>();
         private double start = System.currentTimeMillis() / 1000.0;
 
@@ -83,6 +90,7 @@ final class Defaults {
             this.path = path;
             this.service = service;
             this.exemplars = ((Number) options.getOrDefault("exemplars", 5)).intValue();
+            this.exemplarRate = ((Number) options.getOrDefault("exemplar_rate", 1)).doubleValue();
             long flushMs = (long) (((Number) options.getOrDefault("flush_seconds", 2)).doubleValue() * 1000);
             daemon("faultpoint-observations", () -> {
                 while (true) {
@@ -103,7 +111,7 @@ final class Defaults {
                     observation.outcome(), observation.scope(), observation.rule()), ignored -> new Tally());
             entry.count += 1;
             entry.total += observation.quantity();
-            if (observation.traceId() != null && entry.exemplars.size() < exemplars) {
+            if (observation.traceId() != null && entry.exemplars.size() < exemplars && sampled(observation.traceId())) {
                 entry.exemplars.add(observation.traceId());
             }
         }

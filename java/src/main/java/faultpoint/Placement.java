@@ -39,9 +39,23 @@ public final class Placement implements ClassFileTransformer {
     /** A call site rewritten to a static helper whose first parameter is the receiver. */
     record CallSite(String name, String descriptor, String helperOwner, String helperName, String helperDescriptor) {}
 
+    /** Code that never gets points: the JDK, the agent and what it observes through, and logging. */
+    static final List<String> ALWAYS_EXCLUDED = List.of("java/", "javax/", "jdk/", "sun/", "com/sun/", "faultpoint/",
+            "io/opentelemetry/", "org/slf4j/", "ch/qos/logback/", "org/apache/logging/", "org/apache/commons/logging/");
+    static final java.util.regex.Pattern JAR_VERSION = java.util.regex.Pattern.compile("([^/!]+?)-(\\d[^/!]*)\\.jar(!/)?$");
+
+    /** Where a class's points go: the prefix of their locators, and the kinds allowed there (null: every kind).
+     * Business code has an empty prefix and also gets the boundary plugins' call sites. */
+    record Target(String prefix, Set<String> kinds, boolean business) {
+        boolean allows(String kind) {
+            return kinds == null || kinds.contains(kind);
+        }
+    }
+
     private final String service;
     private final List<String> packages;
     private final Settings.Placement switches;
+    private final List<String> excluded;
     private final Map<String, List<CallSite>> callSites = new HashMap<>();
     private final List<PointEntry> points = new ArrayList<>();
     private boolean placesPoints;
@@ -50,6 +64,32 @@ public final class Placement implements ClassFileTransformer {
         this.service = service;
         this.packages = packages.stream().map(name -> name.replace('.', '/')).toList();
         this.switches = switches;
+        this.excluded = java.util.stream.Stream.concat(ALWAYS_EXCLUDED.stream(),
+                switches.exclude().stream().map(name -> name.replace('.', '/'))).toList();
+    }
+
+    /** The version of the jar a class comes from, by the artifact-version.jar convention, which the offline scan
+     * reads from the same jar names; "unknown" when the name carries none. */
+    static String version(String location) {
+        var matched = JAR_VERSION.matcher(location == null ? "" : location);
+        return matched.find() ? matched.group(2) : "unknown";
+    }
+
+    /** Where the points of a class go, or null when it gets none. */
+    Target target(String internalName, String location) {
+        if (internalName == null || excluded.stream().anyMatch(internalName::startsWith)) {
+            return null;
+        }
+        if (packages.stream().anyMatch(internalName::startsWith)) {
+            return new Target("", null, true);
+        }
+        for (Settings.ScopeEntry entry : switches.scope()) {
+            if (internalName.startsWith(entry.include().replace('.', '/'))) {
+                return new Target(entry.include() + "@" + version(location) + "/",
+                        entry.kinds() == null ? null : Set.copyOf(entry.kinds()), false);
+            }
+        }
+        return null;
     }
 
     void placePoints() {
@@ -70,31 +110,30 @@ public final class Placement implements ClassFileTransformer {
         return points;
     }
 
-    boolean covers(String internalName) {
-        return internalName != null && packages.stream().anyMatch(internalName::startsWith);
-    }
-
     @Override
     public byte[] transform(ClassLoader loader, String internalName, Class<?> redefined, ProtectionDomain domain,
                             byte[] classfile) {
-        if (!covers(internalName)) {
+        String location = domain == null || domain.getCodeSource() == null || domain.getCodeSource().getLocation() == null
+                ? null : domain.getCodeSource().getLocation().toString();
+        Target target = target(internalName, location);
+        if (target == null) {
             return null;
         }
         try {
-            return rewrite(classfile, loader);
+            return rewrite(classfile, loader, target);
         } catch (RuntimeException failure) {
             System.err.println("faultpoint: cannot rewrite " + internalName + ": " + failure);
             return null;
         }
     }
 
-    byte[] rewrite(byte[] classfile, ClassLoader loader) {
+    byte[] rewrite(byte[] classfile, ClassLoader loader, Target target) {
         var node = new ClassNode();
         new ClassReader(classfile).accept(node, ClassReader.SKIP_FRAMES);
         var declarations = new Declarations(loader == null ? ClassLoader.getSystemClassLoader() : loader);
         for (MethodNode method : node.methods) {
             if ((method.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE | Opcodes.ACC_BRIDGE)) == 0) {
-                new MethodPlacer(node.name, method, declarations).place();
+                new MethodPlacer(node.name, method, declarations, target).place();
             }
         }
         var writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES) {
@@ -210,13 +249,15 @@ public final class Placement implements ClassFileTransformer {
         final String owner;
         final MethodNode method;
         final Declarations declarations;
+        final Target target;
         final Map<String, Integer> ordinals = new HashMap<>();
         final InsnList instructions;
 
-        MethodPlacer(String owner, MethodNode method, Declarations declarations) {
+        MethodPlacer(String owner, MethodNode method, Declarations declarations, Target target) {
             this.owner = owner;
             this.method = method;
             this.declarations = declarations;
+            this.target = target;
             this.instructions = method.instructions;
         }
 
@@ -230,7 +271,7 @@ public final class Placement implements ClassFileTransformer {
         }
 
         String place(String kind, AbstractInsnNode at, String anchor, boolean hashed) {
-            String locator = owner + ":" + method.name;
+            String locator = target.prefix() + owner + ":" + method.name;
             String base = locator + "#" + digest(method.desc + " " + anchor);
             if (hashed) {
                 int ordinal = ordinals.merge(base, 1, Integer::sum) - 1;
@@ -241,16 +282,16 @@ public final class Placement implements ClassFileTransformer {
             String id = RuleSet.pointId(service, kind, locator);
             String code = (method.name + method.desc + " " + anchor).substring(0,
                     Math.min(CODE_WIDTH, (method.name + method.desc + " " + anchor).length()));
-            points.add(new PointEntry(id, kind, owner, line(at), method.name, code));
+            points.add(new PointEntry(id, kind, target.prefix() + owner, line(at), method.name, code));
             return id;
         }
 
         void place() {
             if (placesPoints) {
-                var calls = throwingCalls();
-                var loops = loopHeaders();
-                var branches = guardedThrows();
-                var returns = switches.check() ? computedReturns() : List.<AbstractInsnNode>of();
+                var calls = target.allows("call") ? throwingCalls() : Map.<MethodInsnNode, String>of();
+                var loops = target.allows("loop") ? loopHeaders() : Map.<LabelNode, List<JumpInsnNode>>of();
+                var branches = target.allows("branch") ? guardedThrows() : Map.<JumpInsnNode, String>of();
+                var returns = switches.check() && target.allows("check") ? computedReturns() : List.<AbstractInsnNode>of();
                 if (!returns.isEmpty()) {
                     String id = place("check", returns.get(0), "check", false);
                     for (AbstractInsnNode returned : returns) {
@@ -274,8 +315,11 @@ public final class Placement implements ClassFileTransformer {
             }
             for (AbstractInsnNode instruction : instructions.toArray()) {
                 if (instruction instanceof MethodInsnNode invoked) {
-                    replaceCallSite(invoked);
-                    if (placesPoints) {
+                    // Boundary call sites belong to business code; in a library the boundary advice already sees them.
+                    if (target.business()) {
+                        replaceCallSite(invoked);
+                    }
+                    if (placesPoints && target.allows("clock")) {
                         wrapClockRead(invoked);
                     }
                 }

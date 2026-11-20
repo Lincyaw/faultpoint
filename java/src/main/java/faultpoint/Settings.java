@@ -14,14 +14,28 @@ public record Settings(String service, Path rules, Path report, List<String> pac
 
     static final ObjectMapper JSON = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
 
-    /** Which placement rules are applied, and the clock reads recognised as Owner.method. */
-    public record Placement(Boolean branch, Boolean check, Boolean loop, Boolean call, List<String> clock) {
+    /** A library package prefix whose classes get points, limited to some kinds when kinds is given. */
+    public record ScopeEntry(String include, List<String> kinds) {
+        public ScopeEntry {
+            if (include == null || include.isEmpty()) {
+                throw new IllegalArgumentException("a scope entry names the package prefix it includes");
+            }
+            kinds = kinds == null ? null : List.copyOf(kinds);
+        }
+    }
+
+    /** Which placement rules are applied, the clock reads recognised as Owner.method, and the libraries whose
+     * code gets points besides the business packages, minus the excluded prefixes. */
+    public record Placement(Boolean branch, Boolean check, Boolean loop, Boolean call, List<String> clock,
+                            List<ScopeEntry> scope, List<String> exclude) {
         public Placement {
             branch = branch == null || branch;
             check = check == null || check;
             loop = loop == null || loop;
             call = call == null || call;
             clock = clock == null ? List.of("System.currentTimeMillis", "Instant.now") : List.copyOf(clock);
+            scope = scope == null ? List.of() : List.copyOf(scope);
+            exclude = exclude == null ? List.of() : List.copyOf(exclude);
         }
     }
 
@@ -29,7 +43,7 @@ public record Settings(String service, Path rules, Path report, List<String> pac
     public record Config(List<String> plugins, Map<String, Map<String, Object>> options, Placement placement) {
         public Config {
             options = options == null ? Map.of() : Map.copyOf(options);
-            placement = placement == null ? new Placement(null, null, null, null, null) : placement;
+            placement = placement == null ? new Placement(null, null, null, null, null, null, null) : placement;
         }
 
         public Map<String, Object> options(String plugin) {

@@ -49,13 +49,14 @@ public final class Agent {
                 return instrumentation;
             }
         };
+        // The placement transforms before the plugins' advice, so it sees a class's original bytes, as the offline scan does.
+        instrumentation.addTransformer(placement);
         for (Plugin plugin : ServiceLoader.load(Plugin.class, Agent.class.getClassLoader())) {
             if (settings.config().enables(plugin.name())) {
                 plugin.install(installation, settings.config().options(plugin.name()));
             }
         }
         Core.install(core);
-        instrumentation.addTransformer(placement);
         core.start();
     }
 
@@ -99,18 +100,26 @@ public final class Agent {
                 config.placement());
         placement.placePoints();
         Path location = Path.of(options.get("--classes"));
-        var path = new java.util.ArrayList<java.net.URL>(List.of(location.toUri().toURL()));
+        var locations = new java.util.ArrayList<Path>(List.of(location));
         for (String entry : options.getOrDefault("--classpath", "").split(java.io.File.pathSeparator)) {
             if (!entry.isEmpty()) {
-                path.add(Path.of(entry).toUri().toURL());
+                locations.add(Path.of(entry));
             }
         }
-        // Call points depend on the exceptions callees declare, so the scan reads callees from the same class path the service runs with.
+        var path = new java.util.ArrayList<java.net.URL>();
+        for (Path each : locations) {
+            path.add(each.toUri().toURL());
+        }
+        // Call points depend on the exceptions callees declare, and library points on the jars in the placement scope,
+        // so the scan reads the same class path the service runs with.
         try (var loader = new java.net.URLClassLoader(path.toArray(java.net.URL[]::new), ClassLoader.getPlatformClassLoader())) {
-            for (var entry : classes(location)) {
-                String internalName = entry.getKey().substring(0, entry.getKey().length() - ".class".length()).replace('\\', '/');
-                if (placement.covers(internalName)) {
-                    placement.rewrite(entry.getValue(), loader);
+            for (Path each : locations) {
+                for (var entry : classes(each)) {
+                    String internalName = entry.getKey().substring(0, entry.getKey().length() - ".class".length()).replace('\\', '/');
+                    Placement.Target target = placement.target(internalName, each.toString());
+                    if (target != null) {
+                        placement.rewrite(entry.getValue(), loader, target);
+                    }
                 }
             }
         }
