@@ -1,0 +1,3 @@
+[workspace]
+members = ["faultpoint", "faultpoint-rewrite"]
+resolver = "3"

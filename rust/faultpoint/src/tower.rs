@@ -1,0 +1,142 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::LazyLock;
+use std::task::{Context as Poll, Poll as Ready};
+use std::time::{Duration, Instant};
+
+use http::{Request, Response, StatusCode};
+use opentelemetry::context::FutureExt;
+use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
+use opentelemetry_http::HeaderExtractor;
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+use regex::Regex;
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::core::{Plugin, core};
+use crate::rules::point_id;
+
+const DEFAULT_FAILURE_STATUS: u16 = 503;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct TowerOptions {
+    identifier_segment: String,
+}
+
+impl Default for TowerOptions {
+    fn default() -> Self {
+        TowerOptions {
+            identifier_segment: r"^(\d+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,})$".into(),
+        }
+    }
+}
+
+static IDENTIFIER_SEGMENT: LazyLock<Regex> = LazyLock::new(|| {
+    let options: TowerOptions = serde_json::from_value(core().settings.config.options("tower"))
+        .expect("faultpoint: invalid tower options");
+    Regex::new(&options.identifier_segment).expect("faultpoint: invalid identifier_segment")
+});
+
+static PROPAGATOR: LazyLock<TextMapCompositePropagator> = LazyLock::new(|| {
+    TextMapCompositePropagator::new(vec![Box::new(TraceContextPropagator::new()), Box::new(BaggagePropagator::new())])
+});
+
+/// A request path with identifier segments replaced, so that one route is one point.
+pub fn path_template(path: &str) -> String {
+    path.split('/').map(|segment| if IDENTIFIER_SEGMENT.is_match(segment) { "{}" } else { segment })
+        .collect::<Vec<_>>().join("/")
+}
+
+fn status_outcome(status: StatusCode) -> String {
+    format!("{}xx", status.as_u16() / 100)
+}
+
+fn failure<B: Default>(rule_status: Option<&Value>) -> Response<B> {
+    let status = rule_status.and_then(Value::as_u64).map_or(DEFAULT_FAILURE_STATUS, |status| status as u16);
+    let mut response = Response::new(B::default());
+    *response.status_mut() = StatusCode::from_u16(status).expect("a validated status");
+    response
+}
+
+/// The rpc_server point of every request a tower service handles; it restores the caller's trace
+/// context and baggage for the handler.
+#[derive(Clone, Copy, Default)]
+pub struct FaultpointLayer;
+
+impl<S> tower::Layer<S> for FaultpointLayer {
+    type Service = FaultpointService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        FaultpointService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct FaultpointService<S> {
+    inner: S,
+}
+
+impl<S, RequestBody, ResponseBody> tower::Service<Request<RequestBody>> for FaultpointService<S>
+where
+    S: tower::Service<Request<RequestBody>, Response = Response<ResponseBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    RequestBody: Send + 'static,
+    ResponseBody: Default + Send + 'static,
+{
+    type Response = Response<ResponseBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, context: &mut Poll<'_>) -> Ready<Result<(), S::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, request: Request<RequestBody>) -> Self::Future {
+        let core = core();
+        let mut inner = self.inner.clone();
+        std::mem::swap(&mut self.inner, &mut inner);
+        if !core.enabled {
+            return Box::pin(inner.call(request));
+        }
+        let parent = PROPAGATOR.extract(&HeaderExtractor(request.headers()));
+        let point = point_id(&core.settings.service, "rpc_server",
+                             &format!("{} {}", request.method(), path_template(request.uri().path())));
+        let rule = {
+            let _attached = parent.clone().attach();
+            core.decide(&point)
+        };
+        Box::pin(async move {
+            let started = Instant::now();
+            let elapsed = || started.elapsed().as_secs_f64() * 1000.0;
+            let kind = rule.as_ref().map(|rule| rule.action.kind.as_str());
+            if let (Some(rule), Some("delay")) = (&rule, kind) {
+                tokio::time::sleep(Duration::from_secs_f64(rule.number("ms").unwrap_or_else(|reason| core.abort(&reason)) / 1000.0)).await;
+            }
+            if let (Some(rule), Some("crash")) = (&rule, kind) {
+                core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32);
+            }
+            if let (Some(rule), Some("fail" | "fail_after")) = (&rule, kind) {
+                if kind == Some("fail_after") {
+                    inner.call(request).await?;
+                }
+                let response = failure(rule.action.parameters.get("status"));
+                core.observe(&point, &status_outcome(response.status()), elapsed(), Some(rule));
+                return Ok(response);
+            }
+            let response = inner.call(request).await;
+            let outcome = response.as_ref().map_or_else(|_| "error".to_owned(), |response| status_outcome(response.status()));
+            core.observe(&point, &outcome, elapsed(), rule.as_ref());
+            response
+        }.with_context(parent))
+    }
+}
+
+inventory::submit! {
+    Plugin {
+        name: "tower",
+        kinds: &[("rpc_server", &["fail", "fail_after", "delay", "crash"])],
+        rule_source: None, sink: None, context: None,
+    }
+}
