@@ -50,6 +50,8 @@ type core struct {
 	started    atomic.Bool
 	state      atomic.Pointer[ruleState]
 	mu         sync.Mutex
+	exit       sync.Mutex
+	cleanups   []func()
 }
 
 var current core
@@ -200,10 +202,23 @@ func Observe(ctx context.Context, point, outcome string, total float64, rule *Ru
 // Service is the name the points of boundaries are identified by.
 func Service() string { return current.settings.service }
 
-// Crash writes the pending observations and ends the process with code.
+// AtExit registers a cleanup that Crash and Abort run, in registration order, before the process ends, so that a
+// process owner such as the eBPF agent can undo what it changed on the host.
+func AtExit(cleanup func()) {
+	current.exit.Lock()
+	defer current.exit.Unlock()
+	current.cleanups = append(current.cleanups, cleanup)
+}
+
+// Crash writes the pending observations, runs the registered cleanups and ends the process with code.
 func Crash(code int) {
+	// The lock is held until the process ends, so that a concurrent Crash waits for the cleanups instead of exiting first.
+	current.exit.Lock()
 	if current.started.Load() && current.sink != nil {
 		current.sink.Flush()
+	}
+	for _, cleanup := range current.cleanups {
+		cleanup()
 	}
 	os.Exit(code)
 }
