@@ -15,6 +15,8 @@ from faultpoint.tools.candidates import executed_candidates
 from faultpoint.tools.kinds import KindTable
 
 app = typer.Typer(no_args_is_help=True, help="Fault points that inject and observe faults.")
+# Point ids are printed verbatim: rich would turn ":loop:" into an emoji and "[...]" into markup.
+CONSOLE = Console(emoji=False, markup=False, highlight=False)
 
 
 @app.command()
@@ -66,7 +68,7 @@ def candidates(reports: Annotated[list[Path], typer.Argument(help="Observation f
         table.add_row(str(candidate.executions), candidate.point.id,
                       " ".join(f"{outcome}={count}" for outcome, count in candidate.outcomes.items()),
                       candidate.point.code)
-    Console().print(table)
+    CONSOLE.print(table)
 
 
 @app.command()
@@ -84,12 +86,11 @@ def diff(reports: Annotated[list[Path], typer.Argument(help="Observation files o
     if as_json:
         typer.echo(comparison.model_dump_json(indent=2))
         return
-    console = Console()
     injections = Table("rule", "point", "outcome", "injected per repetition", title="Injections")
     for injection in comparison.injections:
         injections.add_row(injection.rule, injection.point, injection.outcome,
                            " ".join(map(str, injection.counts)))
-    console.print(injections)
+    CONSOLE.print(injections)
     effects = Table("point", "outcome", "metric", "verdict", "control", "treatment", "p",
                     title="Effects")
     for effect in comparison.effects:
@@ -97,4 +98,4 @@ def diff(reports: Annotated[list[Path], typer.Argument(help="Observation files o
                         " ".join(f"{value:g}" for value in effect.control),
                         " ".join(f"{value:g}" for value in effect.treatment),
                         "" if effect.p_value is None else f"{effect.p_value:.3g}")
-    console.print(effects)
+    CONSOLE.print(effects)
