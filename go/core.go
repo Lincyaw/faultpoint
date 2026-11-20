@@ -64,7 +64,9 @@ func init() {
 	current.state.Store(&ruleState{})
 }
 
-// Register enrolls a plugin and reports whether it is enabled; its options are decoded only then.
+// Register enrolls a plugin and reports whether it is enabled; its options are decoded only then. A kind several
+// plugins serve accepts only the actions all of them implement, so that a rule one of them cannot obey is refused
+// when it is installed.
 func Register(plugin Plugin) bool {
 	current.registered = append(current.registered, plugin.Name)
 	if !current.enabled || !current.settings.config.enables(plugin.Name) {
@@ -72,7 +74,11 @@ func Register(plugin Plugin) bool {
 	}
 	Options(plugin.Name, plugin.Options)
 	for kind, actions := range plugin.Actions {
-		current.actions[kind] = append(current.actions[kind], actions...)
+		served, found := current.actions[kind]
+		if found {
+			actions = slices.DeleteFunc(slices.Clone(served), func(action string) bool { return !slices.Contains(actions, action) })
+		}
+		current.actions[kind] = actions
 	}
 	return true
 }
