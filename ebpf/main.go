@@ -42,6 +42,9 @@ func main() {
 	faultpoint.Options(optionsName, &options)
 	jsonl := faultpoint.DefaultJSONLOptions
 	faultpoint.Options(jsonlOptionsName, &jsonl)
+	if report != "" && jsonl.FlushSeconds == 0 {
+		faultpoint.Abort("the agent reads kernel counts every flush_seconds, so it needs a positive interval")
+	}
 	services, err := options.services()
 	if err != nil {
 		faultpoint.Abort("%v", err)
