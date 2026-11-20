@@ -1,3 +1,4 @@
+import re
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Self
 
@@ -20,6 +21,8 @@ class PointKind(StrEnum):
     STORE_WRITE = "store_write"
     PUBLISH = "publish"
     CONSUME = "consume"
+    SYSCALL = "syscall"
+    PACKET = "packet"
 
 
 class ActionKind(StrEnum):
@@ -43,23 +46,28 @@ class BoundaryError(StrEnum):
 RPC_KINDS: Final = frozenset({PointKind.RPC_CLIENT, PointKind.RPC_SERVER})
 BOUNDARY_KINDS: Final = RPC_KINDS | {PointKind.STORE_READ, PointKind.STORE_WRITE,
                                      PointKind.PUBLISH, PointKind.CONSUME}
-UNIVERSAL_ACTIONS: Final = frozenset({ActionKind.DELAY, ActionKind.CRASH})
+KERNEL_KINDS: Final = frozenset({PointKind.SYSCALL, PointKind.PACKET})
+"""Points the eBPF agent places, which see processes and sockets but no request baggage."""
+ERRNO_NAME: Final = r"^E[A-Z0-9]+$"
+HELD: Final = frozenset({ActionKind.DELAY, ActionKind.CRASH})
 ALLOWED_ACTIONS: Final[dict[PointKind, frozenset[ActionKind]]] = {
-    PointKind.BRANCH: frozenset({ActionKind.FAIL}),
-    PointKind.CALL: frozenset({ActionKind.FAIL}),
-    PointKind.CHECK: frozenset({ActionKind.NEGATE}),
-    PointKind.LOOP: frozenset(),
-    PointKind.VALUE: frozenset({ActionKind.SET, ActionKind.SHIFT}),
-    PointKind.CLOCK: frozenset({ActionKind.SHIFT}),
-    PointKind.ACQUIRE: frozenset({ActionKind.FAIL}),
-    PointKind.RPC_CLIENT: frozenset({ActionKind.FAIL, ActionKind.FAIL_AFTER, ActionKind.DUPLICATE}),
-    PointKind.RPC_SERVER: frozenset({ActionKind.FAIL, ActionKind.FAIL_AFTER}),
-    PointKind.STORE_READ: frozenset({ActionKind.FAIL, ActionKind.EMPTY}),
-    PointKind.STORE_WRITE: frozenset({ActionKind.FAIL, ActionKind.FAIL_AFTER, ActionKind.DROP,
-                                      ActionKind.DUPLICATE}),
-    PointKind.PUBLISH: frozenset({ActionKind.FAIL, ActionKind.FAIL_AFTER, ActionKind.DROP,
-                                  ActionKind.DUPLICATE}),
-    PointKind.CONSUME: frozenset({ActionKind.FAIL, ActionKind.FAIL_AFTER, ActionKind.DUPLICATE}),
+    PointKind.BRANCH: HELD | {ActionKind.FAIL},
+    PointKind.CALL: HELD | {ActionKind.FAIL},
+    PointKind.CHECK: HELD | {ActionKind.NEGATE},
+    PointKind.LOOP: HELD,
+    PointKind.VALUE: HELD | {ActionKind.SET, ActionKind.SHIFT},
+    PointKind.CLOCK: HELD | {ActionKind.SHIFT},
+    PointKind.ACQUIRE: HELD | {ActionKind.FAIL},
+    PointKind.RPC_CLIENT: HELD | {ActionKind.FAIL, ActionKind.FAIL_AFTER, ActionKind.DUPLICATE},
+    PointKind.RPC_SERVER: HELD | {ActionKind.FAIL, ActionKind.FAIL_AFTER},
+    PointKind.STORE_READ: HELD | {ActionKind.FAIL, ActionKind.EMPTY},
+    PointKind.STORE_WRITE: HELD | {ActionKind.FAIL, ActionKind.FAIL_AFTER, ActionKind.DROP,
+                                   ActionKind.DUPLICATE},
+    PointKind.PUBLISH: HELD | {ActionKind.FAIL, ActionKind.FAIL_AFTER, ActionKind.DROP,
+                               ActionKind.DUPLICATE},
+    PointKind.CONSUME: HELD | {ActionKind.FAIL, ActionKind.FAIL_AFTER, ActionKind.DUPLICATE},
+    PointKind.SYSCALL: frozenset({ActionKind.FAIL, ActionKind.CRASH}),
+    PointKind.PACKET: frozenset({ActionKind.DELAY, ActionKind.DROP}),
 }
 
 
@@ -81,7 +89,8 @@ class Fail(BaseModel):
 
     kind: Literal[ActionKind.FAIL]
     error: str | None = None
-    """A registered error name for a call point, or a boundary error for a boundary point."""
+    """A registered error name for a call point, a boundary error for a boundary point, or an
+    errno name for a syscall point."""
     status: int | None = Field(default=None, ge=100, le=599)
     """The synthetic response status of an RPC point."""
 
@@ -173,8 +182,13 @@ class Rule(BaseModel):
     def validate_action(self) -> Self:
         kind = point_kind(self.point)
         action = self.action.kind
-        if action not in ALLOWED_ACTIONS[kind] | UNIVERSAL_ACTIONS:
+        if action not in ALLOWED_ACTIONS[kind]:
             raise ValueError(f"action {action} does not apply to a {kind} point")
+        if kind in KERNEL_KINDS and self.scope:
+            raise ValueError(f"a {kind} point sees no baggage, so its rule has no scope")
+        if kind is PointKind.SYSCALL and isinstance(self.action, Fail) and (
+                self.action.error is None or re.match(ERRNO_NAME, self.action.error) is None):
+            raise ValueError("a syscall fails with an errno name such as ECONNREFUSED")
         if isinstance(self.action, Fail | FailAfter):
             if self.action.status is not None and kind not in RPC_KINDS:
                 raise ValueError("only an RPC point responds with a status")

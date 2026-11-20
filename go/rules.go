@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -25,6 +26,8 @@ const (
 	KindStoreWrite Kind = "store_write"
 	KindPublish    Kind = "publish"
 	KindConsume    Kind = "consume"
+	KindSyscall    Kind = "syscall"
+	KindPacket     Kind = "packet"
 )
 
 // ActionKind is the deviation a rule injects.
@@ -50,20 +53,27 @@ const (
 )
 
 var allowedActions = map[Kind][]ActionKind{
-	KindBranch:     {ActionFail},
-	KindCall:       {ActionFail},
-	KindCheck:      {ActionNegate},
-	KindLoop:       {},
-	KindValue:      {ActionSet, ActionShift},
-	KindClock:      {ActionShift},
-	KindAcquire:    {ActionFail},
-	KindRPCClient:  {ActionFail, ActionFailAfter, ActionDuplicate},
-	KindRPCServer:  {ActionFail, ActionFailAfter},
-	KindStoreRead:  {ActionFail, ActionEmpty},
-	KindStoreWrite: {ActionFail, ActionFailAfter, ActionDrop, ActionDuplicate},
-	KindPublish:    {ActionFail, ActionFailAfter, ActionDrop, ActionDuplicate},
-	KindConsume:    {ActionFail, ActionFailAfter, ActionDuplicate},
+	KindBranch:     {ActionDelay, ActionCrash, ActionFail},
+	KindCall:       {ActionDelay, ActionCrash, ActionFail},
+	KindCheck:      {ActionDelay, ActionCrash, ActionNegate},
+	KindLoop:       {ActionDelay, ActionCrash},
+	KindValue:      {ActionDelay, ActionCrash, ActionSet, ActionShift},
+	KindClock:      {ActionDelay, ActionCrash, ActionShift},
+	KindAcquire:    {ActionDelay, ActionCrash, ActionFail},
+	KindRPCClient:  {ActionDelay, ActionCrash, ActionFail, ActionFailAfter, ActionDuplicate},
+	KindRPCServer:  {ActionDelay, ActionCrash, ActionFail, ActionFailAfter},
+	KindStoreRead:  {ActionDelay, ActionCrash, ActionFail, ActionEmpty},
+	KindStoreWrite: {ActionDelay, ActionCrash, ActionFail, ActionFailAfter, ActionDrop, ActionDuplicate},
+	KindPublish:    {ActionDelay, ActionCrash, ActionFail, ActionFailAfter, ActionDrop, ActionDuplicate},
+	KindConsume:    {ActionDelay, ActionCrash, ActionFail, ActionFailAfter, ActionDuplicate},
+	KindSyscall:    {ActionFail, ActionCrash},
+	KindPacket:     {ActionDelay, ActionDrop},
 }
+
+var errnoName = regexp.MustCompile(`^E[A-Z0-9]+$`)
+
+// kernel is whether the eBPF agent places points of a kind, which see no request baggage.
+func kernel(kind Kind) bool { return kind == KindSyscall || kind == KindPacket }
 
 var actionFields = map[ActionKind][]string{
 	ActionFail:      {"error", "status"},
@@ -203,8 +213,14 @@ func validateRule(rule Rule) error {
 		return err
 	}
 	action := rule.Action
-	if action.Kind != ActionDelay && action.Kind != ActionCrash && !slices.Contains(allowedActions[kind], action.Kind) {
+	if !slices.Contains(allowedActions[kind], action.Kind) {
 		return fmt.Errorf("action %s does not apply to a %s point", action.Kind, kind)
+	}
+	if kernel(kind) && len(rule.Scope) > 0 {
+		return fmt.Errorf("a %s point sees no baggage, so its rule has no scope", kind)
+	}
+	if kind == KindSyscall && action.Kind == ActionFail && !errnoName.MatchString(action.Error) {
+		return fmt.Errorf("a syscall fails with an errno name such as ECONNREFUSED")
 	}
 	switch action.Kind {
 	case ActionDelay:

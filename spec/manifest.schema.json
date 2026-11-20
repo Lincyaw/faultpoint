@@ -53,7 +53,9 @@
         "store_read",
         "store_write",
         "publish",
-        "consume"
+        "consume",
+        "syscall",
+        "packet"
       ],
       "title": "PointKind",
       "type": "string"
