@@ -277,7 +277,7 @@ class CommandPoints:
                                      else StoreOutcome.ROWS, 0.0, decision)
             case MessageKind.CONSUME:
                 messages = delivered(command, reply)
-                self.runtime.observe(point, StoreOutcome.OK if messages else StoreOutcome.EMPTY, messages, decision)
+                self.runtime.observe(point, StoreOutcome.ROWS if messages else StoreOutcome.EMPTY, messages, decision)
             case _:
                 self.runtime.observe(point, StoreOutcome.OK, 0.0, decision)
 
