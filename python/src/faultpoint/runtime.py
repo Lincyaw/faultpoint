@@ -180,7 +180,8 @@ RUNTIME: Runtime
 
 
 def start() -> None:
-    """Enable faultpoint in this process: load its plugins, obey its rules, then install the plugins."""
+    """Enable faultpoint in this process: load and install its plugins, then obey its rules, so that a module a rule
+    imports, such as the exception class of a call point, is imported through the installed import hook."""
     global RUNTIME
     try:
         settings = Settings()
@@ -188,14 +189,14 @@ def start() -> None:
         available = {point.name: point for point in entry_points(group=PLUGIN_GROUP)}
         plugins: dict[str, Plugin] = {name: available[name].load() for name in config.plugins}
         RUNTIME = Runtime(settings, config, plugins)
+        for name, plugin in plugins.items():
+            if plugin.install is not None:
+                plugin.install(RUNTIME, config.options.get(name, {}))
         source = provided((plugin.source for plugin in plugins.values()), file_rule_source)(settings, config)
         if source is not None:
             RUNTIME.reload(source)
             threading.Thread(target=repeat, args=(POLL_INTERVAL_S, functools.partial(RUNTIME.reload, source)),
                              name="faultpoint-rules", daemon=True).start()
-        for name, plugin in plugins.items():
-            if plugin.install is not None:
-                plugin.install(RUNTIME, config.options.get(name, {}))
         if RUNTIME.sink is not None:
             atexit.register(RUNTIME.sink.flush)
             threading.Thread(target=repeat, args=(RUNTIME.sink.interval, RUNTIME.sink.flush),

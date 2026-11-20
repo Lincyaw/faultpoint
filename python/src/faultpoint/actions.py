@@ -1,7 +1,7 @@
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, Field, ImportString, JsonValue
 
 from faultpoint.rules import STRICT
 
@@ -32,6 +32,16 @@ class Fail(BaseModel):
     kind: Literal[ActionKind.FAIL]
     error: str | None = None
     """The registered error a call point returns."""
+
+
+class RaiseFail(BaseModel):
+    """Raising an exception at a call site, constructed with an empty message: the class an importable dotted name
+    gives, or else the first class the handlers around the call site name."""
+
+    model_config = STRICT
+
+    kind: Literal[ActionKind.FAIL]
+    error: ImportString[type[BaseException]] | None = None
 
 
 class Failure(BaseModel):

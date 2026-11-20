@@ -1,4 +1,5 @@
 import ast
+import copy
 import hashlib
 import importlib.util
 from collections import Counter
@@ -28,6 +29,7 @@ class Placement(BaseModel):
     branch: bool = True
     check: bool = True
     loop: bool = True
+    call: bool = True
     clock: tuple[str, ...] = DEFAULT_CLOCK
 
 
@@ -100,8 +102,25 @@ def point_call(kind: PointKind, point: str, *arguments: ast.expr) -> ast.Call:
     return ast.Call(func=target, args=[ast.Constant(value=point), *arguments], keywords=[])
 
 
+def handled_classes(handlers: list[ast.ExceptHandler]) -> tuple[ast.expr, ...]:
+    """The exception classes a try statement's handlers name; a bare except names none."""
+    return tuple(copy.deepcopy(klass) for handler in handlers
+                 for klass in (handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type])
+                 if klass is not None)
+
+
+def call_site(statement: ast.stmt, point: str, classes: tuple[ast.expr, ...]) -> ast.With:
+    """A statement inside `with faultpoint.points.call(point, lambda: classes)`; the lambda defers the handlers'
+    class expressions, which Python evaluates only when an exception reaches them."""
+    candidates = ast.Lambda(args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+                            body=ast.Tuple(elts=list(classes), ctx=ast.Load()))
+    return ast.copy_location(ast.With(items=[ast.withitem(context_expr=point_call(PointKind.CALL, point, candidates))],
+                                      body=[statement]), statement)
+
+
 class PointPlacer(ast.NodeTransformer):
-    """Places branch, check, loop and clock points in one module, as the placement rules allow."""
+    """Places branch, check, loop, call and clock points in one module, as the placement rules allow; a call point
+    is a statement with a call inside a try block whose handlers name exception classes."""
 
     def __init__(self, service: str, path: str, source: str, placement: Placement) -> None:
         self.service = service
@@ -111,6 +130,7 @@ class PointPlacer(ast.NodeTransformer):
         self.clocks = [tuple(name.split(".")) for name in placement.clock]
         self.scopes: list[str] = []
         self.checks: list[str | None] = []
+        self.handled: list[tuple[ast.expr, ...]] = []
         self.ordinals: Counter[str] = Counter()
         self.points: list[PointEntry] = []
 
@@ -130,7 +150,9 @@ class PointPlacer(ast.NodeTransformer):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
         self.scopes.append(node.name)
+        self.handled.append(())
         self.generic_visit(node)
+        self.handled.pop()
         self.scopes.pop()
         return node
 
@@ -138,10 +160,44 @@ class PointPlacer(ast.NodeTransformer):
         self.scopes.append(node.name)
         placed = self.placement.check and returns_bool(node)
         self.checks.append(self.place(PointKind.CHECK, node, None) if placed else None)
+        self.handled.append(())
         self.generic_visit(node)
+        self.handled.pop()
         self.checks.pop()
         self.scopes.pop()
         return node
+
+    def visit_Try(self, node: ast.Try) -> ast.Try:
+        self.handled.append(handled_classes(node.handlers))
+        node.body = [self.visit(statement) for statement in node.body]
+        self.handled.pop()
+        node.handlers = [self.visit(handler) for handler in node.handlers]
+        node.orelse = [self.visit(statement) for statement in node.orelse]
+        node.finalbody = [self.visit(statement) for statement in node.finalbody]
+        return node
+
+    def call_point(self, node: ast.stmt) -> str | None:
+        """The call point of a statement with a call whose exceptions the innermost try's handlers name."""
+        classes = self.handled[-1] if self.handled else ()
+        calls = self.placement.call and classes and any(isinstance(child, ast.Call) for child in ast.walk(node))
+        return self.place(PointKind.CALL, node, node) if calls else None
+
+    def visit_statement(self, node: ast.stmt) -> ast.stmt:
+        point = self.call_point(node)
+        self.generic_visit(node)
+        return node if point is None else call_site(node, point, self.handled[-1])
+
+    def visit_Expr(self, node: ast.Expr) -> ast.stmt:
+        return self.visit_statement(node)
+
+    def visit_Assign(self, node: ast.Assign) -> ast.stmt:
+        return self.visit_statement(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.stmt:
+        return self.visit_statement(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.stmt:
+        return self.visit_statement(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         return self.visit_function(node)
@@ -155,12 +211,13 @@ class PointPlacer(ast.NodeTransformer):
         self.checks.pop()
         return node
 
-    def visit_Return(self, node: ast.Return) -> ast.Return:
+    def visit_Return(self, node: ast.Return) -> ast.stmt:
+        point = self.call_point(node)
         self.generic_visit(node)
         check = self.checks[-1] if self.checks else None
         if check is not None and node.value is not None:
             node.value = point_call(PointKind.CHECK, check, node.value)
-        return node
+        return node if point is None else call_site(node, point, self.handled[-1])
 
     def visit_If(self, node: ast.If) -> ast.If:
         guards = self.placement.branch and any(

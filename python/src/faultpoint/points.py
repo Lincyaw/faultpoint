@@ -1,17 +1,22 @@
 import time
+from collections.abc import Callable
 from datetime import date, timedelta
 from enum import StrEnum
+from types import TracebackType
 from typing import Any, Final
 
 import faultpoint.runtime
-from faultpoint.actions import Crash, Delay, Fail, Negate, SetValue, Shift
+from faultpoint.actions import Crash, Delay, Fail, Negate, RaiseFail, SetValue, Shift
 from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
+
+INJECTED_MESSAGE: Final = ""
 
 
 class PointKind(StrEnum):
     """The in-process kinds; placed code calls the function of this module named after the kind."""
 
     BRANCH = "branch"
+    CALL = "call"
     CHECK = "check"
     LOOP = "loop"
     VALUE = "value"
@@ -22,6 +27,8 @@ class PointKind(StrEnum):
 class PointOutcome(StrEnum):
     TAKEN = "taken"
     NOT_TAKEN = "not_taken"
+    OK = "ok"
+    ERROR = "error"
     TRUE = "true"
     FALSE = "false"
     ITERATION = "iteration"
@@ -33,6 +40,7 @@ class PointOutcome(StrEnum):
 
 PLUGIN: Final = Plugin(actions={
     PointKind.BRANCH: implemented_actions(Fail, Delay, Crash),
+    PointKind.CALL: implemented_actions(RaiseFail, Delay, Crash),
     PointKind.CHECK: implemented_actions(Negate, Delay, Crash),
     PointKind.LOOP: implemented_actions(Delay, Crash),
     PointKind.VALUE: implemented_actions(SetValue, Shift, Delay, Crash),
@@ -61,6 +69,32 @@ def branch(point: str, taken: bool) -> bool:
             taken = True
     runtime.observe(point, PointOutcome.TAKEN if taken else PointOutcome.NOT_TAKEN, 0.0, decision)
     return taken
+
+
+class CallSite:
+    """A statement with a call inside a try block: a fail rule raises before it runs an exception the try's handlers
+    catch, and whatever exception leaves it is an error."""
+
+    def __init__(self, runtime: Runtime, point: str, candidates: Callable[[], tuple[type[BaseException], ...]]) -> None:
+        self.runtime = runtime
+        self.point = point
+        self.candidates = candidates
+        self.decision: Decision | None = None
+
+    def __enter__(self) -> None:
+        self.decision = decide_in_process(self.runtime, self.point)
+        match self.decision:
+            case Decision(action=RaiseFail(error=error)):
+                self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision)
+                raise (self.candidates()[0] if error is None else error)(INJECTED_MESSAGE)
+
+    def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
+                 trace: TracebackType | None) -> None:
+        self.runtime.observe(self.point, PointOutcome.OK if kind is None else PointOutcome.ERROR, 0.0, self.decision)
+
+
+def call(point: str, candidates: Callable[[], tuple[type[BaseException], ...]]) -> CallSite:
+    return CallSite(faultpoint.runtime.RUNTIME, point, candidates)
 
 
 def check(point: str, result: bool) -> bool:
