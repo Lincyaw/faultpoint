@@ -1,0 +1,4 @@
+faultpoint.Points$PointsPlugin
+faultpoint.ServletBoundary$ServletPlugin
+faultpoint.HttpClients$HttpClientPlugin
+faultpoint.Jdbc$JdbcPlugin
