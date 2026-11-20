@@ -104,6 +104,8 @@ class Edge(BaseModel):
     counterparts: tuple[Fault, ...]
     terminal: bool
     effect_layer: Layer
+    acts_on: str | None = None
+    """For a fault no rule can scope, the container or process it reaches the whole of."""
 
     @property
     def held_in(self) -> frozenset[str]:
@@ -157,7 +159,7 @@ def counterparts(effect: EffectKey, verdicts: set[Verdict], effects: EffectMap,
 
 
 def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: EffectMap, catalog: Catalog,
-                upstream: frozenset[str]) -> list[Edge]:
+                upstream: frozenset[str], targets: dict[str, str]) -> list[Edge]:
     """Every (fault, effect) pair the exercised records show, over the scenarios each fault was tested in."""
     by_fault: dict[str, list[TreatmentRecord]] = defaultdict(list)
     for record in records:
@@ -177,5 +179,6 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
             edges.append(Edge(cause=runs[0].fault, effect=effect, held=tuple(held), not_held=tuple(not_held),
                               conditions=learn_conditions(held_in, not_held, scenarios), counterpart=counterpart,
                               counterparts=faults, terminal=effects.terminal(effect),
-                              effect_layer=point_layer(effect.point, upstream)))
+                              effect_layer=point_layer(effect.point, upstream),
+                              acts_on=None if runs[0].fault.scoped else targets[point_service(runs[0].fault.point)]))
     return edges

@@ -11,13 +11,16 @@ from shop.workload import FROZEN, Workload
 
 REDIS: Final = "redis"
 POSTGRES: Final = "postgres"
-UPSTREAM_SERVICES: Final = frozenset({REDIS, POSTGRES})
+REDIS_IMAGE: Final = "redis:7"
+POSTGRES_IMAGE: Final = "postgres:16"
+UNSCOPED_TARGETS: Final = {service: f"the {service} container ({image})"
+                           for service, image in ((REDIS, REDIS_IMAGE), (POSTGRES, POSTGRES_IMAGE))}
+"""What a fault no rule can scope acts on, by the service of its point: the whole of a container."""
+UPSTREAM_SERVICES: Final = frozenset(UNSCOPED_TARGETS)
 """The services of the upstream components in point ids."""
 PACKET_POINTS: Final = tuple(f"{service}:packet:egress:*:*" for service in sorted(UPSTREAM_SERVICES))
 """The packets each upstream component sends, which the kernel agent can delay; it observes only what it injects, so
 these points are configured rather than found in a control."""
-REDIS_IMAGE: Final = "redis:7"
-POSTGRES_IMAGE: Final = "postgres:16"
 AGENT_IMAGE: Final = "python:3.12-alpine"
 POSTGRES_PASSWORD: Final = "shop"
 REDIS_PORT: Final = 6379

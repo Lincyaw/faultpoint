@@ -21,6 +21,13 @@ class Hop(BaseModel):
     held: tuple[str, ...]
     cluster: int
     effect_layer: Layer
+    acts_on: str | None = None
+    """For a fault no rule can scope, the container or process it reaches the whole of."""
+
+    @property
+    def text(self) -> str:
+        where = f" on {self.acts_on}" if self.acts_on else ""
+        return f"[{self.cause.layer}{where}: {self.cause.key}] -> [{self.effect_layer}: {self.effect.key}]"
 
 
 class Chain(BaseModel):
@@ -167,7 +174,8 @@ def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[Tre
         effects = {edge.effect.key for edge in trail.edges}
         chains.append(Chain(
             hops=tuple(Hop(cause=edge.cause, effect=edge.effect, held=tuple(sorted(edge.held_in)),
-                           cluster=allocation.cluster_of[edge.cause.key].number, effect_layer=edge.effect_layer)
+                           cluster=allocation.cluster_of[edge.cause.key].number, effect_layer=edge.effect_layer,
+                           acts_on=edge.acts_on)
                        for edge in trail.edges),
             condition=trail.conditions[0], several_scenarios=trail.several_scenarios(), services=trail.services(),
             terminal=trail.edges[-1].terminal, novel=clusters not in seen, similarity=trail.similarity(allocation),

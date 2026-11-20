@@ -3,7 +3,7 @@ from typing import Annotated
 
 import typer
 from shop.deployment import MANIFESTS, build, verified_build
-from shop.upstream import PACKET_POINTS, UPSTREAM_SERVICES
+from shop.upstream import PACKET_POINTS, UNSCOPED_TARGETS, UPSTREAM_SERVICES
 from shop.workload import Scenarios
 
 from faultsearch.allocation import (Allocation, AllocationSettings, Exploration, Strategy, phased_allocation,
@@ -97,7 +97,7 @@ def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
     records = [treatment_record(store, assignment.fault, assignment.scenario) for assignment in allocation.assignments]
     edges = build_edges(records, recorded_scenarios(store),
                         store.record_input(EffectMap.read(), INPUTS, EFFECTS_INPUT), store.load(Catalog, CATALOG),
-                        UPSTREAM_SERVICES)
+                        UPSTREAM_SERVICES, UNSCOPED_TARGETS)
     store.save(EdgeSet(strategy=strategy, edges=tuple(edges)), edges_file(strategy))
     stitching = stitch(edges, allocation, records, width, max_hops, kept)
     store.save(stitching, chains_file(strategy))

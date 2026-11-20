@@ -46,6 +46,8 @@ class ValidationSummary(BaseModel):
     model_config = FROZEN
 
     chain: str
+    hops_text: tuple[str, ...]
+    """Every hop with the layers of its fault and effect, and what a fault no rule can scope acted on."""
     layer_path: str
     selection: Selection
     workload: str
@@ -194,7 +196,8 @@ def validation_summaries(validations: Validations, random_edges: EdgeSet | None,
     keys = None if random_edges is None else {edge.key for edge in random_edges.edges}
     chains = None if random_stitching is None else set(random_stitching.keys)
     return [ValidationSummary(
-        chain=validation.chain.key, layer_path=validation.chain.layer_path, selection=validation.selection,
+        chain=validation.chain.key, hops_text=tuple(hop.text for hop in validation.chain.hops),
+        layer_path=validation.chain.layer_path, selection=validation.selection,
         workload=validation.workload.name, stitched_only=validation.chain.stitched_only,
         exercised=validation.record.exercised, hops=tuple(hop.confirmed for hop in validation.hops),
         confirmed=validation.confirmed,
@@ -268,14 +271,16 @@ def render(summary: Summary) -> str:
     lines += ["conditional edges:", *(f"  {edge.key} | held {sorted(edge.held_in)} not {list(edge.not_held)} | "
                                        f"condition {condition_text(edge)}" for edge in summary.conditional_examples)]
     lines += ["chains across layers:", *(f"  {'stitched-only' if chain.stitched_only else 'single-scenario'} "
-                                         f"{chain.layer_path} | {chain.condition}\n    {chain.key}"
+                                         f"{chain.layer_path} | {chain.condition}"
+                                         + "".join(f"\n    {hop.text}" for hop in chain.hops)
                                          for chain in summary.cross_layer_chains)]
     lines += ["effects below the business layer:", *(f"  {item.layer} {item.effect} caused by {item.causes}"
                                                       for item in summary.layer_effects)]
     lines += ["validations:", *(f"  {'confirmed' if item.confirmed else 'refuted'} {item.selection} "
                                 f"{'stitched-only' if item.stitched_only else 'single-scenario'} in {item.workload} "
                                 f"hops {''.join('+' if hop else '-' for hop in item.hops)} layers {item.layer_path} "
-                                f"random edges {item.random_has_edges} chain {item.random_has_chain}\n    {item.chain}"
+                                f"random edges {item.random_has_edges} chain {item.random_has_chain}"
+                                + "".join(f"\n    {text}" for text in item.hops_text)
                                 for item in summary.validations)]
     lines += [f"edges phased vs random: {None if summary.edges is None else summary.edges.model_dump()}",
               f"single scenarios: {summary.single.model_dump()}"]
