@@ -166,15 +166,17 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | 语言 | 接入点 | 进程内故障点 | 边界 |
 | --- | --- | --- | --- |
 | Python | `PYTHONPATH` 指向 SDK 的引导目录，其中的 `sitecustomize` 在启用时安装插件，并链式调用原有的 `sitecustomize` | 导入钩子改写 `FAULTPOINT_SOURCE_ROOT` 下的模块 | 给 httpx 客户端、ASGI 应用、DB-API 的 `connect` 打补丁 |
-| Node / TypeScript | `NODE_OPTIONS=--import faultpoint/register` | `module.registerHooks` 的 `load` 钩子同步改写 `FAULTPOINT_SOURCE_ROOT` 下、`node_modules` 以外的 JS，对 `require` 和 `import` 都生效（Node 22.15 起） | 补丁 `http.Server.prototype.emit` 的 `request` 事件；undici 全局 dispatcher 的拦截器（同时作用于内置 `fetch`），以及 `http.request` 和 `https.request` |
-| Java | `JAVA_TOOL_OPTIONS=-javaagent:faultpoint-agent.jar` | ASM 改写 `FAULTPOINT_PACKAGES` 下的类 | 改写 Servlet 的 `service`、`java.net.http` 客户端实现的 `send` 与 `sendAsync`、JDBC 的 `execute*`；被 JDK 类引用的 SDK 类放进启动类路径 |
+| Node / TypeScript | `NODE_OPTIONS=--import faultpoint/register` | `module.registerHooks` 的 `load` 钩子同步改写 `FAULTPOINT_SOURCE_ROOT` 下、`node_modules` 以外的 JS，对 `require` 和 `import` 都生效（Node 22.15 起） | 补丁 `http.Server.prototype.emit` 的 `request` 事件；包装全局 `fetch`；补丁 `http.request` 和 `https.request`，其中 `duplicate` 无法重发请求体，遇到时以规则 id 和原因终止进程 |
+| Java | `JAVA_TOOL_OPTIONS=-javaagent:faultpoint-agent.jar` | ASM 改写 `FAULTPOINT_PACKAGES` 下的类；`loop` 放在每条回跳指令之前，按完成的迭代计数 | Servlet：ByteBuddy 在 `HttpServlet.service(ServletRequest, ServletResponse)` 上内联 advice，advice 类不由 agent 装载，所以 Servlet API 在子类加载器中（Spring Boot、Tomcat）时也能解析；客户端与存储：把 `FAULTPOINT_PACKAGES` 中对 `HttpClient.send`、`sendAsync`，`Statement` 与 `PreparedStatement` 的 `execute*`，`Connection.prepareStatement` 的调用改为调用 SDK 的静态方法，不改写 JDK 和驱动的类，也就不需要调整模块的可读性或启动类路径 |
 | Go | 构建流程中先运行 `fprewrite`，在副本上构建 | 带类型信息的改写器 | 改写器在副本中包装 `ListenAndServe`、`http.Server` 的 `Handler`、`http.Client` 与 `DefaultClient`、`sql.Open` |
-| Rust | 构建流程中先运行改写器（`syn`），在副本上构建 | 语法改写器；`call` 只放在返回 `anyhow::Result` 或 `Box<dyn Error>` 的函数中，因为注入需要 `From<Injected>` | 在 `axum::serve` 的调用处挂 tower 层；请求级的 `rpc_client` 不支持，因为 reqwest 不改客户端类型就没有请求级钩子，连接级的故障由 eBPF 承担 |
+| Rust | 构建流程中先运行改写器（`syn`），在副本上构建 | 语法改写器；`call` 只放在返回 `anyhow::Result` 或 `Box<dyn Error>` 的函数中，因为注入需要 `From<Injected>`；宏的参数（如 `format!`、`tracing` 的宏）不被改写，因为 `syn` 不解析宏内的记号 | 在 `axum::serve` 的调用处挂 tower 层；请求级的 `rpc_client` 不支持，因为 reqwest 不改客户端类型就没有请求级钩子，连接级的故障由 eBPF 承担 |
 | 任意语言 | eBPF 代理以特权进程运行，按服务对应的 cgroup 生效 | — | `syscall`、`packet` |
 
 - Rust 不用 `RUSTC_WORKSPACE_WRAPPER`：SDK 的 crate 必须和应用的 tower、http 版本由 cargo 一起解析，所以只能在副本的 `Cargo.toml` 中加依赖。
 - Go 不用 `-toolexec` 改写标准库：把 SDK 导入 `net/http` 会形成导入环（SDK 依赖 OpenTelemetry，后者依赖 `net/http`）。
 - 运行时接入（Python、Node、Java）在装载时改写，但故障点的 id 必须与离线 `scan` 生成的清单一致，所以两者使用同一个放置实现，路径都相对于 `FAULTPOINT_SOURCE_ROOT`。
+- Node 包装全局 `fetch`，不用 undici 全局 dispatcher 的拦截器：对使用 `fetch` 的代码覆盖相同，又不依赖 undici 的处理器接口版本。直接使用 undici 的代码不被覆盖。
+- **已知缺口（Java）**：调用点改写只覆盖业务代码直接发出的 HTTP 和 JDBC 调用。第三方库内部的调用不被改写，例如 Spring 的 `RestTemplate` 与 `WebClient`、Feign、JPA/Hibernate，以及连接池替应用调用驱动。对 train-ticket 这类 Spring 应用，这意味着大部分 `rpc_client` 和存储类故障点会缺失。后续的目标入口：Spring 的 `ClientHttpRequest.execute` 与 `ExchangeFunction.exchange`、`feign.Client.execute`、Apache HttpClient 与 OkHttp 的执行入口；存储方面在 `DataSource.getConnection` 与 `Driver.connect` 处返回代理的 `Connection`，使 JPA 和连接池发出的语句也经过故障点。
 
 ### 6.3 放置规则
 
