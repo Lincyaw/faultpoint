@@ -23,18 +23,21 @@ const (
 	sqlPackage     = "faultpoint/fpsql"
 	pgxPackage     = "faultpoint/fppgx"
 	redisPackage   = "faultpoint/fpredis"
+	ginPackage     = "faultpoint/fpgin"
 	pointsPlugin   = "points"
 	httpPlugin     = "http"
 	sqlPlugin      = "sql"
 	pgxPlugin      = "pgx"
 	redisPlugin    = "redis"
+	ginPlugin      = "gin"
 	redisModule    = "github.com/redis/go-redis/v9"
 	pgxModule      = "github.com/jackc/pgx/v5"
+	ginPath        = "github.com/gin-gonic/gin"
 )
 
 // pluginPackages are the packages of the plugins a configuration can enable.
 var pluginPackages = map[string]string{pointsPlugin: pointsPackage, httpPlugin: httpPackage, sqlPlugin: sqlPackage,
-	pgxPlugin: pgxPackage, redisPlugin: redisPackage}
+	pgxPlugin: pgxPackage, redisPlugin: redisPackage, ginPlugin: ginPackage}
 
 // wrapper is the adapter function the copy applies to a value it hands to a library, or to a value a library returns.
 type wrapper struct {
@@ -48,6 +51,7 @@ var (
 	transportWrapper  = wrapper{plugin: httpPlugin, pkg: httpPackage, function: "Transport"}
 	driverNameWrapper = wrapper{plugin: sqlPlugin, pkg: sqlPackage, function: "DriverName"}
 	redisWrapper      = wrapper{plugin: redisPlugin, pkg: redisPackage, function: "Instrument"}
+	ginWrapper        = wrapper{plugin: ginPlugin, pkg: ginPackage, function: "Instrument"}
 )
 
 // argumentWrappers wrap one argument of a call: the handler a server serves and the driver sql.Open opens.
@@ -62,12 +66,15 @@ var argumentWrappers = map[string]struct {
 	"database/sql.Open":          {index: 0, wrapper: driverNameWrapper},
 }
 
-// resultWrappers wrap what a call returns: the go-redis clients, which take a hook.
+// resultWrappers wrap what a call returns: the go-redis clients, which take a hook, and the gin engines, which take
+// a middleware before any route, so that an engine served by its own Run is instrumented too.
 var resultWrappers = map[string]wrapper{
 	redisModule + ".NewClient":          redisWrapper,
 	redisModule + ".NewFailoverClient":  redisWrapper,
 	redisModule + ".NewUniversalClient": redisWrapper,
 	redisModule + ".NewClusterClient":   redisWrapper,
+	ginPath + ".New":                    ginWrapper,
+	ginPath + ".Default":                ginWrapper,
 }
 
 // methodWrappers replace a method call by an adapter function that takes the receiver first, for a library whose
@@ -252,20 +259,21 @@ func (w *wirer) wireAssignment(assignment *ast.AssignStmt) {
 	}
 }
 
-// packageInit is the source of the file every rewritten package gets: it registers the enabled plugins,
-// instruments http.DefaultClient and starts the core, which happens once, after every plugin has registered, in
-// whichever rewritten package initializes first, also in a test binary.
-func packageInit(name string, plugins []string) []byte {
+// packageInit is the source of the file every rewritten package gets: it imports the plugin packages the build uses,
+// so that all of them register before any package starts the core, instruments http.DefaultClient and starts the
+// core, which happens once, in whichever rewritten package initializes first, also in a test binary.
+func packageInit(name string, plugins []string, wiresHTTP bool) []byte {
 	imports := []string{strconv.Quote(corePackage), "_ " + strconv.Quote(contextPackage)}
 	for _, plugin := range plugins {
-		if plugin == httpPlugin {
-			imports = append(imports, strconv.Quote("net/http"), strconv.Quote(httpPackage))
-		} else {
-			imports = append(imports, "_ "+strconv.Quote(pluginPackages[plugin]))
+		if plugin != httpPackage {
+			imports = append(imports, "_ "+strconv.Quote(plugin))
 		}
 	}
+	if wiresHTTP {
+		imports = append(imports, strconv.Quote("net/http"), strconv.Quote(httpPackage))
+	}
 	var source bytes.Buffer
-	err := initTemplate.Execute(&source, map[string]any{"Name": name, "Imports": imports, "HTTP": slices.Contains(plugins, httpPlugin)})
+	err := initTemplate.Execute(&source, map[string]any{"Name": name, "Imports": imports, "HTTP": wiresHTTP})
 	if err != nil {
 		log.Fatal(err)
 	}

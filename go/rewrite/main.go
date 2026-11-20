@@ -1,6 +1,6 @@
-// Command fprewrite places fault points in a build copy of a Go module and of the local modules it replaces, and
-// wires their net/http, database/sql, pgx and go-redis boundaries to the faultpoint adapters, so that the service's
-// own source never contains the SDK; its scan command writes the manifest of the same points without a copy.
+// Command fprewrite places fault points in a build copy of a Go module and of the local modules it imports, and
+// wires their net/http, gin, database/sql, pgx and go-redis boundaries to the faultpoint adapters, so that the
+// service's own source never contains the SDK; its scan command writes the manifest of the same points without a copy.
 package main
 
 import (
@@ -14,12 +14,10 @@ import (
 	"log"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 
-	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
 )
@@ -31,54 +29,10 @@ const (
 	usage        = `usage:
   fprewrite instrument -service NAME -source DIR -target DIR -sdk DIR [-config FILE]
   fprewrite scan -service NAME -source DIR [-manifest FILE] [-config FILE]
-The local modules the source module replaces, directly or through each other, are instrumented with it; the
-target holds every module at its place relative to their common directory.`
+The local modules the source module imports, through its go.work or through directory replacements, are
+instrumented with it; the target holds every module at its place relative to their common directory, with a
+go.work beside them when the source has one.`
 )
-
-// module is a Go module the rewriter instruments; a point in a module other than the service's own is identified by
-// the module path, since its files lie outside the service.
-type module struct {
-	dir    string
-	prefix string
-}
-
-// localModules are the source module and the local modules its go.mod replaces with directories, transitively.
-func localModules(source string) []module {
-	modules := []module{{dir: source}}
-	for index := 0; index < len(modules); index++ {
-		path := filepath.Join(modules[index].dir, "go.mod")
-		content, err := os.ReadFile(path)
-		if err != nil {
-			log.Fatal(err)
-		}
-		parsed, err := modfile.Parse(path, content, nil)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if index > 0 {
-			modules[index].prefix = parsed.Module.Mod.Path + "/"
-		}
-		for _, replaced := range parsed.Replace {
-			dir := filepath.Clean(filepath.Join(modules[index].dir, replaced.New.Path))
-			local := replaced.New.Version == "" && modfile.IsDirectoryPath(replaced.New.Path)
-			if local && !slices.ContainsFunc(modules, func(known module) bool { return known.dir == dir }) {
-				modules = append(modules, module{dir: dir})
-			}
-		}
-	}
-	return modules
-}
-
-// commonDir is the deepest directory that holds every module.
-func commonDir(modules []module) string {
-	root := modules[0].dir
-	for _, known := range modules {
-		for !strings.HasPrefix(known.dir+string(filepath.Separator), root+string(filepath.Separator)) {
-			root = filepath.Dir(root)
-		}
-	}
-	return root
-}
 
 // Config is the file FAULTPOINT_CONFIG names; the rewriter reads the plugins to wire and the placement.
 type Config struct {
@@ -88,7 +42,7 @@ type Config struct {
 }
 
 func readConfig(path string) Config {
-	config := Config{Plugins: []string{pointsPlugin, httpPlugin, sqlPlugin, pgxPlugin, redisPlugin},
+	config := Config{Plugins: []string{pointsPlugin, httpPlugin, ginPlugin, sqlPlugin, pgxPlugin, redisPlugin},
 		Placement: Placement{Branch: true, Call: true, Check: true, Loop: true, Clock: []string{"time.Now"}, Errors: true}}
 	if path == "" {
 		return config
@@ -110,10 +64,10 @@ func readConfig(path string) Config {
 	return config
 }
 
-// loadPackages loads a module on its own, as the copy builds it, without a go.work around the source.
-func loadPackages(source string) []*packages.Package {
-	config := &packages.Config{Dir: source, Env: append(os.Environ(), "GOWORK=off"), Mode: packages.NeedName |
-		packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo}
+// loadPackages loads the packages of a module as the go command resolves them from its directory.
+func loadPackages(dir string) []*packages.Package {
+	config := &packages.Config{Dir: dir, Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+		packages.NeedTypes | packages.NeedTypesInfo}
 	loaded, err := packages.Load(config, "./...")
 	if err != nil {
 		log.Fatal(err)
@@ -154,58 +108,17 @@ func writeManifest(path string, manifest Manifest) {
 	writeFile(path, append(encoded, '\n'))
 }
 
-// copyTree copies a module without its version control and vendor directories.
-func copyTree(source, target string) error {
-	return filepath.WalkDir(source, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() && (entry.Name() == ".git" || entry.Name() == "vendor") {
-			return filepath.SkipDir
-		}
-		destination := filepath.Join(target, relativePath(source, path))
-		if entry.IsDir() {
-			return os.MkdirAll(destination, 0o755)
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(destination, content, 0o644)
-	})
-}
-
-// requireSDK makes the copy's module require the SDK from its local path.
-func requireSDK(target, sdk string) error {
-	path := filepath.Join(target, "go.mod")
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	module, err := modfile.Parse(path, content, nil)
-	if err != nil {
-		return err
-	}
-	if err := module.AddRequire(corePackage, "v0.0.0"); err != nil {
-		return err
-	}
-	if err := module.AddReplace(corePackage, "", sdk, ""); err != nil {
-		return err
-	}
-	formatted, err := module.Format()
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, formatted, 0o644)
+// rewritten is a package written into the copy, which gets its init once every package is known.
+type rewritten struct {
+	dir  string
+	name string
 }
 
 // instrumentPackage writes the rewritten files of a package of a module into the module's copy, with its error
-// registry and its init, and returns the points it placed; a directory of test files only has no package to rewrite.
-func instrumentPackage(service string, source module, copied string, config Config, pkg *packages.Package) []PointEntry {
-	if len(pkg.GoFiles) == 0 {
-		return nil
-	}
+// registry, and returns the points it placed and the plugin packages it now imports.
+func instrumentPackage(service string, source module, copied string, config Config, pkg *packages.Package) ([]PointEntry, []string) {
 	var placed []PointEntry
+	var used []string
 	for _, file := range pkg.Syntax {
 		relative := relativePath(source.dir, pkg.Fset.Position(file.Pos()).Filename)
 		points := placePoints(service, source.prefix+relative, config, pkg, file)
@@ -219,21 +132,18 @@ func instrumentPackage(service string, source module, copied string, config Conf
 		for _, imported := range imports {
 			astutil.AddImport(pkg.Fset, file, imported)
 		}
-		var rewritten bytes.Buffer
-		if err := format.Node(&rewritten, pkg.Fset, file); err != nil {
+		var content bytes.Buffer
+		if err := format.Node(&content, pkg.Fset, file); err != nil {
 			log.Fatal(err)
 		}
-		writeFile(filepath.Join(copied, relative), rewritten.Bytes())
-		placed = append(placed, points...)
+		writeFile(filepath.Join(copied, relative), content.Bytes())
+		placed, used = append(placed, points...), append(used, imports...)
 	}
-	directory := filepath.Join(copied, relativePath(source.dir, filepath.Dir(pkg.GoFiles[0])))
-	if slices.Contains(config.Plugins, pointsPlugin) && config.Placement.Errors {
-		if registry := errorRegistry(pkg); registry != nil {
-			writeFile(filepath.Join(directory, registryFile), registry)
-		}
+	if registry := errorRegistry(pkg); registry != nil && slices.Contains(config.Plugins, pointsPlugin) && config.Placement.Errors {
+		writeFile(filepath.Join(copied, relativePath(source.dir, filepath.Dir(pkg.GoFiles[0])), registryFile), registry)
+		used = append(used, pointsPackage)
 	}
-	writeFile(filepath.Join(directory, initFile), packageInit(pkg.Name, config.Plugins))
-	return placed
+	return placed, used
 }
 
 func instrument(arguments []string) {
@@ -249,7 +159,7 @@ func instrument(arguments []string) {
 	}
 	config := readConfig(*configPath)
 	modules := localModules(absolutePath(*source))
-	root, targetRoot := commonDir(modules), absolutePath(*target)
+	root, targetRoot, sdkRoot := commonDir(modules), absolutePath(*target), absolutePath(*sdk)
 	if _, err := os.Stat(targetRoot); !errors.Is(err, fs.ErrNotExist) {
 		log.Fatalf("the target %s exists; fprewrite writes a fresh copy", targetRoot)
 	}
@@ -260,23 +170,35 @@ func instrument(arguments []string) {
 	}
 	manifest := Manifest{Service: *service, Language: "go", Points: []PointEntry{}}
 	copies := make([]string, len(modules))
+	var written []rewritten
+	used := map[string]bool{}
 	for index, known := range modules {
 		copies[index] = filepath.Join(targetRoot, relativePath(root, known.dir))
 		if err := copyTree(known.dir, copies[index]); err != nil {
 			log.Fatal(err)
 		}
 		for _, pkg := range loadPackages(known.dir) {
-			manifest.Points = append(manifest.Points, instrumentPackage(*service, known, copies[index], config, pkg)...)
-		}
-		if err := requireSDK(copies[index], absolutePath(*sdk)); err != nil {
-			log.Fatal(err)
+			if len(pkg.GoFiles) == 0 {
+				continue
+			}
+			points, imports := instrumentPackage(*service, known, copies[index], config, pkg)
+			manifest.Points = append(manifest.Points, points...)
+			for _, imported := range imports {
+				used[imported] = true
+			}
+			written = append(written, rewritten{name: pkg.Name,
+				dir: filepath.Join(copies[index], relativePath(known.dir, filepath.Dir(pkg.GoFiles[0])))})
 		}
 	}
-	for _, copied := range copies {
-		tidy := exec.Command("go", "mod", "tidy")
-		tidy.Dir, tidy.Env, tidy.Stdout, tidy.Stderr = copied, append(os.Environ(), "GOWORK=off"), os.Stderr, os.Stderr
-		if err := tidy.Run(); err != nil {
-			log.Fatalf("go mod tidy in %s: %v", copied, err)
+	plugins := slices.Sorted(maps.Keys(used))
+	for _, pkg := range written {
+		writeFile(filepath.Join(pkg.dir, initFile), packageInit(pkg.name, plugins, slices.Contains(config.Plugins, httpPlugin)))
+	}
+	if workspace := workspaceFile(absolutePath(*source)); workspace != "" {
+		writeWorkspace(workspace, targetRoot, copies, sdkRoot)
+	} else {
+		for _, copied := range copies {
+			requireSDK(copied, sdkRoot)
 		}
 	}
 	writeManifest(filepath.Join(copies[0], manifestFile), manifest)
