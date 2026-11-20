@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from faultsearch.allocation import Allocation, Strategy
 from faultsearch.catalog import FROZEN, Fault, Layer, point_service
 from faultsearch.counterfactual import TreatmentRecord
-from faultsearch.edges import Condition, Edge, EffectKey
+from faultsearch.edges import Condition, Edge, EffectKey, holds
 
 LAYER_PATH_SEPARATOR: Final = " > "
 CROSS_LAYER_KEPT: Final = 300
@@ -83,8 +83,11 @@ class Trail(BaseModel):
     conditions: tuple[Condition, ...]
 
     def services(self) -> tuple[str, ...]:
-        return tuple(sorted({point_service(edge.cause.point) for edge in self.edges}
-                            | {point_service(self.edges[-1].effect.point)}))
+        """The services of the hops' faults and of the last effect, leaving out the upstream components, whose
+        background work a longer run alone increases."""
+        layered = [(edge.cause.point, edge.cause.layer) for edge in self.edges]
+        layered.append((self.edges[-1].effect.point, self.edges[-1].effect_layer))
+        return tuple(sorted({point_service(point) for point, layer in layered if layer != Layer.UPSTREAM}))
 
     def several_scenarios(self) -> bool:
         return not frozenset.intersection(*(edge.held_in for edge in self.edges))
@@ -121,6 +124,10 @@ class Stitching(BaseModel):
     top_cross_layer: tuple[Chain, ...]
     """The best ranked chains whose hops lie in more than one layer and that end in a failure the user sees."""
     cycles: tuple[Chain, ...]
+    min_count_increase: float = 0.0
+    """The smallest relative increase of a count that counted as an effect."""
+    refuted_mappings: tuple[tuple[str, str, str], ...] = ()
+    """The (effect, counterpart, consequence) steps that validations refuted and that no chain took."""
 
 
 def merge_conditions(left: tuple[Condition, ...], right: tuple[Condition, ...]) -> tuple[Condition, ...]:
@@ -134,10 +141,11 @@ def merge_conditions(left: tuple[Condition, ...], right: tuple[Condition, ...]) 
     return tuple(merged)
 
 
-def beam_search(edges: list[Edge], allocation: Allocation, width: int,
-                max_hops: int) -> tuple[list[Trail], list[Trail]]:
+def beam_search(edges: list[Edge], allocation: Allocation, width: int, max_hops: int,
+                refuted: frozenset[tuple[str, str, str]]) -> tuple[list[Trail], list[Trail]]:
     """Chains of two or more compatible edges, extending at every length the most promising chains that do not yet
-    end at the user, and the cycles whose last effect corresponds to the first fault."""
+    end at the user, and the cycles whose last effect corresponds to the first fault; no chain takes a step from an
+    effect through a counterpart to a consequence that validations refuted."""
     by_cause: dict[str, list[Edge]] = defaultdict(list)
     for edge in edges:
         by_cause[edge.cause.key].append(edge)
@@ -154,6 +162,7 @@ def beam_search(edges: list[Edge], allocation: Allocation, width: int,
                     cycles.append(trail)
                 extended += [Trail(edges=(*trail.edges, edge), conditions=conditions) for edge in by_cause[following]
                              if following not in causes
+                             and (trail.edges[-1].effect.key, following, edge.effect.key) not in refuted
                              and (conditions := merge_conditions(trail.conditions, edge.conditions))]
         chains += [trail for trail in extended if len(trail.edges) <= max_hops]
         beam = sorted((trail for trail in extended if not trail.edges[-1].terminal),
@@ -161,12 +170,14 @@ def beam_search(edges: list[Edge], allocation: Allocation, width: int,
     return chains, cycles
 
 
-def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[TreatmentRecord]) -> list[Chain]:
+def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[TreatmentRecord],
+                  min_count_increase: float) -> list[Chain]:
     """Chains ranked by needing several scenarios, services crossed, ending in a failure the user sees, novelty of
     their cluster sequence and cluster similarity; novelty is judged against the chains ranked above."""
     shown: dict[str, list[tuple[str, set[str]]]] = defaultdict(list)
     for record in records:
-        shown[record.fault.key].append((record.workload, {EffectKey.of(effect).key for effect in record.effects}))
+        shown[record.fault.key].append((record.workload, {EffectKey.of(effect).key for effect in record.effects
+                                                          if holds(effect, min_count_increase)}))
     seen: set[tuple[int, ...]] = set()
     chains = []
     for trail in sorted(trails, key=lambda trail: trail.rank(allocation), reverse=True):
@@ -186,9 +197,9 @@ def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[Tre
 
 
 def stitch(edges: list[Edge], allocation: Allocation, records: list[TreatmentRecord], width: int, max_hops: int,
-           kept: int) -> Stitching:
-    trails, cycle_trails = beam_search(edges, allocation, width, max_hops)
-    chains = ranked_chains(trails, allocation, records)
+           kept: int, min_count_increase: float, refuted: frozenset[tuple[str, str, str]]) -> Stitching:
+    trails, cycle_trails = beam_search(edges, allocation, width, max_hops, refuted)
+    chains = ranked_chains(trails, allocation, records, min_count_increase)
     stitched_only = sum(chain.stitched_only for chain in chains)
     terminal = [chain for chain in chains if chain.stitched_only and chain.terminal]
     return Stitching(strategy=allocation.strategy, edges=len(edges), chains=len(chains), stitched_only=stitched_only,
@@ -201,4 +212,5 @@ def stitch(edges: list[Edge], allocation: Allocation, records: list[TreatmentRec
                      top=tuple(chains[:kept]),
                      top_cross_layer=tuple([chain for chain in chains
                                             if chain.crosses_layers and chain.terminal][:CROSS_LAYER_KEPT]),
-                     cycles=tuple(ranked_chains(cycle_trails, allocation, records)))
+                     cycles=tuple(ranked_chains(cycle_trails, allocation, records, min_count_increase)),
+                     min_count_increase=min_count_increase, refuted_mappings=tuple(sorted(refuted)))

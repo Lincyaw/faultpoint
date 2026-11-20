@@ -9,9 +9,9 @@ from faultsearch.catalog import FROZEN, Catalog, Exclusion, Layer
 from faultsearch.chains import LAYER_PATH_SEPARATOR, Chain, Stitching
 from faultsearch.edges import Counterpart, Edge, EdgeSet, EffectKey, EffectMap
 from faultsearch.counterfactual import ControlRecord, Leak, RunSettings, TreatmentRecord, treatment_record
-from faultsearch.store import (CATALOG, CONTROLS, EFFECTS_INPUT, INPUTS, LEAKS, REPETITIONS, RUN_SETTINGS,
-                               TREATMENTS, VALIDATIONS, Store, allocation_file, chains_file, edges_file)
-from faultsearch.validation import VALIDATION_PREFIX, Selection, Validations
+from faultsearch.store import (CATALOG, CONTROLS, EFFECTS_INPUT, INPUTS, LEAKS, MAPPING_FEEDBACK, REPETITIONS,
+                               RUN_SETTINGS, TREATMENTS, VALIDATIONS, Store, allocation_file, chains_file, edges_file)
+from faultsearch.validation import VALIDATION_PREFIX, MappingFeedback, Selection, Validations
 
 EXAMPLES_PER_CONDITION: Final = 2
 CROSS_LAYER_SHOWN: Final = 15
@@ -119,6 +119,10 @@ class Summary(BaseModel):
     cross_layer_chains: tuple[Chain, ...]
     layer_effects: tuple[LayerEffect, ...]
     validations: tuple[ValidationSummary, ...]
+    min_count_increase: float
+    feedback: dict[str, int]
+    """Validated hops checking a correspondence of the effect map, confirmed and refuted, and the steps stitching no
+    longer took."""
     edges: EdgeComparison | None
     """Absent when the random allocation did not run."""
     single: SingleScenarioView
@@ -219,6 +223,12 @@ def conditional_examples(edges: EdgeSet) -> tuple[Edge, ...]:
     return tuple(edge for examples in by_condition.values() for edge in examples[:EXAMPLES_PER_CONDITION])
 
 
+def feedback_counts(feedback: MappingFeedback, stitching: Stitching) -> dict[str, int]:
+    return {"checks": len(feedback.checks), "confirmed": sum(check.confirmed for check in feedback.checks),
+            "refuted": sum(not check.confirmed for check in feedback.checks),
+            "steps left out of the stitching": len(stitching.refuted_mappings)}
+
+
 def summarise(store: Store, queries: list[str]) -> Summary:
     """The summary of the strategies that ran, the phased allocation always among them."""
     catalog = store.load(Catalog, CATALOG)
@@ -239,6 +249,9 @@ def summarise(store: Store, queries: list[str]) -> Summary:
         layer_effects=layer_effects(edges[Strategy.PHASED]),
         validations=tuple(validation_summaries(store.load(Validations, VALIDATIONS), edges.get(Strategy.RANDOM),
                                                stitchings.get(Strategy.RANDOM))),
+        min_count_increase=stitchings[Strategy.PHASED].min_count_increase,
+        feedback=feedback_counts(store.load(MappingFeedback, MAPPING_FEEDBACK) if store.has(MAPPING_FEEDBACK)
+                                 else MappingFeedback(checks=()), stitchings[Strategy.PHASED]),
         edges=edge_comparison(edges, stitchings) if Strategy.RANDOM in strategies else None,
         single=single_scenario_view(records[Strategy.PHASED], stitchings[Strategy.PHASED],
                                     store.load(EffectMap, INPUTS, EFFECTS_INPUT)),
@@ -282,7 +295,8 @@ def render(summary: Summary) -> str:
                                 f"random edges {item.random_has_edges} chain {item.random_has_chain}"
                                 + "".join(f"\n    {text}" for text in item.hops_text)
                                 for item in summary.validations)]
-    lines += [f"edges phased vs random: {None if summary.edges is None else summary.edges.model_dump()}",
+    lines += [f"smallest count increase {summary.min_count_increase}; effect map feedback {summary.feedback}",
+              f"edges phased vs random: {None if summary.edges is None else summary.edges.model_dump()}",
               f"single scenarios: {summary.single.model_dump()}"]
     lines += [f"lookup {lookup.query}: " + "; ".join(
         f"{strategy} " + (" ".join(f"held {sorted(edge.held_in)} not {list(edge.not_held)} condition "

@@ -1,6 +1,7 @@
 from collections import defaultdict
 from enum import StrEnum
 from pathlib import Path
+from statistics import fmean
 from typing import Final, Self
 
 from faultpoint.rules import Action
@@ -42,6 +43,8 @@ class EffectRule(BaseModel):
     outcomes: tuple[str, ...]
     metric: Metric
     verdicts: tuple[Verdict, ...] = (Verdict.NEW, Verdict.INCREASE)
+    layers: tuple[Layer, ...] = tuple(Layer)
+    """The layers of the effect's point the rule covers."""
     faults: tuple[Action, ...]
     reason: str
 
@@ -58,9 +61,9 @@ class EffectMap(BaseModel):
     def read(cls, path: Path = EFFECTS_FILE) -> Self:
         return cls.model_validate_json(path.read_text(encoding="utf-8"))
 
-    def matching(self, effect: EffectKey, verdicts: set[Verdict]) -> list[EffectRule]:
+    def matching(self, effect: EffectKey, verdicts: set[Verdict], layer: Layer) -> list[EffectRule]:
         return [rule for rule in self.rules if rule.kind == point_kind(effect.point) and effect.outcome in rule.outcomes
-                and rule.metric == effect.metric and verdicts & set(rule.verdicts)]
+                and rule.metric == effect.metric and verdicts & set(rule.verdicts) and layer in rule.layers]
 
     def terminal(self, effect: EffectKey) -> bool:
         """Whether an effect is a failure the user sees: a non-2xx response of the entry service."""
@@ -145,9 +148,16 @@ def learn_conditions(held: list[str], not_held: list[str], scenarios: Scenarios)
     return (condition,)
 
 
-def counterparts(effect: EffectKey, verdicts: set[Verdict], effects: EffectMap,
+def holds(effect: Effect, min_count_increase: float) -> bool:
+    """Whether an effect counts: a count that grew must grow by at least min_count_increase of the control's, since
+    what runs outside any scope, such as an upstream component's background work, grows with a run's length."""
+    return (effect.metric != Metric.COUNT or effect.verdict != Verdict.INCREASE
+            or fmean(effect.treatment) >= (1 + min_count_increase) * fmean(effect.control))
+
+
+def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, effects: EffectMap,
                  catalog: Catalog) -> tuple[Counterpart, tuple[Fault, ...]]:
-    rules = effects.matching(effect, verdicts)
+    rules = effects.matching(effect, verdicts, layer)
     templates = [template for rule in rules for template in rule.faults]
     faults = tuple(fault for fault in catalog.faults
                    if any(fault.instance_of(effect.point, template) for template in templates))
@@ -159,7 +169,7 @@ def counterparts(effect: EffectKey, verdicts: set[Verdict], effects: EffectMap,
 
 
 def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: EffectMap, catalog: Catalog,
-                upstream: frozenset[str], targets: dict[str, str]) -> list[Edge]:
+                upstream: frozenset[str], targets: dict[str, str], min_count_increase: float) -> list[Edge]:
     """Every (fault, effect) pair the exercised records show, over the scenarios each fault was tested in."""
     by_fault: dict[str, list[TreatmentRecord]] = defaultdict(list)
     for record in records:
@@ -170,15 +180,17 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
         sightings: dict[str, list[Sighting]] = defaultdict(list)
         for run in runs:
             for effect in run.effects:
-                sightings[EffectKey.of(effect).key].append(Sighting(scenario=run.workload, effect=effect))
+                if holds(effect, min_count_increase):
+                    sightings[EffectKey.of(effect).key].append(Sighting(scenario=run.workload, effect=effect))
         for held in sightings.values():
             effect = EffectKey.of(held[0].effect)
+            layer = point_layer(effect.point, upstream)
             held_in = [sighting.scenario for sighting in held]
             not_held = [run.workload for run in runs if run.workload not in held_in]
-            counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, effects, catalog)
+            counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, layer, effects,
+                                               catalog)
             edges.append(Edge(cause=runs[0].fault, effect=effect, held=tuple(held), not_held=tuple(not_held),
                               conditions=learn_conditions(held_in, not_held, scenarios), counterpart=counterpart,
-                              counterparts=faults, terminal=effects.terminal(effect),
-                              effect_layer=point_layer(effect.point, upstream),
+                              counterparts=faults, terminal=effects.terminal(effect), effect_layer=layer,
                               acts_on=None if runs[0].fault.scoped else targets[point_service(runs[0].fault.point)]))
     return edges

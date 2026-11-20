@@ -13,10 +13,10 @@ from faultsearch.chains import Stitching, stitch
 from faultsearch.counterfactual import NamedWorkload, Runner, RunSettings, treatment_record
 from faultsearch.edges import EdgeSet, EffectMap, build_edges
 from faultsearch.report import render, summarise
-from faultsearch.store import (ACTIONS_INPUT, ALLOCATION_SETTINGS, CATALOG, EFFECTS_INPUT, INPUTS, REPORT,
-                               RUN_SETTINGS, SCENARIOS_INPUT, VALIDATIONS, Store, allocation_file, chains_file,
-                               edges_file)
-from faultsearch.validation import selected, validate
+from faultsearch.store import (ACTIONS_INPUT, ALLOCATION_SETTINGS, CATALOG, EFFECTS_INPUT, INPUTS, MAPPING_FEEDBACK,
+                               REPORT, RUN_SETTINGS, SCENARIOS_INPUT, VALIDATIONS, Store, allocation_file,
+                               chains_file, edges_file)
+from faultsearch.validation import MappingFeedback, Validations, mapping_checks, selected, validate
 
 app = typer.Typer(no_args_is_help=True, help=(
     "Causal stitching over faultpoint: inject faults into named workloads, stitch the causal edges across "
@@ -90,16 +90,20 @@ def explore(experiment: Experiment,
 def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
                    width: Annotated[int, typer.Option(help="Partial chains kept at every length.")] = 20000,
                    max_hops: int = 4,
-                   kept: Annotated[int, typer.Option(help="Ranked chains written in full.")] = 300) -> None:
-    """Learn the edges of a strategy's injections and stitch them into ranked chains and cycles."""
+                   kept: Annotated[int, typer.Option(help="Ranked chains written in full.")] = 300,
+                   min_count_increase: Annotated[float, typer.Option(
+                       help="The smallest relative increase of a count that counts as an effect.")] = 0.2) -> None:
+    """Learn the edges of a strategy's injections and stitch them into ranked chains and cycles, leaving out the
+    steps from an effect through a counterpart to a consequence that validations refuted."""
     store = Store(experiment)
     allocation = store.load(Allocation, allocation_file(strategy))
     records = [treatment_record(store, assignment.fault, assignment.scenario) for assignment in allocation.assignments]
     edges = build_edges(records, recorded_scenarios(store),
                         store.record_input(EffectMap.read(), INPUTS, EFFECTS_INPUT), store.load(Catalog, CATALOG),
-                        UPSTREAM_SERVICES, UNSCOPED_TARGETS)
+                        UPSTREAM_SERVICES, UNSCOPED_TARGETS, min_count_increase)
     store.save(EdgeSet(strategy=strategy, edges=tuple(edges)), edges_file(strategy))
-    stitching = stitch(edges, allocation, records, width, max_hops, kept)
+    refuted = store.load(MappingFeedback, MAPPING_FEEDBACK).refuted() if store.has(MAPPING_FEEDBACK) else frozenset()
+    stitching = stitch(edges, allocation, records, width, max_hops, kept, min_count_increase, refuted)
     store.save(stitching, chains_file(strategy))
     typer.echo(f"{strategy}: {len(edges)} edges, {stitching.chains} chains ({stitching.stitched_only} stitched only, "
                f"{stitching.single_scenario} shown end to end by one scenario), {len(stitching.cycles)} cycles")
@@ -114,13 +118,18 @@ def validate_command(experiment: Experiment,
                      chain: Annotated[list[str], typer.Option(help="A chain to validate besides, by its key.")] = []
                      ) -> None:
     """Inject only the first fault of the best chains of the phased allocation in the workload their conditions
-    merge into."""
+    merge into, and keep what each validated hop says about the effect map's correspondences."""
     store = Store(experiment)
     stitching = store.load(Stitching, chains_file(Strategy.PHASED))
+    validated = [validation.chain for validation in store.load(Validations, VALIDATIONS).validations] \
+        if store.has(VALIDATIONS) else []
     validations = validate(recorded_runner(store),
-                           selected(stitching, stitched_only, single_scenario, cross_layer, chain),
-                           recorded_scenarios(store))
+                           selected(stitching, stitched_only, single_scenario, cross_layer, chain, validated),
+                           recorded_scenarios(store), stitching.min_count_increase)
     store.save(validations, VALIDATIONS)
+    feedback = store.load(MappingFeedback, MAPPING_FEEDBACK) if store.has(MAPPING_FEEDBACK) \
+        else MappingFeedback(checks=())
+    store.save(feedback.merged(mapping_checks(validations)), MAPPING_FEEDBACK)
     for validation in validations.validations:
         typer.echo(f"{'confirmed' if validation.confirmed else 'refuted'} {validation.selection} in "
                    f"{validation.workload.name}: {''.join('+' if hop.confirmed else '-' for hop in validation.hops)} "
