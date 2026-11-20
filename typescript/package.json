@@ -1,0 +1,28 @@
+{
+  "name": "faultpoint",
+  "version": "0.1.0",
+  "description": "Fault points that both inject and observe faults, for counterfactual causal edge discovery",
+  "type": "module",
+  "exports": {
+    ".": "./dist/points.js",
+    "./register": "./dist/register.js",
+    "./core": "./dist/core.js",
+    "./http": "./dist/http.js"
+  },
+  "bin": {
+    "faultpoint-scan": "./dist/scan.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/context-async-hooks": "^2.0.0",
+    "@opentelemetry/core": "^2.0.0",
+    "typescript": "~5.9.3",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5"
+  }
+}
