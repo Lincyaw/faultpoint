@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -45,14 +46,18 @@ type ObservationRecord struct {
 }
 
 // JSONLOptions are the options of the JSON Lines sink, given under "jsonl" in the configuration; a flush interval of
-// 0 writes every observation as it comes, for processes such as test binaries that end without a last flush.
+// 0 writes every observation as it comes, for processes such as test binaries that end without a last flush, and the
+// exemplar rate is the share of traces whose ids are kept, for hot library paths, while counts stay exact.
 type JSONLOptions struct {
 	FlushSeconds float64 `json:"flush_seconds"`
 	Exemplars    int     `json:"exemplars"`
+	ExemplarRate float64 `json:"exemplar_rate"`
 }
 
-// DefaultJSONLOptions write every two seconds and keep five trace ids per record.
-var DefaultJSONLOptions = JSONLOptions{FlushSeconds: 2, Exemplars: 5}
+// DefaultJSONLOptions write every two seconds and keep five trace ids per record, of every trace.
+var DefaultJSONLOptions = JSONLOptions{FlushSeconds: 2, Exemplars: 5, ExemplarRate: 1}
+
+const exemplarBuckets = 10_000
 
 type tallyKey struct {
 	experiment, point, outcome, scope, rule string
@@ -71,6 +76,7 @@ type JSONLSink struct {
 	service      string
 	process      string
 	exemplars    int
+	sampled      uint64
 	writeThrough bool
 	mu           sync.Mutex
 	start        time.Time
@@ -79,8 +85,8 @@ type JSONLSink struct {
 
 // NewJSONLSink starts a sink that writes to path at the interval its options give.
 func NewJSONLSink(path, service string, options JSONLOptions) (*JSONLSink, error) {
-	if options.FlushSeconds < 0 || options.Exemplars < 0 {
-		return nil, fmt.Errorf("jsonl flushes after at least 0 seconds and keeps at least 0 exemplars: %+v", options)
+	if options.FlushSeconds < 0 || options.Exemplars < 0 || options.ExemplarRate < 0 || options.ExemplarRate > 1 {
+		return nil, fmt.Errorf("jsonl flushes after at least 0 seconds, keeps at least 0 exemplars and samples a share of traces: %+v", options)
 	}
 	host, err := os.Hostname()
 	if err != nil {
@@ -88,7 +94,8 @@ func NewJSONLSink(path, service string, options JSONLOptions) (*JSONLSink, error
 	}
 	sink := &JSONLSink{
 		path: path, service: service, process: fmt.Sprintf("%s:%d", host, os.Getpid()), exemplars: options.Exemplars,
-		writeThrough: options.FlushSeconds == 0, start: time.Now(), tallies: map[tallyKey]*tally{},
+		sampled: uint64(options.ExemplarRate * exemplarBuckets), writeThrough: options.FlushSeconds == 0,
+		start: time.Now(), tallies: map[tallyKey]*tally{},
 	}
 	if !sink.writeThrough {
 		go func() {
@@ -112,13 +119,20 @@ func (s *JSONLSink) Add(observation Observation) {
 	}
 	counted.count += observation.Count
 	counted.total += observation.Total
-	if observation.TraceID != "" && len(counted.exemplars) < s.exemplars {
+	if len(counted.exemplars) < s.exemplars && s.keeps(observation.TraceID) {
 		counted.exemplars = append(counted.exemplars, observation.TraceID)
 	}
 	s.mu.Unlock()
 	if s.writeThrough {
 		s.Flush()
 	}
+}
+
+// keeps is whether a trace's id is sampled as an exemplar, by the low bits of the id, so that every process keeps the
+// same traces.
+func (s *JSONLSink) keeps(traceID string) bool {
+	low, err := strconv.ParseUint(traceID[max(len(traceID)-8, 0):], 16, 64)
+	return traceID != "" && err == nil && low%exemplarBuckets < s.sampled
 }
 
 // Flush appends the counts of the window that ends now.
