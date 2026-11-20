@@ -1,12 +1,17 @@
 import ast
 import copy
+import functools
 import hashlib
+import importlib.metadata
 import importlib.util
 from collections import Counter
+from importlib.machinery import PathFinder
 from pathlib import Path
-from typing import Final
+from typing import Final, Self
 
-from pydantic import BaseModel
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from pydantic import BaseModel, ConfigDict, Field
 
 from faultpoint.points import PointKind
 from faultpoint.rules import STRICT, point_id
@@ -17,12 +22,27 @@ EXCLUDED_DIRECTORIES: Final = frozenset({"site-packages", "dist-packages", ".ven
                                          "node_modules"})
 DEFAULT_CLOCK: Final = ("time.time", "datetime.now", "datetime.utcnow")
 CODE_WIDTH: Final = 120
+MODULE_NAME: Final = r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$"
+SDK_DISTRIBUTION: Final = "faultpoint"
+ALWAYS_EXCLUDED: Final = ("faultpoint", "opentelemetry", "logging")
+NO_EXTRA: Final = {"extra": ""}
+PACKAGE_INIT: Final = "__init__"
 
 type Function = ast.FunctionDef | ast.AsyncFunctionDef
 
 
+class ScopeEntry(BaseModel):
+    """An installed package whose pure-Python modules get points, of the given kinds only when kinds is given."""
+
+    model_config = STRICT
+
+    include: str = Field(pattern=MODULE_NAME)
+    kinds: tuple[PointKind, ...] | None = None
+
+
 class Placement(BaseModel):
-    """The placement rules that run, and the dotted names of the calls that read the clock."""
+    """The placement rules that run, the dotted names of the calls that read the clock, and the installed packages
+    placed besides the service's own source."""
 
     model_config = STRICT
 
@@ -31,6 +51,19 @@ class Placement(BaseModel):
     loop: bool = True
     call: bool = True
     clock: tuple[str, ...] = DEFAULT_CLOCK
+    scope: tuple[ScopeEntry, ...] = ()
+    exclude: tuple[str, ...] = ()
+    """Modules that get no points with their submodules, besides faultpoint and the distributions it depends on,
+    OpenTelemetry and logging."""
+
+    def limited(self, kinds: tuple[PointKind, ...] | None) -> Self:
+        """The placement rules of the given kinds only."""
+        if kinds is None:
+            return self
+        return self.model_copy(update={
+            "branch": self.branch and PointKind.BRANCH in kinds, "check": self.check and PointKind.CHECK in kinds,
+            "loop": self.loop and PointKind.LOOP in kinds, "call": self.call and PointKind.CALL in kinds,
+            "clock": self.clock if PointKind.CLOCK in kinds else ()})
 
 
 class PointEntry(BaseModel):
@@ -55,9 +88,79 @@ class Manifest(BaseModel):
     points: tuple[PointEntry, ...]
 
 
+class Library(BaseModel):
+    """An included package: the directory of its modules, the label of its point ids, and its placement rules."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    directory: Path
+    label: str
+    placement: Placement
+
+    def owns(self, module: str) -> bool:
+        return module == self.name or module.startswith(f"{self.name}.")
+
+
 def placeable(path: Path, root: Path) -> bool:
     """Whether a module is the service's own source under the root rather than an installed package."""
     return path.is_relative_to(root) and EXCLUDED_DIRECTORIES.isdisjoint(path.relative_to(root).parts)
+
+
+@functools.cache
+def sdk_packages() -> frozenset[str]:
+    """The top-level packages of faultpoint and of every distribution it depends on, which get no points, so that
+    no point runs inside the runtime that records points."""
+    distributions = {SDK_DISTRIBUTION}
+    pending = [SDK_DISTRIBUTION]
+    while pending:
+        for requirement in map(Requirement, importlib.metadata.distribution(pending.pop()).requires or ()):
+            name = canonicalize_name(requirement.name)
+            if (requirement.marker is None or requirement.marker.evaluate(NO_EXTRA)) and name not in distributions:
+                distributions.add(name)
+                pending.append(name)
+    return frozenset(package for package, owners in importlib.metadata.packages_distributions().items()
+                     if any(canonicalize_name(owner) in distributions for owner in owners))
+
+
+def package_locations(name: str) -> list[str]:
+    """The directories of an installed package, found without importing it or its parents."""
+    parent = name.rpartition(".")[0]
+    spec = PathFinder.find_spec(name, package_locations(parent) if parent else None)
+    if spec is None or spec.submodule_search_locations is None:
+        raise ModuleNotFoundError(f"the placement scope includes {name}, which is not an installed package")
+    return list(spec.submodule_search_locations)
+
+
+def module_parts(relative: Path) -> tuple[str, ...]:
+    """The dotted name parts of the module a source file is, relative to a directory on the path or a package."""
+    parts = relative.with_suffix("").parts
+    return parts[:-1] if parts[-1] == PACKAGE_INIT else parts
+
+
+class Scope:
+    """Where points are placed: the service's own source under the root and the included installed packages,
+    except excluded modules."""
+
+    def __init__(self, root: Path, placement: Placement) -> None:
+        self.root = root.resolve()
+        self.placement = placement
+        distributions = importlib.metadata.packages_distributions()
+        self.libraries = tuple(Library(
+            name=entry.include, directory=Path(package_locations(entry.include)[0]).resolve(),
+            label=f"{entry.include}@{importlib.metadata.version(distributions[entry.include.partition('.')[0]][0])}",
+            placement=placement.limited(entry.kinds)) for entry in placement.scope)
+        self.excluded = (*ALWAYS_EXCLUDED, *sdk_packages(), *placement.exclude)
+
+    def locate(self, module: str, origin: Path) -> tuple[str, Placement] | None:
+        """The path a module's point ids carry and its placement rules; none for a module that gets no points."""
+        if any(module == name or module.startswith(f"{name}.") for name in self.excluded):
+            return None
+        if placeable(origin, self.root):
+            return origin.relative_to(self.root).as_posix(), self.placement
+        library = next((library for library in self.libraries if library.owns(module)), None)
+        return None if library is None else (f"{library.label}/{origin.relative_to(library.directory).as_posix()}",
+                                             library.placement)
 
 
 def own_returns(function: Function) -> list[ast.Return]:
@@ -268,7 +371,7 @@ def import_position(module: ast.Module) -> int:
 
 
 def place_points(source: str, service: str, path: str, placement: Placement) -> tuple[ast.Module, list[PointEntry]]:
-    """A module's syntax tree with its points placed, and the points; `path` is relative to the source root."""
+    """A module's syntax tree with its points placed, and the points; `path` is what the scope locates it as."""
     module = ast.parse(source)
     placer = PointPlacer(service, path, source, placement)
     placer.visit(module)
@@ -277,15 +380,24 @@ def place_points(source: str, service: str, path: str, placement: Placement) -> 
     return ast.fix_missing_locations(module), placer.points
 
 
-def scan_tree(root: Path, service: str, placement: Placement) -> Manifest:
-    """The points the import hook places in the modules under a source root."""
-    base = root.resolve()
-    points: list[PointEntry] = []
-    for directory, directories, files in base.walk():
+def source_files(base: Path) -> list[Path]:
+    files: list[Path] = []
+    for directory, directories, names in base.walk():
         # Pruning the listed directories in place keeps the walk out of excluded trees.
         directories[:] = sorted(name for name in directories if name not in EXCLUDED_DIRECTORIES)
-        for name in sorted(name for name in files if name.endswith(".py")):
-            path = directory / name
-            source = importlib.util.decode_source(path.read_bytes())
-            points.extend(place_points(source, service, path.relative_to(base).as_posix(), placement)[1])
+        files.extend(directory / name for name in sorted(names) if name.endswith(".py"))
+    return files
+
+
+def scan_tree(root: Path, service: str, placement: Placement) -> Manifest:
+    """The points the import hook places in the modules under a source root and in the included packages."""
+    scope = Scope(root, placement)
+    trees = [(scope.root, ()), *((library.directory, tuple(library.name.split("."))) for library in scope.libraries)]
+    points: list[PointEntry] = []
+    for base, package in trees:
+        for path in source_files(base):
+            located = scope.locate(".".join((*package, *module_parts(path.relative_to(base)))), path)
+            if located is not None:
+                source = importlib.util.decode_source(path.read_bytes())
+                points.extend(place_points(source, service, *located)[1])
     return Manifest(service=service, language="python", points=tuple(points))

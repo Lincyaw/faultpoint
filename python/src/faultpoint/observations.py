@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from faultpoint.rules import STRICT
 
 JSONL_OPTIONS: Final = "jsonl"
+SAMPLED_DIGITS: Final = 8
+SAMPLING_BUCKETS: Final = 10_000
 
 
 class Observation(BaseModel):
@@ -64,6 +66,12 @@ class JsonlOptions(BaseModel):
 
     flush_seconds: float = Field(default=2.0, gt=0)
     exemplars: int = Field(default=5, ge=0)
+    exemplar_rate: float = Field(default=1.0, ge=0, le=1)
+    """The share of traces whose ids are kept as exemplars, for hot library paths; counts stay exact."""
+
+    def sampled(self, trace_id: str) -> bool:
+        """Whether a trace is sampled, by its id, so that every process keeps or skips the same traces."""
+        return int(trace_id[-SAMPLED_DIGITS:], 16) % SAMPLING_BUCKETS < self.exemplar_rate * SAMPLING_BUCKETS
 
 
 class TallyEntry(BaseModel):
@@ -80,7 +88,7 @@ class JsonlSink:
         self.service = service
         self.process = f"{socket.gethostname()}:{os.getpid()}"
         self.interval = options.flush_seconds
-        self.exemplars = options.exemplars
+        self.options = options
         self.lock = threading.Lock()
         self.tally: dict[tuple[str, str, str, str, str | None], TallyEntry] = {}
         self.window_start = time.time()
@@ -92,7 +100,8 @@ class JsonlSink:
             entry = self.tally.setdefault(key, TallyEntry())
             entry.count += 1
             entry.total += observation.quantity
-            if observation.trace_id is not None and len(entry.exemplars) < self.exemplars:
+            if observation.trace_id is not None and len(entry.exemplars) < self.options.exemplars \
+                    and self.options.sampled(observation.trace_id):
                 entry.exemplars.append(observation.trace_id)
 
     def flush(self) -> None:

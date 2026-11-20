@@ -11,6 +11,7 @@ from faultpoint.observations import ObservationRecord, read_records
 from faultpoint.placement import MANIFEST_FILE, Manifest, Placement, scan_tree
 from faultpoint.rules import RuleSet
 from faultpoint.tools.analysis import Selection, compare
+from faultpoint.tools.candidates import executed_candidates
 from faultpoint.tools.kinds import KindTable
 
 app = typer.Typer(no_args_is_help=True, help="Fault points that inject and observe faults.")
@@ -48,6 +49,24 @@ def scan(root: Annotated[Path, typer.Argument(help="The source root, as FAULTPOI
     manifest = scan_tree(root, service, Placement.model_validate(Config.read(config).placement))
     output.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
     typer.echo(f"{len(manifest.points)} points written to {output}")
+
+
+@app.command()
+def candidates(reports: Annotated[list[Path], typer.Argument(help="Observation files of a run without rules.")],
+               manifest: Annotated[list[Path], typer.Option(help="A manifest scan wrote.")],
+               as_json: Annotated[bool, typer.Option("--json", help="Print the candidates as JSON.")] = False) -> None:
+    """List the placed points a run without rules executed, the candidates for injection, most executed first."""
+    found = executed_candidates([Manifest.model_validate_json(path.read_bytes()) for path in manifest],
+                                read_records(reports))
+    if as_json:
+        typer.echo(json.dumps([candidate.model_dump(mode="json") for candidate in found], indent=2))
+        return
+    table = Table("executions", "point", "outcomes", "code", title=f"{len(found)} candidates")
+    for candidate in found:
+        table.add_row(str(candidate.executions), candidate.point.id,
+                      " ".join(f"{outcome}={count}" for outcome, count in candidate.outcomes.items()),
+                      candidate.point.code)
+    Console().print(table)
 
 
 @app.command()

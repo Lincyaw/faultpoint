@@ -9,7 +9,7 @@ from typing import Final
 
 from pydantic import JsonValue
 
-from faultpoint.placement import Placement, place_points, placeable
+from faultpoint.placement import Placement, Scope, place_points
 from faultpoint.runtime import Plugin, Runtime
 
 
@@ -30,29 +30,27 @@ class PlacingLoader(SourceFileLoader):
 
 
 class PlacingFinder(importlib.abc.MetaPathFinder):
-    """Finds modules as the path finder it precedes does, and places points in those under the source root."""
+    """Finds modules as the path finder it precedes does, and places points in the pure-Python modules the scope
+    locates."""
 
-    def __init__(self, root: Path, service: str, placement: Placement) -> None:
-        self.root = root
+    def __init__(self, scope: Scope, service: str) -> None:
+        self.scope = scope
         self.service = service
-        self.placement = placement
 
     def find_spec(self, fullname: str, path: Sequence[str] | None,
                   target: ModuleType | None = None) -> ModuleSpec | None:
         spec = PathFinder.find_spec(fullname, path, target)
         match spec:
-            case ModuleSpec(origin=str() as origin, loader=SourceFileLoader()) if placeable(
-                    Path(origin).resolve(), self.root):
-                spec.loader = PlacingLoader(fullname, origin, self.service,
-                                            Path(origin).resolve().relative_to(self.root).as_posix(),
-                                            self.placement)
+            case ModuleSpec(origin=str() as origin, loader=SourceFileLoader()):
+                located = self.scope.locate(fullname, Path(origin).resolve())
+                if located is not None:
+                    spec.loader = PlacingLoader(fullname, origin, self.service, *located)
         return spec
 
 
 def install(runtime: Runtime, options: dict[str, JsonValue]) -> None:
-    finder = PlacingFinder(runtime.settings.source_root.resolve(), runtime.settings.service,
-                           Placement.model_validate(runtime.config.placement))
-    sys.meta_path.insert(sys.meta_path.index(PathFinder), finder)
+    scope = Scope(runtime.settings.source_root, Placement.model_validate(runtime.config.placement))
+    sys.meta_path.insert(sys.meta_path.index(PathFinder), PlacingFinder(scope, runtime.settings.service))
 
 
 PLUGIN: Final = Plugin(install=install)
