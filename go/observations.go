@@ -8,13 +8,15 @@ import (
 	"time"
 )
 
-// Observation is one execution of a point, as the core hands it to the observation sink.
+// Observation is Count executions of a point with one outcome and Total their summed quantity: one execution
+// from the core, or the counts a kernel program already aggregated.
 type Observation struct {
 	Experiment string
 	Point      string
 	Outcome    string
 	Scope      string
 	Rule       string
+	Count      int
 	Total      float64
 	TraceID    string
 }
@@ -94,7 +96,7 @@ func NewJSONLSink(path, service string, options JSONLOptions) (*JSONLSink, error
 	return sink, nil
 }
 
-// Add counts one observation.
+// Add counts an observation.
 func (s *JSONLSink) Add(observation Observation) {
 	key := tallyKey{experiment: observation.Experiment, point: observation.Point, outcome: observation.Outcome,
 		scope: observation.Scope, rule: observation.Rule}
@@ -105,7 +107,7 @@ func (s *JSONLSink) Add(observation Observation) {
 		counted = &tally{}
 		s.tallies[key] = counted
 	}
-	counted.count++
+	counted.count += observation.Count
 	counted.total += observation.Total
 	if observation.TraceID != "" && len(counted.exemplars) < s.exemplars {
 		counted.exemplars = append(counted.exemplars, observation.TraceID)

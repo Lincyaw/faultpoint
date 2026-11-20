@@ -5,7 +5,6 @@ import (
 	"os"
 	"slices"
 	"strconv"
-	"strings"
 )
 
 const (
@@ -51,9 +50,6 @@ func readSettings() settings {
 	if read.rules == "" && read.report == "" {
 		return read
 	}
-	if read.service == "" || strings.Contains(read.service, ":") {
-		Abort("FAULTPOINT_SERVICE names the service, without ':', when faultpoint is enabled: %q", read.service)
-	}
 	if path := os.Getenv(environmentPrefix + "CONFIG"); path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -71,9 +67,10 @@ func (c configuration) enables(name string) bool {
 	return c.Plugins == nil || slices.Contains(c.Plugins, name)
 }
 
-// decodeOptions fills the options of a component, which hold their defaults, from the configuration.
-func (c configuration) decodeOptions(name string, options any) {
-	given, found := c.Options[name]
+// Options fills the options of a named component, which hold their defaults, from the configuration; a process
+// that is not enabled reads no configuration and keeps the defaults.
+func Options(name string, options any) {
+	given, found := current.settings.config.Options[name]
 	if !found {
 		return
 	}

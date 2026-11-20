@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -66,7 +67,7 @@ func Register(plugin Plugin) bool {
 	if !current.enabled || !current.settings.config.enables(plugin.Name) {
 		return false
 	}
-	current.settings.config.decodeOptions(plugin.Name, plugin.Options)
+	Options(plugin.Name, plugin.Options)
 	for kind, actions := range plugin.Actions {
 		current.actions[kind] = append(current.actions[kind], actions...)
 	}
@@ -88,10 +89,13 @@ func Start() {
 	if !current.enabled {
 		return
 	}
+	if service := current.settings.service; service == "" || strings.Contains(service, ":") {
+		Abort("FAULTPOINT_SERVICE names the service, without ':', when faultpoint is enabled: %q", service)
+	}
 	current.settings.config.checkNames(current.registered)
 	if current.sink == nil && current.settings.report != "" {
 		options := DefaultJSONLOptions
-		current.settings.config.decodeOptions(jsonlOptionsName, &options)
+		Options(jsonlOptionsName, &options)
 		sink, err := NewJSONLSink(current.settings.report, current.settings.service, options)
 		if err != nil {
 			Abort("%v", err)
@@ -181,7 +185,8 @@ func Observe(ctx context.Context, point, outcome string, total float64, rule *Ru
 	if !current.started.Load() || current.sink == nil {
 		return
 	}
-	observation := Observation{Experiment: current.state.Load().experiment, Point: point, Outcome: outcome, Total: total}
+	observation := Observation{Experiment: current.state.Load().experiment, Point: point, Outcome: outcome,
+		Count: 1, Total: total}
 	if rule != nil {
 		observation.Rule = rule.ID
 	}
