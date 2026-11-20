@@ -1,4 +1,5 @@
 import json
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -24,7 +25,6 @@ POSTGRES_PORT: Final = 5432
 HOST_FROM_NAMESPACE: Final = "10.0.2.2"
 """The host's loopback as a repetition's network namespace reaches it through slirp4netns."""
 CONTAINER_CGROUPS: Final = Path("/sys/fs/cgroup/system.slice")
-NETWORK_DEVICES: Final = Path("/sys/class/net")
 AGENT_SYSCALLS: Final = ("read", "write", "sendto", "recvfrom", "fsync", "fdatasync", "pwrite64")
 AGENT_REPORT: Final = "/agent.jsonl"
 AGENT_OBSERVATIONS: Final = "agent.jsonl"
@@ -108,10 +108,7 @@ def remove_containers(prefix: str) -> None:
 
 def host_peer(container: Container) -> str:
     """The host-side end of the container's virtual cable, the device whose index its eth0 links to."""
-    index = docker("exec", container.name, "cat", "/sys/class/net/eth0/iflink")
-    devices = {(path / "ifindex").read_text().strip(): path.name
-               for path in NETWORK_DEVICES.iterdir() if (path / "ifindex").exists()}
-    return devices[index]
+    return socket.if_indextoname(int(docker("exec", container.name, "cat", "/sys/class/net/eth0/iflink")))
 
 
 def agent_config(upstream: Upstream, flush_seconds: float) -> dict[str, Any]:

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -41,10 +42,16 @@ PORTS: Final = {"gateway": 27180, "orders": 27181, "inventory": 27182, "pricing"
 WORKLOAD_FILE: Final = "workload.json"
 RULES_FILE: Final = "rules.json"
 STATUSES_FILE: Final = "statuses.json"
+REFUSAL_FILE: Final = "refusal.txt"
 NETWORK_NAMESPACE: Final = ("unshare", "--user", "--map-root-user", "--net", "--")
 """A fresh network namespace per repetition lets repetitions run side by side on the same ports, so that the client
 points, whose ids carry the peer's address, keep one id."""
 HOST_ROUTE_DEADLINE_S: Final = 10
+REFUSAL: Final = re.compile(r"faultpoint: rule \S+: [^\n]*")
+"""How every SDK says it stops because a rule names an action the plugins serving its point do not all implement."""
+LOAD_DEADLINE_S: Final = 120
+"""The longest a repetition sends checkouts, so that a fault that hangs a service every tenant shares ends its
+repetition too; a control sends all of them in about ten seconds."""
 
 
 class Service(BaseModel):
@@ -248,13 +255,18 @@ def checkout(tenant: str, sku: str, quantity: int) -> int:
 
 
 def load(workload: Workload) -> Statuses:
-    """The same sequence of checkouts in every repetition, the tenants interleaved."""
+    """The same sequence of checkouts in every repetition, the tenants interleaved, sent for at most
+    LOAD_DEADLINE_S."""
     statuses: dict[str, dict[int, int]] = {tenant: {} for tenant in workload.tenant_names()}
-    for index in range(REQUESTS_PER_TENANT):
-        for tenant in workload.tenant_names():
-            sku = workload.skus(tenant)[index % len(workload.sku_numbers)]
-            status = checkout(tenant, sku, workload.quantities[index % len(workload.quantities)])
-            statuses[tenant][status] = statuses[tenant].get(status, 0) + 1
+    checkouts = [(tenant, workload.skus(tenant)[index % len(workload.sku_numbers)],
+                  workload.quantities[index % len(workload.quantities)])
+                 for index in range(REQUESTS_PER_TENANT) for tenant in workload.tenant_names()]
+    started = time.monotonic()
+    for tenant, sku, quantity in checkouts:
+        if time.monotonic() - started > LOAD_DEADLINE_S:
+            break
+        status = checkout(tenant, sku, quantity)
+        statuses[tenant][status] = statuses[tenant].get(status, 0) + 1
     return Statuses(tenants=statuses)
 
 
@@ -305,6 +317,13 @@ def namespaced_run(directory: Path, sdk: Path) -> None:
     finally:
         slirp.terminate()
         slirp.wait(timeout=30)
+
+
+def refusal(directory: Path) -> str | None:
+    """What a service said when it stopped at a rule it cannot apply, none when no service did."""
+    found = [match.group(0) for log in sorted(directory.glob("*.log"))
+             if (match := REFUSAL.search(log.read_text(errors="replace")))]
+    return found[0] if found else None
 
 
 def repetition(directory: Path, workload: Workload, rules: dict[str, Any], sdk: Path) -> Statuses:
