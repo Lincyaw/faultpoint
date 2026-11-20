@@ -84,7 +84,8 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | `rpc_server` | HTTP/RPC 服务端入口 | `fail` `delay` `fail_after` | 同上 |
 | `store_read` | 读语句 | `fail` `delay` `empty` | `rows` `empty` `error`，行数记入 total |
 | `store_write` | 写语句 | `fail` `delay` `fail_after` `drop` `duplicate` | `ok` `error`，影响行数记入 total |
-| `publish` `consume` | 消息生产与消费 | `fail` `delay` `fail_after` `drop` `duplicate`（`consume` 没有 `drop`） | `ok` `error` |
+| `publish` | 消息生产 | `fail` `delay` `fail_after` `drop` `duplicate` | `ok` `error` |
+| `consume` | 消息消费 | `fail` `delay` `fail_after` `duplicate` `empty`（取不到消息） | `rows` `empty` `error`，消息条数记入 total |
 | `syscall` | 进程的系统调用（eBPF） | `fail`：返回指定的 errno | `ok`，或 errno 名 |
 | `packet` | 容器网络接口上的包（eBPF） | `delay` `drop` | `delayed` `dropped` |
 

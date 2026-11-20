@@ -80,8 +80,8 @@
       "errors": ["timeout", "refused"]
     },
     "consume": {
-      "actions": ["fail", "fail_after", "duplicate", "delay", "crash"],
-      "outcomes": ["ok", "error"],
+      "actions": ["fail", "fail_after", "duplicate", "empty", "delay", "crash"],
+      "outcomes": ["rows", "empty", "error"],
       "errors": ["timeout", "refused"]
     },
     "syscall": {
