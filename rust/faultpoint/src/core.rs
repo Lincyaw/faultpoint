@@ -109,8 +109,10 @@ impl Core {
                 continue;
             }
             let options = core.settings.config.options(plugin.name);
+            // A kind served by several plugins accepts only the actions every one of them implements.
             for (kind, actions) in plugin.kinds {
-                core.declared.entry(kind).or_default().extend(actions.iter().copied());
+                let offered: HashSet<&'static str> = actions.iter().copied().collect();
+                core.declared.entry(kind).and_modify(|known| known.retain(|action| offered.contains(action))).or_insert(offered);
             }
             if let Some(sink) = plugin.sink.and_then(|build| build(&core.settings, &options)) {
                 core.sink = Some(sink);
@@ -136,7 +138,8 @@ impl Core {
                 continue;
             }
             if !actions.contains(rule.action.kind.as_str()) {
-                self.abort(&format!("rule {}: no plugin of this process implements {} at a {kind} point", rule.id, rule.action.kind));
+                self.abort(&format!("rule {}: not every plugin of this process serving it implements {} at a {kind} point",
+                                    rule.id, rule.action.kind));
             }
             rules.entry(rule.point.clone()).or_default().push(rule);
         }

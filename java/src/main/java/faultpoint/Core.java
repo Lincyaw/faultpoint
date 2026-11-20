@@ -79,8 +79,13 @@ public final class Core {
         return settings.enabled();
     }
 
+    /** A kind served by several plugins accepts only the actions every one of them implements, so that a rule
+     * is rejected when its rule set loads rather than at the one point that cannot obey it. */
     public void declare(Map<String, List<String>> kinds) {
-        kinds.forEach((kind, actions) -> declared.computeIfAbsent(kind, ignored -> new HashSet<>()).addAll(actions));
+        kinds.forEach((kind, actions) -> declared.merge(kind, new HashSet<>(actions), (known, offered) -> {
+            known.retainAll(offered);
+            return known;
+        }));
     }
 
     public void useRuleSource(RuleSource source) {
@@ -111,7 +116,7 @@ public final class Core {
                 continue;
             }
             if (!actions.contains(rule.kind())) {
-                abort("rule " + rule.id() + ": no plugin of this process implements " + rule.kind() + " at a "
+                abort("rule " + rule.id() + ": not every plugin of this process serving it implements " + rule.kind() + " at a "
                         + rule.pointKind() + " point");
             }
             rules.computeIfAbsent(rule.point(), ignored -> new ArrayList<>()).add(rule);

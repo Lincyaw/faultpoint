@@ -63,9 +63,12 @@ export class Core {
     }
   }
 
+  /** A kind served by several plugins accepts only the actions every one of them implements, so that a rule is
+   * rejected when its rule set loads rather than at the one point that cannot obey it. */
   declare(kinds: Readonly<Record<string, readonly string[]>>): void {
     for (const [kind, actions] of Object.entries(kinds)) {
-      this.declared.set(kind, new Set([...(this.declared.get(kind) ?? []), ...actions]));
+      const known = this.declared.get(kind);
+      this.declared.set(kind, new Set(known === undefined ? actions : actions.filter((action) => known.has(action))));
     }
   }
 
@@ -96,7 +99,7 @@ export class Core {
         continue;
       }
       if (!actions.has(rule.action.kind)) {
-        this.abort(`rule ${rule.id}: no plugin of this process implements ${rule.action.kind} at a ${kind} point`);
+        this.abort(`rule ${rule.id}: not every plugin of this process serving it implements ${rule.action.kind} at a ${kind} point`);
       }
       rules.set(rule.point, [...(rules.get(rule.point) ?? []), rule]);
     }
