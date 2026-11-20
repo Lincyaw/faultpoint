@@ -214,7 +214,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | Python | 导入钩子也改写范围内的已安装包；C 扩展内部不放置 |
 | Node | 加载钩子也改写范围内的 `node_modules` 包；原生插件内部不放置 |
 | Java | agent 也改写范围内的包前缀；`java.*` `jdk.*` `sun.*` 不放置 |
-| Go | 改写后的依赖文件经 `go build -overlay` 替换进构建，不复制模块、不改模块缓存；标准库不放置，因为 SDK 依赖标准库，会形成导入环 |
+| Go | 含有范围内包的依赖模块各复制一份到构建副本的 `faultpoint-libraries/<模块>@<版本>/`，在副本中改写，再由副本的 `go.work` 或 `go.mod` 用 `replace` 指向它；模块缓存不改。不用 `go build -overlay`，因为 Go 拒绝用它替换模块缓存中的文件。标准库不放置，因为 SDK 依赖标准库，会形成导入环 |
 | Rust | 改写后的依赖 crate 副本经副本 `Cargo.toml` 的 `[patch.crates-io]` 替换进构建 |
 
 **范围与行为由配置限定**：配置的 `placement.scope` 列出放置范围，缺省只有业务代码。依赖库须逐个列入，每一项可以限定允许放置的类别：
