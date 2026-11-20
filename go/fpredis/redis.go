@@ -1,14 +1,20 @@
-// Package fpredis is the adapter plugin of go-redis: a hook on the clients the rewriter wires makes every command
-// of the command table in its options a store_read, store_write, publish or consume point.
+// Package fpredis is the adapter plugin of go-redis: a hook on the clients the rewriter wires makes every command of
+// the shared command table spec/redis-commands.json a store_read, store_write, publish or consume point.
 package fpredis
+
+//go:generate cp ../../spec/redis-commands.json commands.json
 
 import (
 	"context"
+	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"faultpoint"
 	"faultpoint/fpaction"
@@ -16,33 +22,16 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// command is where a command is a point: its kind, and the argument after which its key comes, when not first.
+//go:embed commands.json
+var table []byte
+
+// command is where a command of the table is a point: its kind, where its key is among the arguments after the
+// command name, and which reply of a read or consume is empty.
 type command struct {
-	Kind     string `json:"kind"`
-	KeyAfter string `json:"key_after"`
+	Kind  string          `json:"kind"`
+	Key   json.RawMessage `json:"key"`
+	Empty string          `json:"empty"`
 }
-
-const defaultIdentifier = `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\b[0-9a-fA-F]{16,}\b|\b\d+\b`
-
-var (
-	read            = command{Kind: "store_read"}
-	write           = command{Kind: "store_write"}
-	publish         = command{Kind: "publish"}
-	consume         = command{Kind: "consume"}
-	consumeStreams  = command{Kind: "consume", KeyAfter: "streams"}
-	defaultCommands = map[string]command{
-		"get": read, "hget": read, "hgetall": read, "exists": read, "smembers": read, "sismember": read, "scard": read,
-		"lrange": read, "llen": read, "zrange": read, "zrangebyscore": read, "zscore": read, "zcard": read,
-		"xrange": read, "xrevrange": read, "xlen": read, "xpending": read,
-		"set": write, "setnx": write, "setex": write, "psetex": write, "getset": write, "getdel": write, "del": write,
-		"unlink": write, "expire": write, "pexpire": write, "persist": write, "hset": write, "hsetnx": write,
-		"hdel": write, "hincrby": write, "incr": write, "incrby": write, "decr": write, "decrby": write, "sadd": write,
-		"srem": write, "lpush": write, "rpush": write, "lpop": write, "rpop": write, "lrem": write, "ltrim": write,
-		"zadd": write, "zrem": write, "zincrby": write, "xack": write, "xdel": write, "xtrim": write,
-		"xadd": publish, "publish": publish,
-		"xreadgroup": consumeStreams, "xread": consumeStreams, "xautoclaim": consume, "xclaim": consume,
-	}
-)
 
 var (
 	enabled    bool
@@ -51,19 +40,22 @@ var (
 )
 
 func init() {
-	options := struct {
-		Commands   map[string]command `json:"commands"`
-		Identifier string             `json:"identifier"`
-	}{Commands: defaultCommands, Identifier: defaultIdentifier}
+	var options struct {
+		Commands      map[string]command `json:"commands"`
+		KeyIdentifier string             `json:"key_identifier"`
+	}
+	if err := json.Unmarshal(table, &options); err != nil {
+		faultpoint.Abort("the redis command table: %v", err)
+	}
 	enabled = faultpoint.Register(faultpoint.Plugin{Name: "redis", Options: &options, Actions: map[string][]string{
 		"store_read":  {"fail", "empty", "delay", "crash"},
+		"consume":     {"fail", "fail_after", "empty", "delay", "crash"},
 		"store_write": {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
 		"publish":     {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
-		"consume":     {"fail", "fail_after", "delay", "crash"},
 	}})
-	pattern, err := regexp.Compile(options.Identifier)
+	pattern, err := regexp.Compile(options.KeyIdentifier)
 	if err != nil {
-		faultpoint.Abort("option identifier of redis: %v", err)
+		faultpoint.Abort("option key_identifier of redis: %v", err)
 	}
 	commands, identifier = options.Commands, pattern
 }
@@ -77,97 +69,162 @@ func Instrument[C interface{ AddHook(redis.Hook) }](client C) C {
 	return client
 }
 
+// key is the key of a command by the table's key position: an index among the arguments after the command name,
+// "after:TOKEN" for the argument after that token, "numkeys:N" for the first key after the key count at N, or null.
+func key(position json.RawMessage, arguments []any) (string, bool) {
+	var index int
+	var text string
+	switch {
+	case json.Unmarshal(position, &index) == nil && index+1 < len(arguments):
+		return fmt.Sprint(arguments[index+1]), true
+	case json.Unmarshal(position, &text) != nil || text == "":
+		return "", false
+	case strings.HasPrefix(text, "after:"):
+		for at := 1; at+1 < len(arguments); at++ {
+			if strings.EqualFold(fmt.Sprint(arguments[at]), strings.TrimPrefix(text, "after:")) {
+				return fmt.Sprint(arguments[at+1]), true
+			}
+		}
+	case strings.HasPrefix(text, "numkeys:"):
+		at, err := strconv.Atoi(strings.TrimPrefix(text, "numkeys:"))
+		if err == nil && at+2 < len(arguments) && fmt.Sprint(arguments[at+1]) != "0" {
+			return fmt.Sprint(arguments[at+2]), true
+		}
+	}
+	return "", false
+}
+
 // call is one execution of a command at its point.
 type call struct {
-	ctx    context.Context
-	point  string
-	kind   string
-	rule   *faultpoint.Rule
-	action string
+	ctx     context.Context
+	point   string
+	command command
+	rule    *faultpoint.Rule
+	action  string
 }
 
 // decide finds a command in the table, decides its rule and performs the rule's delay or crash; a command outside
 // the table is not a point.
 func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
-	known, found := commands[cmd.Name()]
+	name := strings.ToUpper(cmd.Name())
+	known, found := commands[name]
 	if !found {
 		return call{}, false
 	}
-	arguments := cmd.Args()
-	key := "-"
-	for index := 1; index < len(arguments); index++ {
-		if known.KeyAfter == "" || strings.EqualFold(fmt.Sprint(arguments[index-1]), known.KeyAfter) {
-			key = identifier.ReplaceAllString(fmt.Sprint(arguments[index]), "{}")
-			break
-		}
+	locator := name
+	if found, exists := key(known.Key, cmd.Args()); exists {
+		locator += " " + identifier.ReplaceAllString(found, "{}")
 	}
-	c := call{ctx: ctx, kind: known.Kind,
-		point: faultpoint.PointID(faultpoint.Service(), known.Kind, strings.ToUpper(cmd.Name())+" "+key)}
+	c := call{ctx: ctx, command: known, point: faultpoint.PointID(faultpoint.Service(), known.Kind, locator)}
 	c.rule = faultpoint.Decide(ctx, c.point)
 	if c.rule != nil {
 		fpaction.Hold(c.rule)
 		c.action = c.rule.Action.Kind
 	}
+	if c.action == "empty" && known.Empty == "never" {
+		faultpoint.Abort("rule %s: %s has no empty reply", c.rule.ID, c.point)
+	}
 	return c, true
 }
 
-// sent is whether the command reaches Redis: a fail or drop rule keeps it back.
-func (c call) sent() bool { return c.action != "fail" && c.action != "drop" }
+// sent is whether the command reaches Redis: fail and drop keep it back, and so does empty, except for an
+// array of nils, whose length only the reply knows.
+func (c call) sent() bool {
+	return c.action != "fail" && c.action != "drop" && (c.action != "empty" || c.command.Empty == "all_nil")
+}
+
+// block waits as long as a blocking read kept back by an empty rule would have waited for its empty reply, so that
+// a consumer loop does not spin.
+func (c call) block(cmd redis.Cmder) {
+	arguments := cmd.Args()
+	for index := 1; index+1 < len(arguments) && c.action == "empty"; index++ {
+		milliseconds, err := strconv.Atoi(fmt.Sprint(arguments[index+1]))
+		if strings.EqualFold(fmt.Sprint(arguments[index]), "block") && err == nil {
+			select {
+			case <-time.After(time.Duration(milliseconds) * time.Millisecond):
+			case <-c.ctx.Done():
+			}
+			return
+		}
+	}
+}
 
 // settle applies what a rule does once the command was sent or kept back, and observes the outcome.
 func (c call) settle(cmd redis.Cmder, err error) error {
-	if c.action == "fail" || (err == nil && c.action == "fail_after") {
+	switch {
+	case c.action == "fail" || (err == nil && c.action == "fail_after"):
 		err = fpaction.Failure(c.rule)
-	}
-	if err == nil && c.action == "empty" {
-		err = emptied(cmd)
+	case err == nil && c.action == "empty":
+		err = emptied(cmd, c.command.Empty)
 	}
 	if err != nil {
 		cmd.SetErr(err)
 	}
 	outcome, total := "ok", 0
+	reads := c.command.Kind == "store_read" || c.command.Kind == "consume"
 	switch {
-	case c.kind == "consume" && errors.Is(err, redis.Nil):
-	case c.kind == "store_read" && errors.Is(err, redis.Nil):
+	case reads && c.command.Empty == "nil" && errors.Is(err, redis.Nil):
 		outcome = "empty"
 	case err != nil:
 		outcome = "error"
-	case c.kind == "store_read" && size(cmd) > 0:
-		outcome, total = "rows", size(cmd)
-	case c.kind == "store_read":
+	case reads && empty(cmd, c.command.Empty):
 		outcome = "empty"
+	case reads:
+		outcome, total = "rows", size(cmd)
 	}
 	faultpoint.Observe(c.ctx, c.point, outcome, float64(total), c.rule)
 	return err
 }
 
-// Every typed go-redis command has Val and SetVal, which emptied and size read through reflection.
+// Every typed go-redis command has Val and SetVal, through which the reply is read and replaced.
+func reply(cmd redis.Cmder) reflect.Value {
+	return reflect.ValueOf(cmd).MethodByName("Val").Call(nil)[0]
+}
 
-// emptied makes a read a miss: redis.Nil for a single string or number lookup, the empty value of anything else.
-func emptied(cmd redis.Cmder) error {
-	value := reflect.ValueOf(cmd).MethodByName("Val").Call(nil)[0]
-	switch value.Kind() {
-	case reflect.String, reflect.Float32, reflect.Float64:
+// emptied gives a command the empty reply of the table: redis.Nil, an empty array or map, an empty string, zero, or
+// its own reply with every element nil.
+func emptied(cmd redis.Cmder, kind string) error {
+	if kind == "nil" {
 		return redis.Nil
-	case reflect.Slice:
-		value = reflect.MakeSlice(value.Type(), 0, 0)
-	case reflect.Map:
-		value = reflect.MakeMap(value.Type())
-	default:
-		value = reflect.Zero(value.Type())
 	}
-	reflect.ValueOf(cmd).MethodByName("SetVal").Call([]reflect.Value{value})
+	value := reply(cmd)
+	replaced := reflect.Zero(value.Type())
+	switch {
+	case kind == "all_nil":
+		replaced = reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+	case value.Kind() == reflect.Slice:
+		replaced = reflect.MakeSlice(value.Type(), 0, 0)
+	case value.Kind() == reflect.Map:
+		replaced = reflect.MakeMap(value.Type())
+	}
+	reflect.ValueOf(cmd).MethodByName("SetVal").Call([]reflect.Value{replaced})
 	return nil
 }
 
-// size is how many values a read returned: the length of a collection, else 1 for a value that is not zero.
+// empty is whether a reply is the empty reply of the table.
+func empty(cmd redis.Cmder, kind string) bool {
+	value := reply(cmd)
+	switch kind {
+	case "empty_array":
+		return value.Len() == 0
+	case "empty_string", "zero":
+		return value.IsZero()
+	case "all_nil":
+		for index := range value.Len() {
+			if !value.Index(index).IsNil() {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// size is how many values a read returned: the length of a collection, else 1.
 func size(cmd redis.Cmder) int {
-	value := reflect.ValueOf(cmd).MethodByName("Val").Call(nil)[0]
-	switch {
-	case value.Kind() == reflect.Slice || value.Kind() == reflect.Map:
+	value := reply(cmd)
+	if value.Kind() == reflect.Slice || value.Kind() == reflect.Map {
 		return value.Len()
-	case value.IsZero():
-		return 0
 	}
 	return 1
 }
@@ -185,6 +242,8 @@ func (hook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		var err error
 		if c.sent() {
 			err = next(ctx, cmd)
+		} else {
+			c.block(cmd)
 		}
 		if err == nil && c.action == "duplicate" {
 			err = next(ctx, cmd)

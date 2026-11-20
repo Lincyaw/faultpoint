@@ -5,6 +5,7 @@ package fppgx
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 
 	"faultpoint"
@@ -246,15 +247,18 @@ type batchSender interface {
 	SendBatch(ctx context.Context, batch *pgx.Batch) pgx.BatchResults
 }
 
-// SendBatch is db.SendBatch under the rule of one point for the whole batch, classified by all its statements; the
-// outcome is observed when the results are closed.
+// SendBatch is db.SendBatch under the rule of one point for the whole batch, classified by its distinct statements,
+// so that the point does not depend on how many times a batch repeats a statement; the outcome is observed when the
+// results are closed.
 func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchResults {
 	if passes(ctx) {
 		return db.SendBatch(ctx, batch)
 	}
-	queries := make([]string, len(batch.QueuedQueries))
-	for index, queued := range batch.QueuedQueries {
-		queries[index] = queued.SQL
+	var queries []string
+	for _, queued := range batch.QueuedQueries {
+		if !slices.Contains(queries, queued.SQL) {
+			queries = append(queries, queued.SQL)
+		}
 	}
 	s := decide(ctx, strings.Join(queries, ";\n"))
 	s.refuse("SendBatch", "drop", "empty")
@@ -278,7 +282,7 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 		s.observe(0, err)
 		return failedResults{err: err}
 	}
-	return &observedResults{BatchResults: results, statement: s, queued: int64(len(queries))}
+	return &observedResults{BatchResults: results, statement: s, queued: int64(len(batch.QueuedQueries))}
 }
 
 type observedResults struct {
