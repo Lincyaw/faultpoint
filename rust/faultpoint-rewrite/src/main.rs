@@ -46,6 +46,7 @@ struct Placer<'a> {
     ordinals: HashMap<String, usize>,
     points: Vec<PointEntry>,
     serves: bool,
+    stores: bool,
 }
 
 fn last_segments(path: &syn::Path, count: usize) -> String {
@@ -294,7 +295,134 @@ impl VisitMut for Placer<'_> {
             layered(call.args.iter_mut().nth(1).expect("two arguments"));
             self.serves = true;
         }
+        if let Some(store) = sqlx_store(node).or_else(|| redis_store(node)) {
+            *node = store;
+            self.stores = true;
+        }
     }
+}
+
+/// The call that starts a method chain, with the chain's methods from the call outwards.
+fn chain(expression: &Expr) -> Option<(&syn::ExprCall, Vec<&syn::ExprMethodCall>)> {
+    let mut methods = Vec::new();
+    let mut current = expression;
+    loop {
+        match current {
+            Expr::MethodCall(method) => {
+                methods.push(method);
+                current = &method.receiver;
+            }
+            Expr::Call(call) => {
+                methods.reverse();
+                return Some((call, methods));
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn path_of(call: &syn::ExprCall) -> Option<&syn::Path> {
+    match call.func.as_ref() {
+        Expr::Path(path) => Some(&path.path),
+        _ => None,
+    }
+}
+
+/// A SQL argument the copy can evaluate twice: a literal, a constant path, or a reference to one.
+fn repeatable(sql: &Expr) -> bool {
+    match sql {
+        Expr::Lit(_) | Expr::Path(_) => true,
+        Expr::Reference(reference) => repeatable(&reference.expr),
+        _ => false,
+    }
+}
+
+/// `sqlx::query*(SQL)...fetch_one|fetch_all|fetch_optional|execute(executor)` as a store point; the hooks
+/// build sqlx's own values, so the SDK does not depend on sqlx.
+fn sqlx_store(expression: &Expr) -> Option<Expr> {
+    let Expr::MethodCall(execution) = expression else { return None };
+    let (root, _) = chain(expression)?;
+    let path = path_of(root)?;
+    let starts = path.segments.first().is_some_and(|segment| segment.ident == "sqlx")
+        && path.segments.last().is_some_and(|segment| ["query", "query_as", "query_scalar"].contains(&segment.ident.to_string().as_str()));
+    let sql = root.args.first()?;
+    if !starts || execution.args.len() != 1 || !repeatable(sql) {
+        return None;
+    }
+    let (substitute, is_empty): (Expr, Expr) = match execution.method.to_string().as_str() {
+        "fetch_one" => (parse_quote!(|| ::std::result::Result::Err(::sqlx::Error::RowNotFound)), parse_quote!(|_| false)),
+        "fetch_all" => (parse_quote!(|| ::std::result::Result::Ok(::std::vec::Vec::new())), parse_quote!(|rows| rows.is_empty())),
+        "fetch_optional" => (parse_quote!(|| ::std::result::Result::Ok(::std::option::Option::None)), parse_quote!(|row| row.is_none())),
+        "execute" => (parse_quote!(|| ::std::result::Result::Ok(::core::default::Default::default())), parse_quote!(|_| false)),
+        _ => return None,
+    };
+    Some(parse_quote!(::faultpoint::store::sql(#sql, #expression, ::faultpoint::store::Hooks {
+        failure: || ::sqlx::Error::Protocol(::std::string::String::from("faultpoint: injected store failure")),
+        substitute: #substitute,
+        is_empty: #is_empty,
+    })))
+}
+
+/// spec/redis-commands.json, which the SDK reads as well.
+static REDIS_COMMANDS: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
+    serde_json::from_str(include_str!("../../../spec/redis-commands.json")).expect("the shared Redis table is JSON")
+});
+
+fn string_literal(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(text), .. }) => Some(text.value()),
+        Expr::Reference(reference) => string_literal(&reference.expr),
+        _ => None,
+    }
+}
+
+/// The key argument of a command by the shared table's rule, among the `.arg(..)` arguments of the chain.
+fn key_argument<'a>(rule: &serde_json::Value, arguments: &[&'a Expr]) -> Option<&'a Expr> {
+    if let Some(index) = rule.as_u64() {
+        return arguments.get(index as usize).copied();
+    }
+    let rule = rule.as_str()?;
+    if let Some(token) = rule.strip_prefix("after:") {
+        let index = arguments.iter().position(|argument| string_literal(argument).is_some_and(|text| text.eq_ignore_ascii_case(token)))?;
+        return arguments.get(index + 1).copied();
+    }
+    let at: usize = rule.strip_prefix("numkeys:")?.parse().ok()?;
+    arguments.get(at + 1).copied()
+}
+
+/// The key text a point uses, taken before the chain moves the key; the SDK templates it at runtime.
+fn key_text(key: &Expr) -> Expr {
+    parse_quote!(::std::option::Option::Some(::faultpoint::store::KeyText::key_text(&#key)))
+}
+
+/// `redis::cmd("NAME")...query_async(connection)` as a Redis point; the hooks build redis-rs's own values.
+fn redis_store(expression: &Expr) -> Option<Expr> {
+    let Expr::MethodCall(execution) = expression else { return None };
+    let (root, methods) = chain(expression)?;
+    let path = path_of(root)?;
+    if execution.method != "query_async" || last_segments(path, 2) != "redis::cmd" {
+        return None;
+    }
+    let name = string_literal(root.args.first()?)?.to_uppercase();
+    let command = REDIS_COMMANDS["commands"].get(&name)?;
+    let arguments: Vec<&Expr> = methods.iter().filter(|method| method.method == "arg").filter_map(|method| method.args.first()).collect();
+    let key: Expr = match key_argument(&command["key"], &arguments) {
+        Some(key) => key_text(key),
+        None => parse_quote!(::std::option::Option::None),
+    };
+    // An empty read answers nil; a dropped write is acknowledged with Redis's status reply.
+    let substitute: Expr = if command.get("empty").is_some() {
+        parse_quote!(|| ::redis::FromRedisValue::from_redis_value(&::redis::Value::Nil))
+    } else {
+        parse_quote!(|| ::redis::FromRedisValue::from_redis_value(&::redis::Value::Okay))
+    };
+    // Arguments run left to right, so the key's text is taken before the chain moves the key, and the chain's
+    // temporaries live to the end of the statement as they did before.
+    Some(parse_quote!(::faultpoint::store::redis(#name, #key, #expression, ::faultpoint::store::Hooks {
+        failure: || ::redis::RedisError::from((::redis::ErrorKind::IoError, "faultpoint: injected Redis failure")),
+        substitute: #substitute,
+        is_empty: |_| false,
+    })))
 }
 
 fn copy_tree(source: &Path, target: &Path, files: &mut Vec<PathBuf>) {
@@ -317,14 +445,15 @@ fn copy_tree(source: &Path, target: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn require_sdk(target: &Path, sdk: &Path, serves: bool) {
+/// The copy depends on the SDK with the features of the boundaries the rewrite wired.
+fn require_sdk(target: &Path, sdk: &Path, features: &[&str]) {
     let manifest_path = target.join("Cargo.toml");
     let mut manifest: toml_edit::DocumentMut = std::fs::read_to_string(&manifest_path).expect("cannot read Cargo.toml")
         .parse().expect("Cargo.toml is not valid TOML");
     let mut dependency = toml_edit::InlineTable::new();
     dependency.insert("path", sdk.display().to_string().into());
-    if serves {
-        dependency.insert("features", toml_edit::Array::from_iter(["tower"]).into());
+    if !features.is_empty() {
+        dependency.insert("features", toml_edit::Array::from_iter(features.iter().copied()).into());
     }
     manifest["dependencies"]["faultpoint"] = toml_edit::value(dependency);
     std::fs::write(&manifest_path, manifest.to_string()).expect("cannot write Cargo.toml");
@@ -354,21 +483,24 @@ fn main() {
     copy_tree(&source, &target, &mut files);
     files.sort();
     let mut points = Vec::new();
-    let mut serves = false;
+    let (mut serves, mut stores) = (false, false);
     for file in files {
         let path = file.strip_prefix(&target).expect("under the target").display().to_string();
         let mut syntax = syn::parse_file(&std::fs::read_to_string(&file).expect("cannot read a source file"))
             .unwrap_or_else(|error| panic!("cannot parse {path}: {error}"));
         let mut placer = Placer { service: &service, path, placement: &config.placement, scopes: Vec::new(), owner: None,
-                                  ordinals: HashMap::new(), points: Vec::new(), serves: false };
+                                  ordinals: HashMap::new(), points: Vec::new(), serves: false, stores: false };
         placer.visit_file_mut(&mut syntax);
         serves |= placer.serves;
-        if !placer.points.is_empty() || placer.serves {
+        stores |= placer.stores;
+        if !placer.points.is_empty() || placer.serves || placer.stores {
             std::fs::write(&file, prettyplease::unparse(&syntax)).expect("cannot write a source file");
         }
         points.extend(placer.points);
     }
-    require_sdk(&target, &sdk, serves);
+    let features: Vec<&str> = [(serves, "tower"), (stores, "store")].into_iter()
+        .filter_map(|(wired, feature)| wired.then_some(feature)).collect();
+    require_sdk(&target, &sdk, &features);
     let manifest = serde_json::json!({"service": service, "language": "rust", "points": points});
     std::fs::write(target.join(MANIFEST_FILE), serde_json::to_string_pretty(&manifest).expect("serialises") + "\n")
         .expect("cannot write the manifest");

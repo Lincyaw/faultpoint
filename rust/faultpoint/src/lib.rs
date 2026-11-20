@@ -4,6 +4,8 @@ pub mod core;
 pub mod observations;
 pub mod points;
 pub mod rules;
+#[cfg(feature = "store")]
+pub mod store;
 #[cfg(feature = "tower")]
 pub mod tower;
 

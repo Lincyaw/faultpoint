@@ -8,6 +8,8 @@ description = "Fault points that both inject and observe faults, for counterfact
 default = []
 # The rpc_server boundary as a tower layer, which the rewriter wires at axum::serve.
 tower = ["dep:tower", "dep:http", "dep:tokio", "dep:regex", "dep:opentelemetry_sdk", "dep:opentelemetry-http"]
+# The store points the rewriter places at sqlx and redis-rs call sites; the copy supplies the client's own types.
+store = ["dep:tokio", "dep:regex", "dep:sqlparser"]
 
 [dependencies]
 opentelemetry = "0.33"
@@ -22,3 +24,4 @@ tokio = { version = "1", features = ["time"], optional = true }
 regex = { version = "1", optional = true }
 opentelemetry_sdk = { version = "0.33", optional = true }
 opentelemetry-http = { version = "0.33", optional = true }
+sqlparser = { version = "0.64", features = ["visitor"], optional = true }
