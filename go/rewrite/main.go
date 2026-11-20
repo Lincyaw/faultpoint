@@ -1,6 +1,6 @@
-// Command fprewrite places fault points in a build copy of a Go module and wires its net/http and database/sql
-// boundaries to the faultpoint adapters, so that the service's own source never contains the SDK; its scan
-// command writes the manifest of the same points without a copy.
+// Command fprewrite places fault points in a build copy of a Go module and of the local modules it replaces, and
+// wires their net/http, database/sql, pgx and go-redis boundaries to the faultpoint adapters, so that the service's
+// own source never contains the SDK; its scan command writes the manifest of the same points without a copy.
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"go/format"
 	"io/fs"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,11 +27,58 @@ import (
 const (
 	manifestFile = "faultpoint-manifest.json"
 	registryFile = "faultpoint_errors.go"
-	wiringFile   = "faultpoint_main.go"
+	initFile     = "faultpoint_init.go"
 	usage        = `usage:
   fprewrite instrument -service NAME -source DIR -target DIR -sdk DIR [-config FILE]
-  fprewrite scan -service NAME -source DIR [-manifest FILE] [-config FILE]`
+  fprewrite scan -service NAME -source DIR [-manifest FILE] [-config FILE]
+The local modules the source module replaces, directly or through each other, are instrumented with it; the
+target holds every module at its place relative to their common directory.`
 )
+
+// module is a Go module the rewriter instruments; a point in a module other than the service's own is identified by
+// the module path, since its files lie outside the service.
+type module struct {
+	dir    string
+	prefix string
+}
+
+// localModules are the source module and the local modules its go.mod replaces with directories, transitively.
+func localModules(source string) []module {
+	modules := []module{{dir: source}}
+	for index := 0; index < len(modules); index++ {
+		path := filepath.Join(modules[index].dir, "go.mod")
+		content, err := os.ReadFile(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+		parsed, err := modfile.Parse(path, content, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if index > 0 {
+			modules[index].prefix = parsed.Module.Mod.Path + "/"
+		}
+		for _, replaced := range parsed.Replace {
+			dir := filepath.Clean(filepath.Join(modules[index].dir, replaced.New.Path))
+			local := replaced.New.Version == "" && modfile.IsDirectoryPath(replaced.New.Path)
+			if local && !slices.ContainsFunc(modules, func(known module) bool { return known.dir == dir }) {
+				modules = append(modules, module{dir: dir})
+			}
+		}
+	}
+	return modules
+}
+
+// commonDir is the deepest directory that holds every module.
+func commonDir(modules []module) string {
+	root := modules[0].dir
+	for _, known := range modules {
+		for !strings.HasPrefix(known.dir+string(filepath.Separator), root+string(filepath.Separator)) {
+			root = filepath.Dir(root)
+		}
+	}
+	return root
+}
 
 // Config is the file FAULTPOINT_CONFIG names; the rewriter reads the plugins to wire and the placement.
 type Config struct {
@@ -40,7 +88,7 @@ type Config struct {
 }
 
 func readConfig(path string) Config {
-	config := Config{Plugins: []string{pointsPlugin, httpPlugin, sqlPlugin},
+	config := Config{Plugins: []string{pointsPlugin, httpPlugin, sqlPlugin, pgxPlugin, redisPlugin},
 		Placement: Placement{Branch: true, Call: true, Check: true, Loop: true, Clock: []string{"time.Now"}, Errors: true}}
 	if path == "" {
 		return config
@@ -56,15 +104,16 @@ func readConfig(path string) Config {
 	}
 	for _, plugin := range config.Plugins {
 		if _, known := pluginPackages[plugin]; !known {
-			log.Fatalf("the configuration enables %q, which is not a Go plugin: points, http or sql", plugin)
+			log.Fatalf("the configuration enables %q, which is not a Go plugin: %v", plugin, slices.Sorted(maps.Keys(pluginPackages)))
 		}
 	}
 	return config
 }
 
+// loadPackages loads a module on its own, as the copy builds it, without a go.work around the source.
 func loadPackages(source string) []*packages.Package {
-	config := &packages.Config{Dir: source, Mode: packages.NeedName | packages.NeedFiles |
-		packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo}
+	config := &packages.Config{Dir: source, Env: append(os.Environ(), "GOWORK=off"), Mode: packages.NeedName |
+		packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo}
 	loaded, err := packages.Load(config, "./...")
 	if err != nil {
 		log.Fatal(err)
@@ -150,13 +199,16 @@ func requireSDK(target, sdk string) error {
 	return os.WriteFile(path, formatted, 0o644)
 }
 
-// instrumentPackage writes the rewritten files of a package into the copy, with its error registry and, for a
-// main package, its wiring, and returns the points it placed.
-func instrumentPackage(service, sourceRoot, target string, config Config, pkg *packages.Package) []PointEntry {
+// instrumentPackage writes the rewritten files of a package of a module into the module's copy, with its error
+// registry and its init, and returns the points it placed; a directory of test files only has no package to rewrite.
+func instrumentPackage(service string, source module, copied string, config Config, pkg *packages.Package) []PointEntry {
+	if len(pkg.GoFiles) == 0 {
+		return nil
+	}
 	var placed []PointEntry
 	for _, file := range pkg.Syntax {
-		relative := relativePath(sourceRoot, pkg.Fset.Position(file.Pos()).Filename)
-		points := placePoints(service, relative, config, pkg, file)
+		relative := relativePath(source.dir, pkg.Fset.Position(file.Pos()).Filename)
+		points := placePoints(service, source.prefix+relative, config, pkg, file)
 		imports := wireBoundaries(pkg.TypesInfo, config.Plugins, file)
 		if len(points) > 0 {
 			imports = append(imports, pointsPackage)
@@ -171,18 +223,16 @@ func instrumentPackage(service, sourceRoot, target string, config Config, pkg *p
 		if err := format.Node(&rewritten, pkg.Fset, file); err != nil {
 			log.Fatal(err)
 		}
-		writeFile(filepath.Join(target, relative), rewritten.Bytes())
+		writeFile(filepath.Join(copied, relative), rewritten.Bytes())
 		placed = append(placed, points...)
 	}
-	directory := filepath.Join(target, relativePath(sourceRoot, filepath.Dir(pkg.GoFiles[0])))
+	directory := filepath.Join(copied, relativePath(source.dir, filepath.Dir(pkg.GoFiles[0])))
 	if slices.Contains(config.Plugins, pointsPlugin) && config.Placement.Errors {
 		if registry := errorRegistry(pkg); registry != nil {
 			writeFile(filepath.Join(directory, registryFile), registry)
 		}
 	}
-	if pkg.Name == "main" {
-		writeFile(filepath.Join(directory, wiringFile), mainWiring(config.Plugins))
-	}
+	writeFile(filepath.Join(directory, initFile), packageInit(pkg.Name, config.Plugins))
 	return placed
 }
 
@@ -198,30 +248,39 @@ func instrument(arguments []string) {
 		log.Fatal(usage)
 	}
 	config := readConfig(*configPath)
-	sourceRoot, targetRoot := absolutePath(*source), absolutePath(*target)
+	modules := localModules(absolutePath(*source))
+	root, targetRoot := commonDir(modules), absolutePath(*target)
 	if _, err := os.Stat(targetRoot); !errors.Is(err, fs.ErrNotExist) {
 		log.Fatalf("the target %s exists; fprewrite writes a fresh copy", targetRoot)
 	}
-	if strings.HasPrefix(targetRoot, sourceRoot+string(filepath.Separator)) {
-		log.Fatalf("the target %s lies inside the source %s", targetRoot, sourceRoot)
-	}
-	if err := copyTree(sourceRoot, targetRoot); err != nil {
-		log.Fatal(err)
+	for _, known := range modules {
+		if strings.HasPrefix(targetRoot, known.dir+string(filepath.Separator)) {
+			log.Fatalf("the target %s lies inside the module %s", targetRoot, known.dir)
+		}
 	}
 	manifest := Manifest{Service: *service, Language: "go", Points: []PointEntry{}}
-	for _, pkg := range loadPackages(sourceRoot) {
-		manifest.Points = append(manifest.Points, instrumentPackage(*service, sourceRoot, targetRoot, config, pkg)...)
+	copies := make([]string, len(modules))
+	for index, known := range modules {
+		copies[index] = filepath.Join(targetRoot, relativePath(root, known.dir))
+		if err := copyTree(known.dir, copies[index]); err != nil {
+			log.Fatal(err)
+		}
+		for _, pkg := range loadPackages(known.dir) {
+			manifest.Points = append(manifest.Points, instrumentPackage(*service, known, copies[index], config, pkg)...)
+		}
+		if err := requireSDK(copies[index], absolutePath(*sdk)); err != nil {
+			log.Fatal(err)
+		}
 	}
-	if err := requireSDK(targetRoot, absolutePath(*sdk)); err != nil {
-		log.Fatal(err)
+	for _, copied := range copies {
+		tidy := exec.Command("go", "mod", "tidy")
+		tidy.Dir, tidy.Env, tidy.Stdout, tidy.Stderr = copied, append(os.Environ(), "GOWORK=off"), os.Stderr, os.Stderr
+		if err := tidy.Run(); err != nil {
+			log.Fatalf("go mod tidy in %s: %v", copied, err)
+		}
 	}
-	tidy := exec.Command("go", "mod", "tidy")
-	tidy.Dir, tidy.Stdout, tidy.Stderr = targetRoot, os.Stderr, os.Stderr
-	if err := tidy.Run(); err != nil {
-		log.Fatalf("go mod tidy in the copy: %v", err)
-	}
-	writeManifest(filepath.Join(targetRoot, manifestFile), manifest)
-	fmt.Printf("%d points placed in %s\n", len(manifest.Points), targetRoot)
+	writeManifest(filepath.Join(copies[0], manifestFile), manifest)
+	fmt.Printf("%d points placed in %d modules; the service is at %s\n", len(manifest.Points), len(modules), copies[0])
 }
 
 func scan(arguments []string) {
@@ -235,12 +294,13 @@ func scan(arguments []string) {
 		log.Fatal(usage)
 	}
 	config := readConfig(*configPath)
-	sourceRoot := absolutePath(*source)
 	manifest := Manifest{Service: *service, Language: "go", Points: []PointEntry{}}
-	for _, pkg := range loadPackages(sourceRoot) {
-		for _, file := range pkg.Syntax {
-			relative := relativePath(sourceRoot, pkg.Fset.Position(file.Pos()).Filename)
-			manifest.Points = append(manifest.Points, placePoints(*service, relative, config, pkg, file)...)
+	for _, known := range localModules(absolutePath(*source)) {
+		for _, pkg := range loadPackages(known.dir) {
+			for _, file := range pkg.Syntax {
+				relative := known.prefix + relativePath(known.dir, pkg.Fset.Position(file.Pos()).Filename)
+				manifest.Points = append(manifest.Points, placePoints(*service, relative, config, pkg, file)...)
+			}
 		}
 	}
 	writeManifest(*manifestPath, manifest)
