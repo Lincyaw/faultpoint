@@ -15,7 +15,7 @@
     {"kind": "check", "outcomes": ["true", "false"], "metric": "count", "verdicts": ["increase"], "faults": [],
      "reason": "An answer the detector already gave, given more often, may only mean more executions."},
     {"kind": "loop", "outcomes": ["iteration"], "metric": "count", "faults": [{"kind": "delay"}],
-     "reason": "Extra iterations are read as contention, as CSnake does, which a delay at the loop stands for."},
+     "reason": "Extra iterations are read as contention, which a delay at the loop stands for."},
     {"kind": "rpc_client", "outcomes": ["timeout"], "metric": "count",
      "faults": [{"kind": "fail", "error": "timeout"}, {"kind": "fail_after", "error": "timeout"}],
      "reason": "A timeout does not tell whether the peer completed the call, so both are candidates."},

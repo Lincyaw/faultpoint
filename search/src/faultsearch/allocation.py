@@ -12,11 +12,11 @@ from scipy.spatial.distance import squareform
 from shop.workload import Scenarios
 
 from faultsearch.catalog import FROZEN, Catalog, Fault
-from faultsearch.fca import NamedWorkload, Runner, TreatmentRecord
+from faultsearch.counterfactual import NamedWorkload, Runner, TreatmentRecord
 
 
 class Strategy(StrEnum):
-    THREE_PHASE = "3pa"
+    PHASED = "phased"
     RANDOM = "random"
 
 
@@ -55,7 +55,7 @@ class Cluster(BaseModel):
 
     number: int
     members: tuple[str, ...]
-    sim_score: float
+    similarity: float
     """The mean pairwise cosine similarity of the effect vectors of every run of the members."""
 
 
@@ -107,8 +107,8 @@ def cluster_faults(first_runs: dict[str, TreatmentRecord], distance: float) -> d
     return dict(zip(keys, (int(number) for number in numbers), strict=True))
 
 
-def sim_scores(members: dict[int, list[str]], runs: list[TreatmentRecord]) -> dict[int, float]:
-    """Every cluster's SimScore over the runs of its members, a single run counting as fully similar."""
+def cluster_similarities(members: dict[int, list[str]], runs: list[TreatmentRecord]) -> dict[int, float]:
+    """Every cluster's similarity over the runs of its members, a single run counting as fully similar."""
     similarity = similarities(weighted_vectors([effect_keys(run) for run in runs]))
     scores = {}
     for number, keys in members.items():
@@ -171,10 +171,10 @@ class Exploration:
 
     def allocation(self, strategy: Strategy) -> Allocation:
         members = self.members()
-        scores = sim_scores(members, self.runs())
+        scores = cluster_similarities(members, self.runs())
         return Allocation(
             strategy=strategy, assignments=tuple(self.assignments),
-            clusters=tuple(Cluster(number=number, members=tuple(keys), sim_score=scores[number])
+            clusters=tuple(Cluster(number=number, members=tuple(keys), similarity=scores[number])
                            for number, keys in sorted(members.items())),
             unexercised=tuple(sorted({assignment.fault.key for assignment in self.assignments} - set(self.first_runs()))))
 
@@ -194,12 +194,12 @@ def round_robin(exploration: Exploration, members: dict[int, list[str]], budget:
 
 
 def weighted(exploration: Exploration, members: dict[int, list[str]], budget: int) -> None:
-    """Injections drawn by cluster weight, max(epsilon, 1 - SimScore), which favours clusters whose effects differ
-    from one scenario to another."""
+    """Injections drawn by cluster weight, max(epsilon, 1 - similarity), which favours clusters whose effects differ
+    from one scenario to another, the sign of conditional causality."""
     settings = exploration.settings
     spent = 0
     while spent < budget:
-        scores = sim_scores(members, exploration.runs())
+        scores = cluster_similarities(members, exploration.runs())
         open_clusters = sorted(members)
         batch: list[Assignment] = []
         taken: set[tuple[str, str]] = set()
@@ -217,8 +217,9 @@ def weighted(exploration: Exploration, members: dict[int, list[str]], budget: in
         spent += len(batch)
 
 
-def three_phase(exploration: Exploration) -> Allocation:
-    """CSnake's 3PA: every fault once where its point runs most, then clusters in turn, then clusters by weight."""
+def phased_allocation(exploration: Exploration) -> Allocation:
+    """Phased budget allocation: every fault once where its point runs most, clustered into causally equivalent
+    faults; then the clusters in turn; then the clusters by weight."""
     exploration.run([Assignment(fault=fault, scenario=scenarios[0], phase=Phase.COVERAGE)
                      for fault in exploration.catalog.faults
                      if (scenarios := exploration.untested(fault, set()))])
@@ -226,7 +227,7 @@ def three_phase(exploration: Exploration) -> Allocation:
     members = exploration.members()
     round_robin(exploration, members, round(remaining * exploration.settings.round_robin_share))
     weighted(exploration, members, exploration.settings.budget - len(exploration.assignments))
-    return exploration.allocation(Strategy.THREE_PHASE)
+    return exploration.allocation(Strategy.PHASED)
 
 
 def random_allocation(exploration: Exploration) -> Allocation:

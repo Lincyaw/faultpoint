@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from faultsearch.allocation import Allocation, Strategy
 from faultsearch.catalog import FROZEN, Fault, point_service
 from faultsearch.edges import Condition, Edge, EffectKey
-from faultsearch.fca import TreatmentRecord
+from faultsearch.counterfactual import TreatmentRecord
 
 
 class Hop(BaseModel):
@@ -32,7 +32,8 @@ class Chain(BaseModel):
     terminal: bool
     novel: bool
     """No chain ranked above it has the same sequence of clusters."""
-    sim_score: float
+    similarity: float
+    """The mean similarity of the clusters of the hops' faults."""
     end_to_end: tuple[str, ...]
     """The scenarios where injecting the first fault alone showed every hop's effect."""
 
@@ -45,7 +46,7 @@ class Chain(BaseModel):
         return " -> ".join(f"[{hop.cause.key}] {hop.effect.key}" for hop in self.hops)
 
     def rank(self) -> tuple[bool, int, bool, bool, float]:
-        return self.several_scenarios, len(self.services), self.terminal, self.novel, self.sim_score
+        return self.several_scenarios, len(self.services), self.terminal, self.novel, self.similarity
 
 
 class Trail(BaseModel):
@@ -63,15 +64,15 @@ class Trail(BaseModel):
     def several_scenarios(self) -> bool:
         return not frozenset.intersection(*(edge.held_in for edge in self.edges))
 
-    def sim_score(self, allocation: Allocation) -> float:
-        return fmean(allocation.cluster_of[edge.cause.key].sim_score for edge in self.edges)
+    def similarity(self, allocation: Allocation) -> float:
+        return fmean(allocation.cluster_of[edge.cause.key].similarity for edge in self.edges)
 
     def rank(self, allocation: Allocation) -> tuple[bool, int, bool, float]:
-        return self.several_scenarios(), len(self.services()), self.edges[-1].terminal, self.sim_score(allocation)
+        return self.several_scenarios(), len(self.services()), self.edges[-1].terminal, self.similarity(allocation)
 
     def promise(self, allocation: Allocation) -> tuple[bool, int, float]:
         """The rank without ending at the user, which extending a chain still open can only reach later."""
-        return self.several_scenarios(), len(self.services()), self.sim_score(allocation)
+        return self.several_scenarios(), len(self.services()), self.similarity(allocation)
 
 
 class Stitching(BaseModel):
@@ -131,7 +132,7 @@ def beam_search(edges: list[Edge], allocation: Allocation, width: int,
 
 def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[TreatmentRecord]) -> list[Chain]:
     """Chains ranked by needing several scenarios, services crossed, ending in a failure the user sees, novelty of
-    their cluster sequence and SimScore; novelty is judged against the chains ranked above."""
+    their cluster sequence and cluster similarity; novelty is judged against the chains ranked above."""
     shown: dict[str, list[tuple[str, set[str]]]] = defaultdict(list)
     for record in records:
         shown[record.fault.key].append((record.workload, {EffectKey.of(effect).key for effect in record.effects}))
@@ -144,7 +145,7 @@ def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[Tre
             hops=tuple(Hop(cause=edge.cause, effect=edge.effect, held=tuple(sorted(edge.held_in)),
                            cluster=allocation.cluster_of[edge.cause.key].number) for edge in trail.edges),
             condition=trail.conditions[0], several_scenarios=trail.several_scenarios(), services=trail.services(),
-            terminal=trail.edges[-1].terminal, novel=clusters not in seen, sim_score=trail.sim_score(allocation),
+            terminal=trail.edges[-1].terminal, novel=clusters not in seen, similarity=trail.similarity(allocation),
             end_to_end=tuple(sorted(scenario for scenario, shown_effects in shown[trail.edges[0].cause.key]
                                     if effects <= shown_effects))))
         seen.add(clusters)

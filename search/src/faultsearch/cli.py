@@ -5,12 +5,12 @@ import typer
 from shop.deployment import MANIFESTS, build, verified_build
 from shop.workload import Scenarios
 
-from faultsearch.allocation import (Allocation, AllocationSettings, Exploration, Strategy, random_allocation,
-                                    three_phase)
+from faultsearch.allocation import (Allocation, AllocationSettings, Exploration, Strategy, phased_allocation,
+                                    random_allocation)
 from faultsearch.catalog import ActionTable, Catalog, build_catalog, tenant_executions
 from faultsearch.chains import Stitching, stitch
+from faultsearch.counterfactual import NamedWorkload, Runner, RunSettings, treatment_record
 from faultsearch.edges import EdgeSet, EffectMap, build_edges
-from faultsearch.fca import NamedWorkload, Runner, RunSettings, treatment_record
 from faultsearch.report import render, summarise
 from faultsearch.store import (ACTIONS_INPUT, ALLOCATION_SETTINGS, CATALOG, EFFECTS_INPUT, INPUTS, REPORT,
                                RUN_SETTINGS, SCENARIOS_INPUT, VALIDATIONS, Store, allocation_file, chains_file,
@@ -49,7 +49,7 @@ def scenario_catalog(store: Store, runner: Runner, scenarios: Scenarios) -> Cata
 @app.command()
 def explore(experiment: Experiment,
             sdk_root: Annotated[Path, typer.Option(help="A clean checkout of the SDK commit the shop runs with.")],
-            strategy: Chosen = Strategy.THREE_PHASE,
+            strategy: Chosen = Strategy.PHASED,
             budget: Annotated[int, typer.Option(help="Injections, (fault, scenario) pairs, per strategy.")] = 200,
             seed: int = 1,
             repetitions: Annotated[int, typer.Option(help="Control and treatment repetitions each.")] = 3,
@@ -75,13 +75,13 @@ def explore(experiment: Experiment,
     catalog = scenario_catalog(store, runner, scenarios)
     typer.echo(f"catalog: {len(catalog.faults)} faults, {len(catalog.excluded)} points excluded")
     exploration = Exploration(runner, catalog, scenarios, settings)
-    allocation = three_phase(exploration) if strategy == Strategy.THREE_PHASE else random_allocation(exploration)
+    allocation = phased_allocation(exploration) if strategy == Strategy.PHASED else random_allocation(exploration)
     store.save(allocation, allocation_file(strategy))
     typer.echo(f"{strategy}: {len(allocation.assignments)} injections, {len(allocation.clusters)} clusters")
 
 
 @app.command("stitch")
-def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.THREE_PHASE,
+def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
                    width: Annotated[int, typer.Option(help="Partial chains kept at every length.")] = 20000,
                    max_hops: int = 4,
                    kept: Annotated[int, typer.Option(help="Ranked chains written in full.")] = 300) -> None:
@@ -104,9 +104,10 @@ def validate_command(experiment: Experiment,
                      single_scenario: Annotated[int, typer.Option(help="Best chains one scenario showed.")] = 3,
                      chain: Annotated[list[str], typer.Option(help="A chain to validate besides, by its key.")] = []
                      ) -> None:
-    """Inject only the first fault of the best 3PA chains in the workload their conditions merge into."""
+    """Inject only the first fault of the best chains of the phased allocation in the workload their conditions
+    merge into."""
     store = Store(experiment)
-    stitching = store.load(Stitching, chains_file(Strategy.THREE_PHASE))
+    stitching = store.load(Stitching, chains_file(Strategy.PHASED))
     validations = validate(recorded_runner(store), selected(stitching, stitched_only, single_scenario, chain),
                            recorded_scenarios(store))
     store.save(validations, VALIDATIONS)

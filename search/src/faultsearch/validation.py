@@ -8,7 +8,7 @@ from shop.workload import Scenarios
 from faultsearch.catalog import FROZEN
 from faultsearch.chains import Chain, Stitching
 from faultsearch.edges import Condition, EffectKey
-from faultsearch.fca import NamedWorkload, Runner, TreatmentRecord
+from faultsearch.counterfactual import NamedWorkload, Runner, TreatmentRecord
 
 VALIDATION_PREFIX: Final = "validate."
 

@@ -8,7 +8,7 @@ from faultsearch.allocation import Allocation, Strategy
 from faultsearch.catalog import FROZEN, Catalog, Exclusion
 from faultsearch.chains import Stitching
 from faultsearch.edges import Counterpart, Edge, EdgeSet, EffectKey, EffectMap
-from faultsearch.fca import ControlRecord, Leak, RunSettings, TreatmentRecord, treatment_record
+from faultsearch.counterfactual import ControlRecord, Leak, RunSettings, TreatmentRecord, treatment_record
 from faultsearch.store import (CATALOG, CONTROLS, EFFECTS_INPUT, INPUTS, LEAKS, REPETITIONS, RUN_SETTINGS,
                                TREATMENTS, VALIDATIONS, Store, allocation_file, chains_file, edges_file)
 from faultsearch.validation import VALIDATION_PREFIX, Selection, Validations
@@ -52,14 +52,14 @@ class ValidationSummary(BaseModel):
 
 
 class EdgeComparison(BaseModel):
-    """The edges 3PA and random allocation found with the same budget."""
+    """The edges the phased and the random allocation found with the same budget."""
 
     model_config = FROZEN
 
     shared: int
-    only_three_phase: int
+    only_phased: int
     only_random: int
-    conditional_only_three_phase: int
+    conditional_only_phased: int
     conditional_only_random: int
     terminal_chains: dict[str, int]
     """Stitched-only chains ending in a failure the user sees, by strategy."""
@@ -73,7 +73,7 @@ class SingleScenarioView(BaseModel):
     end_to_end: dict[str, int]
     union: int
     stitched: int
-    """Such pairs that 3PA's stitched-only chains reach."""
+    """Such pairs that the phased allocation's stitched-only chains reach."""
     beyond_single: int
     """Of those, the pairs no single injection of the first fault showed in any scenario it was tested in."""
 
@@ -135,12 +135,12 @@ def edge_comparison(edges: dict[Strategy, EdgeSet], stitchings: dict[Strategy, S
     keys = {strategy: {edge.key for edge in edge_set.edges} for strategy, edge_set in edges.items()}
     conditional = {strategy: {edge.key for edge in edge_set.edges if edge.not_held}
                    for strategy, edge_set in edges.items()}
-    three_phase, uniform = Strategy.THREE_PHASE, Strategy.RANDOM
+    phased, uniform = Strategy.PHASED, Strategy.RANDOM
     return EdgeComparison(
-        shared=len(keys[three_phase] & keys[uniform]), only_three_phase=len(keys[three_phase] - keys[uniform]),
-        only_random=len(keys[uniform] - keys[three_phase]),
-        conditional_only_three_phase=len(conditional[three_phase] - keys[uniform]),
-        conditional_only_random=len(conditional[uniform] - keys[three_phase]),
+        shared=len(keys[phased] & keys[uniform]), only_phased=len(keys[phased] - keys[uniform]),
+        only_random=len(keys[uniform] - keys[phased]),
+        conditional_only_phased=len(conditional[phased] - keys[uniform]),
+        conditional_only_random=len(conditional[uniform] - keys[phased]),
         terminal_chains={strategy: stitching.terminal_stitched_only for strategy, stitching in stitchings.items()})
 
 
@@ -193,11 +193,11 @@ def summarise(store: Store, queries: list[str]) -> Summary:
         excluded=catalog.excluded, repetitions=repetition_counts(store, settings.repetitions),
         strategies=tuple(strategy_summary(allocations[strategy], records[strategy], edges[strategy],
                                           stitchings[strategy]) for strategy in Strategy),
-        conditional_examples=conditional_examples(edges[Strategy.THREE_PHASE]),
+        conditional_examples=conditional_examples(edges[Strategy.PHASED]),
         validations=tuple(validation_summaries(store.load(Validations, VALIDATIONS), edges[Strategy.RANDOM],
                                                stitchings[Strategy.RANDOM])),
         edges=edge_comparison(edges, stitchings),
-        single=single_scenario_view(records[Strategy.THREE_PHASE], stitchings[Strategy.THREE_PHASE],
+        single=single_scenario_view(records[Strategy.PHASED], stitchings[Strategy.PHASED],
                                     store.load(EffectMap, INPUTS, EFFECTS_INPUT)),
         lookups=tuple(EdgeLookup(query=query, found={
             strategy: tuple(edge for edge in edge_set.edges
@@ -230,7 +230,8 @@ def render(summary: Summary) -> str:
                                 f"hops {''.join('+' if hop else '-' for hop in item.hops)} random edges "
                                 f"{item.random_has_edges} chain {item.random_has_chain}\n    {item.chain}"
                                 for item in summary.validations)]
-    lines += [f"edges 3pa vs random: {summary.edges.model_dump()}", f"single scenarios: {summary.single.model_dump()}"]
+    lines += [f"edges phased vs random: {summary.edges.model_dump()}",
+              f"single scenarios: {summary.single.model_dump()}"]
     lines += [f"lookup {lookup.query}: " + "; ".join(
         f"{strategy} " + (" ".join(f"held {sorted(edge.held_in)} not {list(edge.not_held)} condition "
                                    f"{condition_text(edge)}" for edge in found) or "absent")

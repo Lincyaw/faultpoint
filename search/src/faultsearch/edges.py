@@ -10,7 +10,7 @@ from shop.workload import Scenarios
 
 from faultsearch.allocation import Strategy
 from faultsearch.catalog import DATA, FROZEN, Catalog, Fault, point_kind, point_service
-from faultsearch.fca import TreatmentRecord
+from faultsearch.counterfactual import TreatmentRecord
 
 EFFECTS_FILE: Final = DATA / "effects.json"
 
