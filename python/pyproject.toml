@@ -22,8 +22,11 @@ faultpoint = "faultpoint.tools.cli:app"
 points = "faultpoint.points:PLUGIN"
 import-hook = "faultpoint.hook:PLUGIN"
 httpx = "faultpoint.adapters.http:HTTPX"
+httpx2 = "faultpoint.adapters.http:HTTPX2"
 asgi = "faultpoint.adapters.http:ASGI"
 dbapi = "faultpoint.adapters.dbapi:PLUGIN"
+psycopg = "faultpoint.adapters.psycopg:PLUGIN"
+redis = "faultpoint.adapters.redis:PLUGIN"
 
 [build-system]
 requires = ["hatchling"]
@@ -34,3 +37,4 @@ packages = ["src/faultpoint"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "../spec/kinds.json" = "faultpoint/tools/kinds.json"
+"../spec/redis-commands.json" = "faultpoint/adapters/redis-commands.json"

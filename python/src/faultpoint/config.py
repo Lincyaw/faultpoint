@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from faultpoint.observations import JSONL_OPTIONS
 from faultpoint.rules import STRICT
 
-DEFAULT_PLUGINS: Final = ("points", "import-hook", "httpx", "asgi", "dbapi")
+DEFAULT_PLUGINS: Final = ("points", "import-hook", "httpx", "httpx2", "asgi", "dbapi", "psycopg", "redis")
 
 
 class Settings(BaseSettings):

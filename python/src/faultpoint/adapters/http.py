@@ -10,11 +10,12 @@ from typing import Any, Final
 import wrapt
 from pydantic import BaseModel, JsonValue
 
-from faultpoint.actions import BoundaryFail, Crash, Delay, Duplicate, FailAfter
+from faultpoint.actions import BoundaryError, BoundaryFail, Crash, Delay, Duplicate, FailAfter, Failure
 from faultpoint.rules import STRICT, point_id
 from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
 
 HTTPX_MODULE: Final = "httpx"
+HTTPX2_MODULE: Final = "httpx2"
 UVICORN_MODULE: Final = "uvicorn"
 DEFAULT_FAILURE_STATUS: Final = 503
 IDENTIFIER_SEGMENT: Final = re.compile(
@@ -135,19 +136,118 @@ def install_asgi(runtime: Runtime, options: dict[str, JsonValue]) -> None:
         lambda module: wrapt.wrap_function_wrapper(module, "Config.load", wrapper), UVICORN_MODULE)
 
 
-def patch_httpx(runtime: Runtime, options: HttpOptions, module: ModuleType) -> None:
-    # Imported once the application imports httpx, so that a process without httpx never needs it.
-    import faultpoint.adapters.httpx
+class ClientPoint:
+    """The rpc_client point of every request the transports of an httpx-compatible library send, which also
+    carries the request context; the library module supplies its own response and exception types."""
 
-    faultpoint.adapters.httpx.patch(module, runtime, options)
+    def __init__(self, runtime: Runtime, options: HttpOptions, library: ModuleType) -> None:
+        self.runtime = runtime
+        self.options = options
+        self.library = library
+
+    def decide(self, request: Any) -> tuple[str, Decision | None]:
+        self.runtime.context.inject(request.headers)
+        url = request.url
+        peer = url.host if url.port is None else f"{url.host}:{url.port}"
+        point = point_id(self.runtime.settings.service, RpcKind.CLIENT,
+                         f"{request.method} {peer}{path_template(url.path, self.options.identifier_segment)}")
+        return point, self.runtime.decide(point)
+
+    def error_outcome(self, error: Exception) -> RpcOutcome:
+        match error:
+            case self.library.TimeoutException():
+                return RpcOutcome.TIMEOUT
+            case self.library.ConnectError():
+                return RpcOutcome.REFUSED
+        return RpcOutcome.ERROR
+
+    def failed(self, failure: Failure, request: Any) -> Any:
+        """The synthetic response of a failure with a status; a failure without one raises its boundary error."""
+        if failure.status is None and failure.error is BoundaryError.REFUSED:
+            raise self.library.ConnectError("[Errno 111] Connection refused", request=request)
+        if failure.status is None:
+            raise self.library.ReadTimeout("timed out", request=request)
+        return self.library.Response(failure.status, request=request)
+
+    def handle(self, send: Callable[..., Any], transport: Any, args: tuple[Any, ...],
+               kwargs: dict[str, Any]) -> Any:
+        (request,) = args
+        point, decision = self.decide(request)
+        started = time.monotonic()
+        try:
+            response = self.exchange(send, request, decision)
+        except Exception as error:
+            self.runtime.observe(point, self.error_outcome(error), elapsed_ms(started), decision)
+            raise
+        self.runtime.observe(point, status_outcome(response.status_code), elapsed_ms(started), decision)
+        return response
+
+    def exchange(self, send: Callable[[Any], Any], request: Any, decision: Decision | None) -> Any:
+        match decision:
+            case Decision(action=Delay(ms=ms)):
+                time.sleep(ms / 1000)
+                return send(request)
+            case Decision(action=Crash(code=code)):
+                self.runtime.crash(code)
+            case Decision(action=BoundaryFail() as failure):
+                return self.failed(failure, request)
+            case Decision(action=Duplicate()):
+                request.read()
+                send(request).read()
+                return send(request)
+            case Decision(action=FailAfter() as failure):
+                send(request).read()
+                return self.failed(failure, request)
+        return send(request)
+
+    async def handle_async(self, send: Callable[..., Awaitable[Any]], transport: Any, args: tuple[Any, ...],
+                           kwargs: dict[str, Any]) -> Any:
+        (request,) = args
+        point, decision = self.decide(request)
+        started = time.monotonic()
+        try:
+            response = await self.exchange_async(send, request, decision)
+        except Exception as error:
+            self.runtime.observe(point, self.error_outcome(error), elapsed_ms(started), decision)
+            raise
+        self.runtime.observe(point, status_outcome(response.status_code), elapsed_ms(started), decision)
+        return response
+
+    async def exchange_async(self, send: Callable[[Any], Awaitable[Any]], request: Any,
+                             decision: Decision | None) -> Any:
+        match decision:
+            case Decision(action=Delay(ms=ms)):
+                await asyncio.sleep(ms / 1000)
+                return await send(request)
+            case Decision(action=Crash(code=code)):
+                self.runtime.crash(code)
+            case Decision(action=BoundaryFail() as failure):
+                return self.failed(failure, request)
+            case Decision(action=Duplicate()):
+                await request.aread()
+                await (await send(request)).aread()
+                return await send(request)
+            case Decision(action=FailAfter() as failure):
+                await (await send(request)).aread()
+                return self.failed(failure, request)
+        return await send(request)
 
 
-def install_httpx(runtime: Runtime, options: dict[str, JsonValue]) -> None:
+def patch_client(runtime: Runtime, options: HttpOptions, library: ModuleType) -> None:
+    """Make the transports every client of the library sends through, by default, the rpc_client points."""
+    point = ClientPoint(runtime, options, library)
+    wrapt.wrap_function_wrapper(library, "HTTPTransport.handle_request", point.handle)
+    wrapt.wrap_function_wrapper(library, "AsyncHTTPTransport.handle_async_request", point.handle_async)
+
+
+def install_client(library: str, runtime: Runtime, options: dict[str, JsonValue]) -> None:
     wrapt.register_post_import_hook(
-        functools.partial(patch_httpx, runtime, HttpOptions.model_validate(options)), HTTPX_MODULE)
+        functools.partial(patch_client, runtime, HttpOptions.model_validate(options)), library)
 
 
-HTTPX: Final = Plugin(actions={RpcKind.CLIENT: implemented_actions(BoundaryFail, FailAfter, Duplicate, Delay, Crash)},
-                      install=install_httpx)
+CLIENT_ACTIONS: Final = implemented_actions(BoundaryFail, FailAfter, Duplicate, Delay, Crash)
+HTTPX: Final = Plugin(actions={RpcKind.CLIENT: CLIENT_ACTIONS}, install=functools.partial(install_client, HTTPX_MODULE))
+HTTPX2: Final = Plugin(actions={RpcKind.CLIENT: CLIENT_ACTIONS},
+                       install=functools.partial(install_client, HTTPX2_MODULE))
 ASGI: Final = Plugin(actions={RpcKind.SERVER: implemented_actions(BoundaryFail, FailAfter, Delay, Crash)},
                      install=install_asgi)

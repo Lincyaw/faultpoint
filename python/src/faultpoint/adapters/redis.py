@@ -1,0 +1,330 @@
+import asyncio
+import functools
+import json
+import re
+import time
+from collections.abc import Awaitable, Callable
+from enum import StrEnum
+from importlib.metadata import distribution
+from pathlib import Path
+from types import ModuleType
+from typing import Annotated, Any, Final
+
+import wrapt
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints
+
+from faultpoint.actions import BoundaryError, BoundaryFail, Crash, Delay, Drop, Duplicate, Empty, FailAfter, Failure
+from faultpoint.adapters.store import (CONSUME_ACTIONS, READ_ACTIONS, WRITE_ACTIONS, MessageKind, StoreKind,
+                                       StoreOutcome)
+from faultpoint.rules import point_id
+from faultpoint.runtime import Decision, Plugin, Runtime
+
+REDIS_MODULE: Final = "redis"
+REDIS_ASYNCIO_MODULE: Final = "redis.asyncio"
+DISTRIBUTION: Final = "faultpoint"
+COMMANDS_FILE: Final = "faultpoint/adapters/redis-commands.json"
+"""Where the wheel carries spec/redis-commands.json, relative to the installed distribution."""
+KEY_POSITION: Final = r"^(after:\S+|numkeys:\d+)$"
+AFTER: Final = "after"
+STREAMS_KEY: Final = "after:STREAMS"
+CONTAINERS: Final = (list, tuple, dict, set)
+
+type Queued = tuple[tuple[Any, ...], dict[str, Any]]
+
+
+class EmptyReply(StrEnum):
+    """Which reply of a read or a consume counts as empty, as spec/redis-commands.json names it."""
+
+    NIL = "nil"
+    EMPTY_ARRAY = "empty_array"
+    EMPTY_STRING = "empty_string"
+    ZERO = "zero"
+    ALL_NIL = "all_nil"
+    NEVER = "never"
+
+
+class Command(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: StoreKind | MessageKind
+    key: int | Annotated[str, StringConstraints(pattern=KEY_POSITION)] | None
+    """The key's index among the arguments after the command name, the argument after:TOKEN, the first key after
+    the count at numkeys:N, or none."""
+    empty: EmptyReply | None = None
+
+    @property
+    def reads_streams(self) -> bool:
+        return self.key == STREAMS_KEY
+
+
+class CommandTable(BaseModel):
+    """spec/redis-commands.json, whose key_identifier and commands the plugin's options may replace."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    comment: str = Field(alias="$comment")
+    key_identifier: re.Pattern[str]
+    commands: dict[str, Command]
+
+
+class Decided(BaseModel):
+    """A command that is a point, with its table entry and the decision for this execution."""
+
+    model_config = ConfigDict(frozen=True)
+
+    command: Command
+    point: str
+    decision: Decision | None
+
+    @property
+    def action(self) -> BaseModel | None:
+        return None if self.decision is None else self.decision.action
+
+
+def argument_text(argument: Any) -> str:
+    return argument.decode(errors="replace") if isinstance(argument, bytes) else str(argument)
+
+
+def command_key(arguments: list[str], position: int | str | None) -> str | None:
+    """The key of a command among the arguments after its name, as its table entry places it."""
+    match position:
+        case int():
+            return arguments[position] if position < len(arguments) else None
+        case str() if position.startswith(AFTER):
+            token = position.partition(":")[2].upper()
+            index = [argument.upper() for argument in arguments].index(token) + 1
+            return arguments[index] if index < len(arguments) else None
+        case str():
+            count = int(position.partition(":")[2])
+            return arguments[count + 1] if int(arguments[count]) > 0 else None
+    return None
+
+
+def is_empty(reply: Any, empty: EmptyReply | None) -> bool:
+    """Whether a parsed reply is empty; the client parses a nil array into an empty list or map."""
+    match empty:
+        case EmptyReply.NIL:
+            return reply is None or (isinstance(reply, CONTAINERS) and not reply)
+        case EmptyReply.EMPTY_ARRAY:
+            return isinstance(reply, CONTAINERS) and not reply
+        case EmptyReply.EMPTY_STRING:
+            return reply in ("", b"")
+        case EmptyReply.ZERO:
+            return reply == 0
+        case EmptyReply.ALL_NIL:
+            return isinstance(reply, CONTAINERS) and all(item is None for item in reply)
+    return False
+
+
+def emptied(reply: Any, empty: EmptyReply | None) -> Any:
+    """The empty reply of a read, of its actual reply's type; a command whose reply is never empty keeps it."""
+    match empty:
+        case EmptyReply.ALL_NIL:
+            return [None] * len(reply)
+        case EmptyReply.NIL if not isinstance(reply, CONTAINERS):
+            return None
+        case EmptyReply.NIL | EmptyReply.EMPTY_ARRAY | EmptyReply.EMPTY_STRING | EmptyReply.ZERO:
+            return type(reply)()
+    return reply
+
+
+def stream_entries(reply: Any) -> list[list[Any]]:
+    """The entry lists of an XREAD or XREADGROUP reply, in its RESP2 list or RESP3 map shape."""
+    match reply:
+        case dict():
+            return [entries for lists in reply.values() for entries in lists]
+    return [entries for _, entries in reply]
+
+
+def delivered(command: Command, reply: Any) -> int:
+    """The messages a consume delivered: the stream entries of a stream read, else one unless it is empty."""
+    match command:
+        case Command() if is_empty(reply, command.empty):
+            return 0
+        case Command(reads_streams=True):
+            return sum(map(len, stream_entries(reply)))
+    return 1
+
+
+def delivered_twice(command: Command, reply: Any) -> Any:
+    if not command.reads_streams:
+        raise NotImplementedError("a duplicated consume delivers stream entries twice, and this command reads none")
+    for entries in stream_entries(reply):
+        entries.extend(list(entries))
+    return reply
+
+
+def copies(decided: Decided | None) -> int:
+    """How often a command is sent: never when dropped, twice when a write or publish is duplicated."""
+    match decided:
+        case Decided(action=Drop()):
+            return 0
+        case Decided(action=Duplicate(), command=Command(kind=StoreKind.WRITE | MessageKind.PUBLISH)):
+            return 2
+    return 1
+
+
+def delay_seconds(decisions: list[Decided | None]) -> float:
+    delays = [decided.action for decided in decisions if decided is not None and isinstance(decided.action, Delay)]
+    return sum(delay.ms for delay in delays) / 1000
+
+
+class CommandPoints:
+    """The commands of every redis-py client and pipeline, sync or asyncio, that the command table lists, as
+    points; a dropped command is acknowledged with True, and a duplicated consume delivers each entry twice."""
+
+    def __init__(self, runtime: Runtime, table: CommandTable, exceptions: ModuleType) -> None:
+        self.runtime = runtime
+        self.table = table
+        self.exceptions = exceptions
+
+    def decide(self, args: tuple[Any, ...]) -> Decided | None:
+        """The point and decision of a command; none for a command that is not a point."""
+        words = argument_text(args[0]).split()
+        name, arguments = words[0].upper(), [*words[1:], *(argument_text(argument) for argument in args[1:])]
+        command = self.table.commands.get(name)
+        if command is None:
+            return None
+        key = command_key(arguments, command.key)
+        locator = name if key is None else f"{name} {self.table.key_identifier.sub('{}', key)}"
+        point = point_id(self.runtime.settings.service, command.kind, locator)
+        return Decided(command=command, point=point, decision=self.runtime.decide(point))
+
+    def failure(self, failure: Failure) -> Exception:
+        if failure.error is BoundaryError.REFUSED:
+            return self.exceptions.ConnectionError("Connection refused.")
+        return self.exceptions.TimeoutError("Timeout reading from socket")
+
+    def prepare(self, decisions: list[Decided | None]) -> float:
+        """Crash or fail before anything is sent, and the seconds to wait before sending."""
+        for decided in decisions:
+            match decided:
+                case Decided(action=Crash(code=code)):
+                    self.runtime.crash(code)
+                case Decided(action=BoundaryFail() as failure):
+                    self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decided.decision)
+                    raise self.failure(failure)
+        return delay_seconds(decisions)
+
+    def failed(self, decisions: list[Decided | None]) -> None:
+        for decided in decisions:
+            if decided is not None:
+                self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decided.decision)
+
+    def settle(self, decisions: list[Decided | None], replies: list[Any]) -> list[Any]:
+        """Each command's reply out of the replies of what was sent, observed, and a failure after the effect."""
+        sent = iter(replies)
+        settled = [self.reply(decided, [next(sent) for _ in range(copies(decided))]) for decided in decisions]
+        failures = [decided.action for decided in decisions
+                    if decided is not None and isinstance(decided.action, FailAfter)]
+        if failures:
+            raise self.failure(failures[0])
+        return settled
+
+    def reply(self, decided: Decided | None, sent: list[Any]) -> Any:
+        reply = sent[-1] if sent else True
+        match decided:
+            case Decided(action=Empty()):
+                reply = emptied(reply, decided.command.empty)
+            case Decided(action=Duplicate(), command=Command(kind=MessageKind.CONSUME)):
+                reply = delivered_twice(decided.command, reply)
+        if decided is not None:
+            self.observe_reply(decided, reply)
+        return reply
+
+    def observe_reply(self, decided: Decided, reply: Any) -> None:
+        """A read or a consume is empty or not; a consume's quantity is the messages it delivered."""
+        command, point, decision = decided.command, decided.point, decided.decision
+        failed = isinstance(reply, Exception) or isinstance(decided.action, FailAfter)
+        match command.kind:
+            case _ if failed:
+                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision)
+            case StoreKind.READ:
+                self.runtime.observe(point, StoreOutcome.EMPTY if is_empty(reply, command.empty)
+                                     else StoreOutcome.ROWS, 0.0, decision)
+            case MessageKind.CONSUME:
+                messages = delivered(command, reply)
+                self.runtime.observe(point, StoreOutcome.OK if messages else StoreOutcome.EMPTY, messages, decision)
+            case _:
+                self.runtime.observe(point, StoreOutcome.OK, 0.0, decision)
+
+    def execute(self, execute_command: Callable[..., Any], client: Any, args: tuple[Any, ...],
+                kwargs: dict[str, Any]) -> Any:
+        decisions = [self.decide(args)]
+        delay = self.prepare(decisions)
+        if delay:
+            time.sleep(delay)
+        try:
+            replies = [execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
+        except Exception:
+            self.failed(decisions)
+            raise
+        return self.settle(decisions, replies)[0]
+
+    def execute_pipeline(self, execute: Callable[..., list[Any]], pipeline: Any, args: tuple[Any, ...],
+                         kwargs: dict[str, Any]) -> list[Any]:
+        stack: list[Queued] = list(pipeline.command_stack)
+        decisions = [self.decide(queued_args) for queued_args, _ in stack]
+        delay = self.prepare(decisions)
+        if delay:
+            time.sleep(delay)
+        pipeline.command_stack[:] = [queued for queued, decided in zip(stack, decisions, strict=True)
+                                     for _ in range(copies(decided))]
+        try:
+            replies = execute(*args, **kwargs)
+        except Exception:
+            self.failed(decisions)
+            raise
+        return self.settle(decisions, replies)
+
+    async def execute_async(self, execute_command: Callable[..., Awaitable[Any]], client: Any,
+                            args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        decisions = [self.decide(args)]
+        delay = self.prepare(decisions)
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            replies = [await execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
+        except Exception:
+            self.failed(decisions)
+            raise
+        return self.settle(decisions, replies)[0]
+
+    async def execute_pipeline_async(self, execute: Callable[..., Awaitable[list[Any]]], pipeline: Any,
+                                     args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
+        stack: list[Queued] = list(pipeline.command_stack)
+        decisions = [self.decide(queued_args) for queued_args, _ in stack]
+        delay = self.prepare(decisions)
+        if delay:
+            await asyncio.sleep(delay)
+        pipeline.command_stack[:] = [queued for queued, decided in zip(stack, decisions, strict=True)
+                                     for _ in range(copies(decided))]
+        try:
+            replies = await execute(*args, **kwargs)
+        except Exception:
+            self.failed(decisions)
+            raise
+        return self.settle(decisions, replies)
+
+
+def patch_asyncio(points: CommandPoints, module: ModuleType) -> None:
+    wrapt.wrap_function_wrapper(module, "Redis.execute_command", points.execute_async)
+    wrapt.wrap_function_wrapper(module, "client.Pipeline.execute", points.execute_pipeline_async)
+
+
+def patch(runtime: Runtime, table: CommandTable, module: ModuleType) -> None:
+    points = CommandPoints(runtime, table, module.exceptions)
+    wrapt.wrap_function_wrapper(module, "Redis.execute_command", points.execute)
+    wrapt.wrap_function_wrapper(module, "client.Pipeline.execute", points.execute_pipeline)
+    wrapt.register_post_import_hook(functools.partial(patch_asyncio, points), REDIS_ASYNCIO_MODULE)
+
+
+def install(runtime: Runtime, options: dict[str, JsonValue]) -> None:
+    shipped = json.loads(Path(str(distribution(DISTRIBUTION).locate_file(COMMANDS_FILE))).read_bytes())
+    table = CommandTable.model_validate({**shipped, **options})
+    wrapt.register_post_import_hook(functools.partial(patch, runtime, table), REDIS_MODULE)
+
+
+PLUGIN: Final = Plugin(actions={StoreKind.READ: READ_ACTIONS, StoreKind.WRITE: WRITE_ACTIONS,
+                                MessageKind.PUBLISH: WRITE_ACTIONS, MessageKind.CONSUME: CONSUME_ACTIONS},
+                       install=install)
