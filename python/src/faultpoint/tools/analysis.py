@@ -1,6 +1,7 @@
 import math
 from collections import defaultdict
 from enum import StrEnum
+from statistics import fmean
 from typing import Self
 
 from pydantic import BaseModel
@@ -89,9 +90,10 @@ def natural_tallies(records: list[ObservationRecord],
 
 
 def compare(records: list[ObservationRecord], control: list[Selection],
-            treatment: list[Selection], alpha: float) -> Comparison:
+            treatment: list[Selection], alpha: float, min_mean_increase: float = 0.2) -> Comparison:
     """The outcomes a treatment adds to or increases over its control, and the injections that
-    caused them."""
+    caused them; a mean counts only when it also grows by at least min_mean_increase of the
+    control's, since a few repetitions make sub-millisecond shifts significant."""
     control_tallies = [natural_tallies(records, selection) for selection in control]
     treatment_tallies = [natural_tallies(records, selection) for selection in treatment]
     keys = sorted({key for tallies in control_tallies + treatment_tallies for key in tallies})
@@ -115,7 +117,7 @@ def compare(records: list[ObservationRecord], control: list[Selection],
                            for count, total in [tallies.get((point, outcome), (0, 0.0))] if count]
         if len(control_means) >= 2 and len(treatment_means) >= 2 and any(control_means + treatment_means):
             larger, p_value = exceeds(control_means, treatment_means, alpha)
-            if larger:
+            if larger and fmean(treatment_means) >= (1 + min_mean_increase) * fmean(control_means):
                 effects.append(Effect(point=point, outcome=outcome, metric=Metric.MEAN,
                                       verdict=Verdict.INCREASE, control=tuple(control_means),
                                       treatment=tuple(treatment_means), p_value=p_value))

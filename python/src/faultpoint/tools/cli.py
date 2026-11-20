@@ -55,11 +55,13 @@ def diff(reports: Annotated[list[Path], typer.Argument(help="Observation files o
          control: Annotated[list[str], typer.Option(help="A control repetition, EXPERIMENT@SCOPE.")],
          treatment: Annotated[list[str], typer.Option(help="A treatment repetition, EXPERIMENT@SCOPE.")],
          alpha: Annotated[float, typer.Option(help="Significance of an increase.")] = 0.1,
+         min_mean_increase: Annotated[float, typer.Option(
+             help="The smallest relative increase of a mean that counts, 0.2 meaning 20%.")] = 0.2,
          as_json: Annotated[bool, typer.Option("--json", help="Print the comparison as JSON.")] = False) -> None:
     """Compare treatment repetitions with control repetitions: the outcomes the injection added
     or increased."""
     comparison = compare(read_records(reports), [Selection.parse(text) for text in control],
-                         [Selection.parse(text) for text in treatment], alpha)
+                         [Selection.parse(text) for text in treatment], alpha, min_mean_increase)
     if as_json:
         typer.echo(comparison.model_dump_json(indent=2))
         return
