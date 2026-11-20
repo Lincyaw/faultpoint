@@ -15,10 +15,7 @@ import (
 	"faultpoint"
 )
 
-const (
-	environmentPrefix = "FAULTPOINT_"
-	invalidRulesExit  = 70
-)
+const environmentPrefix = "FAULTPOINT_"
 
 // agent applies one rule set at a time; the mutex orders installs, collections and the final detach.
 type agent struct {
@@ -35,10 +32,11 @@ type agent struct {
 	injected   []uint64
 }
 
+// main ends through the core's Abort or Crash, whose registered cleanup detaches what the agent attached.
 func main() {
 	rules, report := os.Getenv(environmentPrefix+"RULES"), os.Getenv(environmentPrefix+"REPORT")
 	if rules == "" && report == "" {
-		exit(errors.New("neither FAULTPOINT_RULES nor FAULTPOINT_REPORT is set, so the agent has nothing to do"))
+		faultpoint.Abort("neither FAULTPOINT_RULES nor FAULTPOINT_REPORT is set, so the agent has nothing to do")
 	}
 	var options agentOptions
 	faultpoint.Options(optionsName, &options)
@@ -46,76 +44,81 @@ func main() {
 	faultpoint.Options(jsonlOptionsName, &jsonl)
 	services, err := options.services()
 	if err != nil {
-		exit(err)
+		faultpoint.Abort("%v", err)
 	}
 	var seed int64
 	if text := os.Getenv(environmentPrefix + "SEED"); text != "" {
 		if seed, err = strconv.ParseInt(text, 10, 64); err != nil {
-			exit(fmt.Errorf("FAULTPOINT_SEED is an integer: %w", err))
+			faultpoint.Abort("FAULTPOINT_SEED is an integer: %v", err)
 		}
 	}
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	loaded, err := loadKernel(services)
 	if err != nil {
-		exit(err)
+		faultpoint.Abort("%v", err)
 	}
 	a := &agent{services: services, seed: seed, kernel: loaded, sinks: map[string]*faultpoint.JSONLSink{},
 		natural: map[pointsNaturalKey]uint64{}}
+	faultpoint.AtExit(a.shutdown)
 	for _, name := range options.Syscalls {
 		a.syscalls.number(name)
 	}
 	if report != "" {
-		a.mu.Lock()
 		for _, configured := range services {
 			if a.sinks[configured.name], err = faultpoint.NewJSONLSink(report, configured.name, jsonl); err != nil {
-				a.abort("%v", err)
+				faultpoint.Abort("%v", err)
 			}
 		}
 		if err := loaded.observe(a.syscalls); err != nil {
-			a.abort("%v", err)
+			faultpoint.Abort("%v", err)
 		}
-		a.mu.Unlock()
 		go func() {
 			for range time.Tick(time.Duration(jsonl.FlushSeconds * float64(time.Second))) {
 				a.mu.Lock()
-				if err := a.collect(); err != nil {
-					a.abort("%v", err)
-				}
+				err := a.collect()
 				a.mu.Unlock()
+				if err != nil {
+					faultpoint.Abort("%v", err)
+				}
 			}
 		}()
 	}
 	if rules != "" {
 		faultpoint.FileRuleSource{Path: rules}.Start(a.install)
 	}
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	a.mu.Lock()
-	if err := a.close(); err != nil {
-		exit(err)
+	faultpoint.Crash(0)
+}
+
+// install is the rule source's callback; a rule set the agent cannot apply ends it.
+func (a *agent) install(data []byte) {
+	if err := a.replace(data); err != nil {
+		faultpoint.Abort("%v", err)
 	}
 }
 
-// install replaces the rule set: the old one is detached and its counts written before the new one is attached,
-// so that every record belongs to one experiment.
-func (a *agent) install(data []byte) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+// replace detaches the old rule set and writes its counts before it attaches the new one, so that every record
+// belongs to one experiment.
+func (a *agent) replace(data []byte) error {
 	ruleset, err := faultpoint.ParseRuleSet(data)
 	if err != nil {
-		a.abort("invalid rules: %v", err)
+		return fmt.Errorf("invalid rules: %w", err)
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	rules, err := translate(ruleset, a.services, &a.syscalls, a.seed)
 	if err != nil {
-		a.abort("rules the agent cannot apply: %v", err)
+		return fmt.Errorf("rules the agent cannot apply: %w", err)
 	}
 	if err := a.detach(); err != nil {
-		a.abort("%v", err)
+		return err
 	}
 	if a.injector, err = a.kernel.inject(rules, a.services, a.syscalls); err != nil {
-		a.abort("%v", err)
+		return err
 	}
 	a.rules, a.experiment, a.injected = rules, rules.experiment, make([]uint64, len(rules.triggers))
+	return nil
 }
 
 // detach removes the rule set from the kernel and writes what was counted under it.
@@ -134,20 +137,11 @@ func (a *agent) detach() error {
 	return errors.Join(errs...)
 }
 
-func (a *agent) close() error {
-	return errors.Join(a.detach(), a.kernel.Close())
-}
-
-// abort detaches everything and ends the agent, so that no experiment runs under rules it did not ask for.
-func (a *agent) abort(format string, arguments ...any) {
-	fmt.Fprintf(os.Stderr, "fpebpf: "+format+"; stopping\n", arguments...)
-	if err := a.close(); err != nil {
+// shutdown detaches everything as the process ends; it keeps the lock, so that nothing touches what it closed.
+func (a *agent) shutdown() {
+	a.mu.Lock()
+	if err := errors.Join(a.detach(), a.kernel.Close()); err != nil {
 		fmt.Fprintf(os.Stderr, "fpebpf: %v\n", err)
+		os.Exit(1)
 	}
-	os.Exit(invalidRulesExit)
-}
-
-func exit(err error) {
-	fmt.Fprintf(os.Stderr, "fpebpf: %v\n", err)
-	os.Exit(1)
 }
