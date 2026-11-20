@@ -2,7 +2,30 @@
 
 faultpoint 在被测系统的代码中放置故障点。同一个故障点既能按规则注入故障，也能在故障自然发生时上报观测，因此一次注入实验引起的“额外故障”可以用与注入相同的词汇表达，为反事实的因果边发现提供数据。
 
-本仓库只负责故障点本身：类别、身份、规则、观测与插桩。实验编排、因果边的统计、拼接搜索和落地成题由使用它的搜索系统负责；`faultpoint diff` 只提供一次反事实比较的参考实现。
+本仓库只负责故障点本身：类别、身份、规则、观测与接入。实验编排、因果边的统计、拼接搜索和落地成题由使用它的搜索系统负责；`faultpoint diff` 只提供一次反事实比较的参考实现。
+
+## 0. 架构：核心与插件
+
+两条原则：
+
+- **轻量**：每种语言的 SDK 只有一个很小的核心，其余能力都是插件，按需加载。
+- **不写死**：类别、动作、观测结果、放置规则和输出方式，都来自共享的数据文件或配置，而不是写在各语言的代码里。
+
+| 层 | 职责 | 不负责 |
+| --- | --- | --- |
+| 核心 | 通过规则来源取得规则集；按故障点 id、范围和触发条件选出规则（`decide`）；把观测交给观测输出（`observe`）；通过上下文提供者读取 baggage 和 trace id；维护插件的登记 | 任何类别的语义、类别与动作的对应表、观测结果的词汇、库适配、放置规则、分析 |
+| 故障点插件 | 一个类别的语义：在故障点上执行动作，报告 outcome。登记时声明自己服务哪些类别、实现哪些动作 | 规则匹配 |
+| 边界适配插件 | 把某个库或框架（httpx、ASGI、DB-API、`net/http`、`database/sql`、undici、Servlet、JDBC、tower……）的调用变成边界类故障点，选项（路径模板、语句分类）可配置 | 接入方式 |
+| 接入插件 | 把故障点和适配器装进进程或构建：Python 导入钩子、Node 加载钩子、Java agent、Go/Rust 构建副本改写器 | 规则与观测 |
+| 规则来源 | 缺省为轮询本地文件；可替换为 HTTP、ConfigMap 等 | — |
+| 观测输出 | 缺省为 JSON Lines 文件，写出间隔和样例数是它的选项；可替换为 OpenTelemetry 指标、标准输出等 | — |
+| 上下文提供者 | 缺省读取 OpenTelemetry 的 baggage 和 trace context | — |
+| eBPF 代理 | 独立进程，承担 `syscall` 与 `packet` 两类故障点，使用同样的规则来源和观测输出约定 | 请求级范围 |
+| 工具 | `check`（按 `spec/kinds.json` 校验规则集）、`scan`（离线生成清单）、`diff`（反事实比较），不进入被测进程 | — |
+
+- **类别表是数据**：`spec/kinds.json` 是类别、动作及其参数约束的唯一来源。各语言的核心只校验规则集的通用结构：实验名、规则 id 不重复、故障点 id 的形状、触发条件的取值范围。动作参数是一个自由对象，由执行它的插件解释。控制方安装规则前，先用 `faultpoint check` 按 `spec/kinds.json` 完整校验一遍。
+- **加载时的适用性检查**：规则集加载时，核心对属于本服务、且本进程登记了对应类别插件的规则，检查其动作是否在插件声明的动作里，不在则判定规则集无效。本进程没有登记的类别，规则留给其他进程（例如 eBPF 代理），核心忽略它们。
+- **插件的发现**：按各语言的惯例。Python 用入口点（entry points），Node 用包名动态导入，Java 用 `ServiceLoader`，Go 和 Rust 在编译期登记（`init` 或链接期收集）。启用哪些插件、各自的选项，由配置决定（见第 7 节）。
 
 ## 1. 故障点的类别
 
@@ -18,7 +41,9 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | RPC：`rpc_client` `rpc_server` | `fail` | `delay` | 规划中 | `duplicate` | 以 `delay` 表达 | `fail_after` |
 | 存储：`store_read` `store_write` | `fail` `drop` | `delay` | `empty` | `duplicate` | 以 `delay` 表达 | `fail_after` |
 | 消息：`publish` `consume` | `fail` `drop` | `delay` | — | `duplicate` | 以 `delay` 表达 | `fail_after` |
-| 进程生命周期 | `crash`（任何故障点都可执行） | | | | | |
+| 系统调用：`syscall` | `fail`（errno） | — | — | — | — | — |
+| 网络包：`packet` | `drop` | `delay` | — | — | — | — |
+| 进程生命周期 | `crash`（除 `packet` 外的故障点都可执行） | | | | | |
 
 - 乱序不单设动作：对某个键的消息或请求做 `delay`，使它晚于后继到达。
 - 并发竞争同样用 `delay` 表达：在“读之后、写之前”的 `store_read` 或 `acquire` 上延迟，以拉大竞争窗口。
@@ -36,6 +61,8 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 
 ### 1.3 各类故障点
 
+下表是 `spec/kinds.json` 的说明；两者不一致时，以 `spec/kinds.json` 为准。
+
 | 类别 | 放置位置 | 可用动作 | 观测结果（outcome） |
 | --- | --- | --- | --- |
 | `branch` | 守卫错误返回或抛出的条件判断 | `fail`：强制进入该分支 | `taken` `not_taken` |
@@ -49,9 +76,11 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | `rpc_server` | HTTP/RPC 服务端入口 | `fail` `delay` `fail_after` | 同上 |
 | `store_read` | 读语句 | `fail` `delay` `empty` | `rows` `empty` `error`，行数记入 total |
 | `store_write` | 写语句 | `fail` `delay` `fail_after` `drop` `duplicate` | `ok` `error`，影响行数记入 total |
-| `publish` `consume` | 消息生产与消费 | `fail` `delay` `fail_after` `drop` `duplicate` | `ok` `error` |
+| `publish` `consume` | 消息生产与消费 | `fail` `delay` `fail_after` `drop` `duplicate`（`consume` 没有 `drop`） | `ok` `error` |
+| `syscall` | 进程的系统调用（eBPF） | `fail`：返回指定的 errno | `ok`，或 errno 名 |
+| `packet` | 容器网络接口上的包（eBPF） | `delay` `drop` | `delayed` `dropped` |
 
-所有类别都可以执行 `delay` 和 `crash`。值错误中，只有布尔取反（`negate`）由插桩自动放置；一般的业务计算错误空间大、误报多，因此 `value` 只放在人工标注的、在业务约束上有意义的计算上（金额、配额、时间窗口、版本号），并且只在合法值域内扰动。
+除 `syscall` 和 `packet` 外，所有类别都还可以执行 `delay` 和 `crash`。`syscall` 不能延迟，因为 eBPF 程序不能在内核探针里睡眠；它可以执行 `crash`，由 eBPF 程序向进程发送 SIGKILL。`packet` 只作用于网络包，不针对某个进程，因此没有 `crash`。值错误中，只有布尔取反（`negate`）由插桩自动放置；一般的业务计算错误空间大、误报多，因此 `value` 只放在人工标注的、在业务约束上有意义的计算上（金额、配额、时间窗口、版本号），并且只在合法值域内扰动。
 
 ### 1.4 完整性检查
 
@@ -66,6 +95,8 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | 改写器放置的进程内故障点 | `<相对路径>:<函数限定名>#<锚点>`，`check` 每个函数一个，省略锚点 |
 | HTTP 边界 | `<METHOD> <路径模板>`，客户端前面再加对端主机；路径中的数字、UUID 和长十六进制段替换为 `{}` |
 | SQL 边界 | `<表名，以 + 连接>#<规范化语句的哈希>` |
+| 系统调用 | 系统调用名，例如 `connect` `read` `write` `fsync` |
+| 网络包 | `<egress 或 ingress>:<对端 IP 或 *>:<对端端口或 *>` |
 
 锚点是节点规范化形式（不含行号）的哈希前 8 位。同一函数中出现相同哈希时，追加序号。这样，与该节点无关的代码修改不会改变 id。改写器同时输出一份清单（`faultpoint-manifest.json`），逐个列出故障点的 id、类别、文件、行号、函数和代码片段，供实验规划读取。
 
@@ -88,18 +119,18 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 }
 ```
 
-- **范围**：`scope` 中的每一项都必须等于当前请求 baggage 中的同名项，规则才生效。不在任何请求中的后台工作没有 baggage，只匹配 `scope` 为空的规则。
+- **范围**：`scope` 中的每一项都必须等于当前请求 baggage 中的同名项，规则才生效。不在任何请求中的后台工作没有 baggage，只匹配 `scope` 为空的规则。内核看不到请求的 baggage，所以 `syscall` 和 `packet` 的规则不能带 `scope`，作用范围就是故障点所属服务的所有容器。
 - **触发**：每个进程对每条规则单独计数：先跳过前 `skip` 次匹配，之后最多注入 `limit` 次，每次以 `probability` 的概率注入（随机数以 `FAULTPOINT_SEED` 和规则 id 为种子）。并发下“第 n 次”本身是不确定的，所以优先用 `scope` 限定到具体的租户或请求，少用计数。
-- **适用性**：动作必须属于该类别的可用动作（见 1.3）。边界类故障点的 `fail` 和 `fail_after` 用 `status` 指定合成的响应状态，或用 `error` 指定 `timeout` 或 `refused`。`call` 的 `error` 是已登记的错误名，Go 改写器会把包级的 `error` 变量自动登记为 `<包路径>.<变量名>`，这样注入的就是代码真实会返回的哨兵错误。
-- **原子更新**：控制方先写临时文件再改名替换。SDK 每 0.5 秒检查一次文件的修改时间，重新加载前先把当前计数写出，因此每条观测记录只属于一个实验。规则文件无效时，SDK 终止进程，以免实验在无效的规则下继续运行。
+- **适用性**：动作必须属于该类别的可用动作（见 1.3）。边界类故障点的 `fail` 和 `fail_after` 用 `status` 指定合成的响应状态，或用 `error` 指定 `timeout` 或 `refused`。`call` 的 `error` 是已登记的错误名，Go 改写器会把包级的 `error` 变量自动登记为 `<包路径>.<变量名>`，这样注入的就是代码真实会返回的哨兵错误。`syscall` 的 `fail` 必须给出 errno 名，例如 `ECONNREFUSED`。
+- **原子更新**：控制方先写临时文件再改名替换。缺省的文件规则来源每 0.5 秒检查一次修改时间。核心在换上新规则集之前，先让观测输出写出当前的计数，因此每条观测记录只属于一个实验。规则集无效时，核心终止进程，以免实验在无效的规则下继续运行。
 
 ## 4. 观测
 
-故障点每被执行一次，就记录一个结果。结果在进程内按（实验，故障点，outcome，范围，注入规则）聚合成计数和 total，每隔 `FAULTPOINT_FLUSH_SECONDS` 秒，以 JSON Lines 的形式追加到 `FAULTPOINT_REPORT`，格式由 `spec/observation.schema.json` 定义。
+故障点每被执行一次，就记录一个结果。核心把结果交给观测输出。缺省的观测输出在进程内按（实验，故障点，outcome，范围，注入规则）聚合成计数和 total，定期以 JSON Lines 的形式追加到 `FAULTPOINT_REPORT`，格式由 `spec/observation.schema.json` 定义。其他观测输出必须保留同样的字段，`diff` 才能读取。
 
 - **范围**：取 baggage 中 `FAULTPOINT_SCOPE_KEY`（默认 `fp.scope`）的值，用于在同一次部署中区分被注入的请求与作为对照的请求。
 - **注入规则**：被注入的那次执行，记录中带有规则 id；自然发生的执行，这一项为空。比较时可以把注入本身和它引起的效果分开。
-- **样例**：当前上下文中有有效的 trace 时，每个键最多保留 5 个 trace id，用于把效果追溯到具体请求。
+- **样例**：当前上下文中有有效的 trace 时，每个键保留若干个 trace id（缺省 5 个，是观测输出的选项），用于把效果追溯到具体请求。
 - **独立管道**：观测写入单独的文件，不进入被测系统的日志、追踪和指标，避免进入诊断者可以申请的数据。
 
 ## 5. 上下文
@@ -107,58 +138,83 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 请求上下文使用 OpenTelemetry 的 W3C baggage 和 traceparent。
 
 - 已经接入 OpenTelemetry 的系统，由它原有的插桩负责跨服务传递。SDK 只读取上下文，不依赖 OpenTelemetry SDK。
-- 没有接入的系统，由本仓库的 HTTP 边界拦截器负责提取和注入这两个请求头。
-- Python 的上下文基于 contextvars，能随协程和线程池传递。
+- 没有接入的系统，由本仓库的 HTTP 边界适配器负责提取和注入这两个请求头。
+- Python 的上下文基于 contextvars，能随协程和线程池传递。Node 使用 OpenTelemetry 基于 AsyncLocalStorage 的上下文管理器；进程尚未登记上下文管理器时，由 SDK 登记。Java 使用 OpenTelemetry API 的 `Context`。Rust 使用 `opentelemetry::Context`，服务端适配器用 `with_context` 把上下文挂到请求的 future 上。
 - Go 必须显式传递 `context.Context`。改写器使用所在函数的 `context.Context` 参数或 `*http.Request` 参数的 `Context()`；找不到时传入 `nil`，这时故障点只匹配 `scope` 为空的规则，观测的范围为空。
 
-## 6. 插桩
+## 6. 接入方式
 
-| 位置 | 方式 | 理由 |
-| --- | --- | --- |
-| 边界：HTTP、SQL、消息、资源 | 各语言客户端库和框架的拦截器 | 每个库只做一次，与业务代码无关 |
-| 进程内：`branch` `call` `check` `loop` `clock` | 每种语言一个改写器，在构建期改写一份源码副本 | 不修改提交的业务代码 |
-| 进程内：`value` `acquire` | 开发者手工调用 API | 需要业务含义，无法自动判断 |
+**原则**：业务源码和线上构建都不包含 SDK。解释型和 JIT 语言只通过启动参数或环境变量接入；编译型语言只在构建副本中接入。没有这些参数、不用构建副本时，服务与 SDK 无关。
 
-**两份构建**：插桩只用于探索阶段的构建。出题时使用未插桩的源码，故障点和规则都不进入出题的代码、镜像和数据。
+### 6.1 调研：几种低侵入方式的能力与限制
 
-### 6.1 Python 改写器（`faultpoint rewrite`）
+| 方式 | 改动范围 | 能做的 | 做不到的 |
+| --- | --- | --- | --- |
+| eBPF kprobe 覆盖返回值 | 不改代码和构建；需要加载 eBPF 的特权 | 任意语言进程的系统调用返回指定 errno（`bpf_override_return`，要求 `CONFIG_BPF_KPROBE_OVERRIDE`，且函数在错误注入白名单中，系统调用在其中），可按 cgroup 限定到容器 | 不能延迟（探针里不能睡眠）；看不到请求的 baggage |
+| eBPF tc 程序 | 同上 | 按对端地址和端口丢包；把 `skb->tstamp` 设为将来时刻，再由 fq qdisc 按时发送，实现延迟（EDT） | 看不到请求；接口上需要 fq qdisc |
+| eBPF uprobe 写寄存器 | 同上；内核 6.18 起支持 | 编译型语言中，在未被内联、通过 call 调用、返回整型或布尔的函数入口直接返回指定值 | 解释型和 JIT 语言（Python、Node、Java）无法按源码函数定位；Go 不能用 uretprobe（会和栈搬迁冲突），观测自然返回值要在每条 ret 指令处放 uprobe；被内联的函数没有入口；返回 error 接口或 `Result` 需要在用户内存中构造值 |
+| 语言运行时钩子 | 只改启动参数或环境变量 | 请求级范围、语义级故障点、库边界 | 需要运行时提供钩子 |
+| 编译期改写（构建副本、Go 的 `-toolexec`） | 只改构建流程 | 同上，并有完整的类型信息 | 需要重新构建 |
+| 服务网格（Envoy 故障过滤器） | 只改部署 | HTTP 拒绝和延迟，可按请求头（包括 baggage）匹配 | 不支持 `fail_after` 和 `duplicate`；需要部署网格 |
 
-在标准库 `ast` 上改写源码副本，用 `ast.unparse` 输出。
+**结论**：请求级、语义级的故障点由语言运行时钩子承担，编译型语言改用构建副本；与请求无关的环境故障（系统调用、网络包）由 eBPF 代理承担。服务网格可以替代 RPC 边界的一部分，第一版不实现。uprobe 写寄存器第一版也不实现，只作为编译型语言免构建放置 `check` 的后续选项，在内核 7.0 上可用。
 
-- `branch`：主体中直接含有 `raise <异常>` 的 `if`，条件改为 `faultpoint.points.branch(id, 条件)`。
-- `check`：返回注解为 `bool` 的函数，每个 `return` 改为 `faultpoint.points.check(id, 值)`；所有返回值都是常量时跳过。
-- `loop`：在 `for`、`while` 循环体的开头插入 `faultpoint.points.loop(id)`；`for _ in range(<常量>)` 跳过。
-- `clock`：`time.time()`、`datetime.now()`、`datetime.utcnow()` 包装为 `faultpoint.points.clock(id, ...)`。
-- 局限：Python 没有类型信息，`check` 依赖返回注解，`clock` 依赖调用名。“库函数在调用点抛出的异常”需要知道被调函数会抛出什么，第一版不支持。
+参考：[bpf_override_return](https://docs.ebpf.io/linux/helper-function/bpf_override_return/)、[Tetragon 的 uprobe Override 条件](https://tetragon.io/docs/concepts/tracing-policy/selectors/)、[Node `module.registerHooks`](https://nodejs.org/api/module.html)、[OpenTelemetry Go 编译期插桩](https://opentelemetry.io/docs/zero-code/go/compile-time/)、[Cargo 的 rustc 包装器](https://doc.rust-lang.org/cargo/reference/config.html)。
 
-### 6.2 Go 改写器（`fprewrite`）
+### 6.2 各语言的接入
 
-用 `golang.org/x/tools/go/packages` 加载带类型信息的语法树，再用 `go/format` 输出。
+| 语言 | 接入点 | 进程内故障点 | 边界 |
+| --- | --- | --- | --- |
+| Python | `PYTHONPATH` 指向 SDK 的引导目录，其中的 `sitecustomize` 在启用时安装插件，并链式调用原有的 `sitecustomize` | 导入钩子改写 `FAULTPOINT_SOURCE_ROOT` 下的模块 | 给 httpx 客户端、ASGI 应用、DB-API 的 `connect` 打补丁 |
+| Node / TypeScript | `NODE_OPTIONS=--import faultpoint/register` | `module.registerHooks` 的 `load` 钩子同步改写 `FAULTPOINT_SOURCE_ROOT` 下、`node_modules` 以外的 JS，对 `require` 和 `import` 都生效（Node 22.15 起） | 补丁 `http.Server.prototype.emit` 的 `request` 事件；undici 全局 dispatcher 的拦截器（同时作用于内置 `fetch`），以及 `http.request` 和 `https.request` |
+| Java | `JAVA_TOOL_OPTIONS=-javaagent:faultpoint-agent.jar` | ASM 改写 `FAULTPOINT_PACKAGES` 下的类 | 改写 Servlet 的 `service`、`java.net.http` 客户端实现的 `send` 与 `sendAsync`、JDBC 的 `execute*`；被 JDK 类引用的 SDK 类放进启动类路径 |
+| Go | 构建流程中先运行 `fprewrite`，在副本上构建 | 带类型信息的改写器 | 改写器在副本中包装 `ListenAndServe`、`http.Server` 的 `Handler`、`http.Client` 与 `DefaultClient`、`sql.Open` |
+| Rust | 构建流程中先运行改写器（`syn`），在副本上构建 | 语法改写器；`call` 只放在返回 `anyhow::Result` 或 `Box<dyn Error>` 的函数中，因为注入需要 `From<Injected>` | 在 `axum::serve` 的调用处挂 tower 层；请求级的 `rpc_client` 不支持，因为 reqwest 不改客户端类型就没有请求级钩子，连接级的故障由 eBPF 承担 |
+| 任意语言 | eBPF 代理以特权进程运行，按服务对应的 cgroup 生效 | — | `syscall`、`packet` |
 
-- `call`：条件为 `err != nil`、且 `err` 的类型是 `error` 时，改为 `faultpoint.Failed(ctx, id, &err)`：观测 err，注入时替换它。之所以替换 err 本身、而不是强制进入分支，是因为 err 为 nil 时强行进入分支，返回的仍是 nil 错误。
-- `branch`：主体中直接返回非 nil 错误的其他 `if`，条件改为 `faultpoint.Branch(ctx, id, 条件)`。
-- `check`：唯一结果为 `bool` 的函数，包装每个 `return`；所有返回值都是常量时跳过。
-- `loop`：在循环体开头插入 `faultpoint.Loop(ctx, id)`；上界为常量的三段式 `for` 循环跳过。
-- `clock`：类型检查确认为 `time.Now` 的调用，包装为 `faultpoint.Clock(ctx, id, time.Now())`。
-- 错误登记：为每个含有包级 `error` 变量的包生成 `faultpoint_errors.go`，在 `init` 中调用 `faultpoint.RegisterError`。
-- `go.mod` 中加入对 SDK 的 `require` 和指向本地路径的 `replace`。
+- Rust 不用 `RUSTC_WORKSPACE_WRAPPER`：SDK 的 crate 必须和应用的 tower、http 版本由 cargo 一起解析，所以只能在副本的 `Cargo.toml` 中加依赖。
+- Go 不用 `-toolexec` 改写标准库：把 SDK 导入 `net/http` 会形成导入环（SDK 依赖 OpenTelemetry，后者依赖 `net/http`）。
+- 运行时接入（Python、Node、Java）在装载时改写，但故障点的 id 必须与离线 `scan` 生成的清单一致，所以两者使用同一个放置实现，路径都相对于 `FAULTPOINT_SOURCE_ROOT`。
 
-### 6.3 Java（规划中）
+### 6.3 放置规则
 
-用 ASM 在构建期改写字节码：`branch` 放在守卫 `athrow` 的条件跳转上，`call` 放在声明了受检异常的调用点上，`check` 放在 `boolean` 方法的返回处，`loop` 放在回边上。边界用 Servlet Filter、HTTP 客户端拦截器和 JDBC 代理实现。上下文使用 OpenTelemetry 的 `Context` 和 `Baggage`。
+各语言的放置规则形式相同。每条规则都可以在配置中关闭，规则中的名单（例如读时钟的函数）可以在配置中替换：
 
-## 7. 运行时
+- `branch`：直接守卫抛出异常或返回非 nil 错误的条件判断，条件改为 `branch(id, 条件)`。
+- `call`：Go 中类型为 `error` 的 `err != nil`，改为 `Failed(ctx, id, &err)`，观测 err，注入时替换它。替换 err 而不是强制进入分支，是因为 err 为 nil 时强行进入分支，返回的仍是 nil 错误。
+- `check`：返回布尔值的函数，包装每个 `return`；所有返回值都是常量时跳过。有类型信息的语言按类型判断，Python 按返回注解判断，JS 按返回表达式的形状判断。
+- `loop`：在循环体开头插入 `loop(id)`；上界为常量的循环跳过。
+- `clock`：读当前时间的调用（缺省名单：Python 的 `time.time` `datetime.now` `datetime.utcnow`，Go 的 `time.Now`，JS 的 `Date.now` 和无参 `new Date`，Java 的 `System.currentTimeMillis` `Instant.now`，Rust 的 `SystemTime::now` `Instant::now`），包装为 `clock(id, 读数)`。
+- Go 为每个含有包级 `error` 变量的包生成登记文件，使 `call` 的 `fail` 能用名字注入真实的哨兵错误。
+
+## 7. 配置与运行时
+
+常用设置用环境变量给出；其余设置都在 `FAULTPOINT_CONFIG` 指向的 JSON 文件里，包括启用哪些插件和各自的选项，以及放置规则的开关与名单。
 
 | 环境变量 | 含义 | 缺省 |
 | --- | --- | --- |
 | `FAULTPOINT_SERVICE` | 服务名，用于边界故障点的 id 和观测记录 | 必填（启用时） |
-| `FAULTPOINT_RULES` | 规则文件路径 | 不注入 |
-| `FAULTPOINT_REPORT` | 观测输出路径 | 不观测 |
+| `FAULTPOINT_RULES` | 缺省规则来源读取的文件 | 不注入 |
+| `FAULTPOINT_REPORT` | 缺省观测输出写入的文件 | 不观测 |
+| `FAULTPOINT_SOURCE_ROOT` | 运行时接入时改写哪些源文件；故障点 id 中的路径相对于它 | 当前目录 |
+| `FAULTPOINT_PACKAGES` | Java agent 改写的包前缀，以逗号分隔 | 无（只放边界） |
 | `FAULTPOINT_SCOPE_KEY` | 作为观测范围的 baggage 键 | `fp.scope` |
-| `FAULTPOINT_FLUSH_SECONDS` | 观测写出的间隔 | 2 |
 | `FAULTPOINT_SEED` | 概率触发的随机种子 | 0 |
+| `FAULTPOINT_CONFIG` | 插件、选项与放置规则 | 只启用缺省插件 |
 
-- 规则和观测都未配置时，每个故障点只读一个全局标志就返回。
+```json
+{
+  "plugins": ["points", "httpx", "asgi", "dbapi"],
+  "options": {
+    "jsonl": {"flush_seconds": 2, "exemplars": 5},
+    "http": {"identifier_segment": "^(\\d+|[0-9a-f-]{36})$"},
+    "dbapi": {"dialect": "sqlite"}
+  },
+  "placement": {"branch": true, "check": true, "loop": true, "clock": ["time.time", "datetime.now"]}
+}
+```
+
+- 规则和观测都未配置时，接入插件不安装任何东西；已经放置的故障点只读一个全局标志就返回。
 - 延迟有两种语义。边界上的延迟表示对端变慢，异步代码中不阻塞事件循环。进程内的延迟表示资源竞争，会阻塞当前线程。
 - `crash` 先写出观测，再以指定的退出码立即终止进程。
 - 进程被强制杀死时，最后一个间隔内的观测会丢失，所以收集观测前要等待至少两个写出间隔。
@@ -171,13 +227,14 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 - 否则，若处理组的计数或每次执行的平均 total 显著大于对照组（单侧 Welch t 检验，默认 p<0.1），记为 `increase`；
 - 处理组中带有规则 id 的记录是注入本身，单独列出以确认规则确实触发了，不计入效果。
 
-## 9. 各语言的实现状态
+## 9. 实现状态
 
-| 部分 | Python | Go | Java |
-| --- | --- | --- | --- |
-| 规则、观测、运行时 | 已实现 | 已实现 | 规划中 |
-| 进程内 API | `branch` `check` `loop` `value` `clock` `acquire` | 同左，另有 `call`（`Failed`） | 规划中 |
-| HTTP 边界 | ASGI 中间件、httpx 异步客户端 | `net/http` 中间件和 `RoundTripper` | 规划中 |
-| SQL 边界 | DB-API 2 连接包装 | `database/sql` 驱动包装 | 规划中 |
-| 消息边界 | 规划中 | 规划中 | 规划中 |
-| 改写器 | `branch` `check` `loop` `clock` | `call` `branch` `check` `loop` `clock`，以及错误登记 | 规划中 |
+本节记录哪些部分已经按上面的设计实现、哪些还在规划中。
+
+| 部分 | Python | Go | Node / TypeScript | Java | Rust | eBPF 代理 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 核心与插件结构 | 待按第 0 节重构 | 待按第 0 节重构 | 进行中 | 规划中 | 规划中 | 规划中 |
+| 进程内故障点 | 已有，待改为插件 | 已有，待改为插件 | 进行中 | 规划中 | 规划中 | — |
+| 边界适配 | httpx、ASGI、DB-API，已有 | `net/http`、`database/sql`，已有 | 进行中 | 规划中 | 规划中 | `syscall` `packet`，规划中 |
+| 接入 | 构建副本改写器已有，待改为导入钩子 | 构建副本改写器已有，待加入边界的自动装配 | 进行中 | 规划中 | 规划中 | 规划中 |
+| 消息边界 | 规划中 | 规划中 | 规划中 | 规划中 | 规划中 | — |

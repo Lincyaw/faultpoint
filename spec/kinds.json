@@ -1,0 +1,100 @@
+{
+  "actions": {
+    "fail": {
+      "type": "object",
+      "properties": {
+        "error": {"type": "string", "minLength": 1},
+        "status": {"type": "integer", "minimum": 100, "maximum": 599}
+      },
+      "additionalProperties": false
+    },
+    "fail_after": {
+      "type": "object",
+      "properties": {
+        "error": {"type": "string", "minLength": 1},
+        "status": {"type": "integer", "minimum": 100, "maximum": 599}
+      },
+      "additionalProperties": false
+    },
+    "delay": {
+      "type": "object",
+      "properties": {"ms": {"type": "integer", "exclusiveMinimum": 0}},
+      "required": ["ms"],
+      "additionalProperties": false
+    },
+    "drop": {"type": "object", "additionalProperties": false},
+    "duplicate": {"type": "object", "additionalProperties": false},
+    "negate": {"type": "object", "additionalProperties": false},
+    "empty": {"type": "object", "additionalProperties": false},
+    "set": {
+      "type": "object",
+      "properties": {"value": {}},
+      "required": ["value"],
+      "additionalProperties": false
+    },
+    "shift": {
+      "type": "object",
+      "properties": {"amount": {"type": "number"}},
+      "required": ["amount"],
+      "additionalProperties": false
+    },
+    "crash": {
+      "type": "object",
+      "properties": {"code": {"type": "integer", "minimum": 0, "maximum": 255}},
+      "additionalProperties": false
+    }
+  },
+  "kinds": {
+    "branch": {"actions": ["fail", "delay", "crash"], "outcomes": ["taken", "not_taken"]},
+    "call": {"actions": ["fail", "delay", "crash"], "outcomes": ["ok", "error"]},
+    "check": {"actions": ["negate", "delay", "crash"], "outcomes": ["true", "false"]},
+    "loop": {"actions": ["delay", "crash"], "outcomes": ["iteration"]},
+    "value": {"actions": ["set", "shift", "delay", "crash"], "outcomes": ["observed"]},
+    "clock": {"actions": ["shift", "delay", "crash"], "outcomes": ["read"]},
+    "acquire": {"actions": ["fail", "delay", "crash"], "outcomes": ["acquired", "rejected"]},
+    "rpc_client": {
+      "actions": ["fail", "fail_after", "duplicate", "delay", "crash"],
+      "outcomes": ["2xx", "3xx", "4xx", "5xx", "timeout", "refused", "error"],
+      "status": true,
+      "errors": ["timeout", "refused"]
+    },
+    "rpc_server": {
+      "actions": ["fail", "fail_after", "delay", "crash"],
+      "outcomes": ["2xx", "3xx", "4xx", "5xx", "error"],
+      "status": true,
+      "errors": []
+    },
+    "store_read": {
+      "actions": ["fail", "empty", "delay", "crash"],
+      "outcomes": ["rows", "empty", "error"],
+      "errors": ["timeout", "refused"]
+    },
+    "store_write": {
+      "actions": ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
+      "outcomes": ["ok", "error"],
+      "errors": ["timeout", "refused"]
+    },
+    "publish": {
+      "actions": ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
+      "outcomes": ["ok", "error"],
+      "errors": ["timeout", "refused"]
+    },
+    "consume": {
+      "actions": ["fail", "fail_after", "duplicate", "delay", "crash"],
+      "outcomes": ["ok", "error"],
+      "errors": ["timeout", "refused"]
+    },
+    "syscall": {
+      "actions": ["fail", "crash"],
+      "outcomes": ["ok", "<errno name>"],
+      "scope": false,
+      "error_pattern": "^E[A-Z0-9]+$",
+      "error_required": true
+    },
+    "packet": {
+      "actions": ["delay", "drop"],
+      "outcomes": ["delayed", "dropped"],
+      "scope": false
+    }
+  }
+}
