@@ -1,0 +1,81 @@
+{
+  "additionalProperties": false,
+  "description": "How often one point produced one outcome in one scope during one flush window.",
+  "properties": {
+    "experiment": {
+      "title": "Experiment",
+      "type": "string"
+    },
+    "service": {
+      "title": "Service",
+      "type": "string"
+    },
+    "process": {
+      "title": "Process",
+      "type": "string"
+    },
+    "start": {
+      "title": "Start",
+      "type": "number"
+    },
+    "end": {
+      "title": "End",
+      "type": "number"
+    },
+    "point": {
+      "title": "Point",
+      "type": "string"
+    },
+    "outcome": {
+      "title": "Outcome",
+      "type": "string"
+    },
+    "scope": {
+      "title": "Scope",
+      "type": "string"
+    },
+    "rule": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Rule"
+    },
+    "count": {
+      "minimum": 1,
+      "title": "Count",
+      "type": "integer"
+    },
+    "total": {
+      "title": "Total",
+      "type": "number"
+    },
+    "exemplars": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Exemplars",
+      "type": "array"
+    }
+  },
+  "required": [
+    "experiment",
+    "service",
+    "process",
+    "start",
+    "end",
+    "point",
+    "outcome",
+    "scope",
+    "rule",
+    "count",
+    "total"
+  ],
+  "title": "ObservationRecord",
+  "type": "object"
+}
