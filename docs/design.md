@@ -192,6 +192,42 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 - `clock`：读当前时间的调用（缺省名单：Python 的 `time.time` `datetime.now` `datetime.utcnow`，Go 的 `time.Now`，JS 的 `Date.now` 和无参 `new Date`，Java 的 `System.currentTimeMillis` `Instant.now`，Rust 的 `SystemTime::now` `Instant::now`），包装为 `clock(id, 读数)`。
 - Go 为每个含有包级 `error` 变量的包生成登记文件，使 `call` 的 `fail` 能用名字注入真实的哨兵错误。
 
+### 6.4 依赖库中的故障点
+
+连接池、重试、超时、重连、缓存这些传播机制大多在依赖库内部。把放置规则延伸到依赖库，链路就不止于业务代码。延伸有三条约束：接入方式不变，范围和行为由配置限定，先观测、再注入。
+
+**接入方式不变**：各语言沿用自己的接入点，只扩大改写的范围。
+
+| 语言 | 依赖库的改写方式 |
+| --- | --- |
+| Python | 导入钩子也改写范围内的已安装包；C 扩展内部不放置 |
+| Node | 加载钩子也改写范围内的 `node_modules` 包；原生插件内部不放置 |
+| Java | agent 也改写范围内的包前缀；`java.*` `jdk.*` `sun.*` 不放置 |
+| Go | 改写后的依赖文件经 `go build -overlay` 替换进构建，不复制模块、不改模块缓存；标准库不放置，因为 SDK 依赖标准库，会形成导入环 |
+| Rust | 改写后的依赖 crate 副本经副本 `Cargo.toml` 的 `[patch.crates-io]` 替换进构建 |
+
+**范围与行为由配置限定**：配置的 `placement.scope` 列出放置范围，缺省只有业务代码。依赖库须逐个列入，每一项可以限定允许放置的类别：
+
+```json
+{"placement": {"scope": [
+  {"include": "<业务代码>"},
+  {"include": "com.zaxxer.hikari", "kinds": ["branch", "call", "loop", "check"]},
+  {"include": "github.com/jackc/pgx/v5/pgxpool", "kinds": ["branch", "call", "loop"]}
+], "exclude": ["<SDK 自身>", "<OpenTelemetry>", "<日志库>"]}}
+```
+
+- SDK 自身、OpenTelemetry 和日志库始终排除，避免故障点改变观测本身。
+- 依赖库的故障点 id 带上库名和版本：`<包或模块>@<版本>/<相对路径>:<函数>#<锚点>`，升级依赖后 id 不会与旧版本混淆。
+- 依赖库中的热路径执行次数极多，观测输出对计数保持精确，trace id 样例按配置的比例采样。
+
+**先观测、再注入**：
+
+1. 用扩大后的范围构建或启动，不装任何规则，跑一次对照，得到每个故障点的执行次数。
+2. `scan` 生成的清单与这次对照的观测合并，只有实际执行过的故障点才列为注入候选。
+3. 可选：再构建一次，只放置候选故障点，以减少开销。
+
+第一步的代价是一次普通的对照运行，能筛掉绝大多数从未执行的故障点。
+
 ## 7. 配置与运行时
 
 常用设置用环境变量给出；其余设置都在 `FAULTPOINT_CONFIG` 指向的 JSON 文件里，包括启用哪些插件和各自的选项，以及放置规则的开关与名单。
