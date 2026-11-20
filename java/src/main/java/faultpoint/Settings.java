@@ -15,11 +15,12 @@ public record Settings(String service, Path rules, Path report, List<String> pac
     static final ObjectMapper JSON = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
 
     /** Which placement rules are applied, and the clock reads recognised as Owner.method. */
-    public record Placement(Boolean branch, Boolean check, Boolean loop, List<String> clock) {
+    public record Placement(Boolean branch, Boolean check, Boolean loop, Boolean call, List<String> clock) {
         public Placement {
             branch = branch == null || branch;
             check = check == null || check;
             loop = loop == null || loop;
+            call = call == null || call;
             clock = clock == null ? List.of("System.currentTimeMillis", "Instant.now") : List.copyOf(clock);
         }
     }
@@ -28,7 +29,7 @@ public record Settings(String service, Path rules, Path report, List<String> pac
     public record Config(List<String> plugins, Map<String, Map<String, Object>> options, Placement placement) {
         public Config {
             options = options == null ? Map.of() : Map.copyOf(options);
-            placement = placement == null ? new Placement(null, null, null, null) : placement;
+            placement = placement == null ? new Placement(null, null, null, null, null) : placement;
         }
 
         public Map<String, Object> options(String plugin) {

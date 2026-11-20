@@ -3,53 +3,69 @@ package faultpoint;
 import faultpoint.RuleSet.Rule;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.TreeSet;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import net.bytebuddy.matcher.ElementMatchers;
 import net.sf.jsqlparser.JSQLParserException;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.statement.Statement;
+import net.sf.jsqlparser.statement.UnsupportedStatement;
 import net.sf.jsqlparser.statement.select.Select;
 import net.sf.jsqlparser.util.TablesNamesFinder;
 
-/** The store_read and store_write points of JDBC calls in the configured packages, whose call sites
- * the placement routes here. */
+/** The store_read and store_write points of every JDBC statement a driver executes, whoever calls it:
+ * JdbcTemplate, a connection pool, JPA or the application. Advice on the implementations of
+ * java.sql.Statement and java.sql.Connection calls into this class. */
 public final class Jdbc {
 
     private record Kind(String kind, String locator) {}
 
     private static final Map<String, Kind> STATEMENTS = new ConcurrentHashMap<>();
     /** The SQL of each prepared statement, which JDBC does not expose. */
-    private static final Map<PreparedStatement, String> PREPARED = Collections.synchronizedMap(new WeakHashMap<>());
+    private static final Map<Object, String> PREPARED = Collections.synchronizedMap(new WeakHashMap<>());
+    /** A pool's statement proxy calls the driver's statement; only the outermost execution is a point. */
+    private static final ThreadLocal<int[]> DEPTH = ThreadLocal.withInitial(() -> new int[1]);
+    private static final String BATCH = "-#batch";
 
     private Jdbc() {}
 
-    /** The kind and locator of a statement: the tables it touches and the hash of its normalised text. */
+    /** The kind and locator of a statement: a query is read and anything else written, the tables it
+     * touches and the hash of its normalised text. A statement the parser does not understand is
+     * written, since the parser recognises every query form a driver is sent. */
     static Kind statementPoint(String sql) {
         return STATEMENTS.computeIfAbsent(sql, text -> {
+            List<Statement> statements = new ArrayList<>();
             try {
-                var statement = CCJSqlParserUtil.parse(text);
-                var tables = new TreeSet<>(TablesNamesFinder.findTables(text));
-                String kind = statement instanceof Select ? "store_read" : "store_write";
-                String table = tables.isEmpty() ? "-" : String.join("+", tables);
-                return new Kind(kind, table + "#" + Placement.digest(statement.toString()));
+                statements.addAll(CCJSqlParserUtil.parseStatements(text, parser -> parser.withUnsupportedStatements()));
             } catch (JSQLParserException unparsable) {
-                throw new IllegalArgumentException("faultpoint: cannot parse a statement: " + text, unparsable);
+                statements.add(new UnsupportedStatement(text, List.of()));
             }
+            boolean reads = !statements.isEmpty() && statements.stream().allMatch(statement -> statement instanceof Select);
+            var tables = new TreeSet<String>();
+            var shape = new StringBuilder();
+            for (Statement statement : statements) {
+                if (!(statement instanceof UnsupportedStatement)) {
+                    tables.addAll(new TablesNamesFinder<Void>().getTables(statement));
+                }
+                shape.append(statement instanceof UnsupportedStatement ? text.strip() : statement.toString()).append(';');
+            }
+            String table = tables.isEmpty() ? "-" : String.join("+", tables);
+            return new Kind(reads ? "store_read" : "store_write", table + "#" + Placement.digest(shape.toString()));
         });
     }
 
-    private record Execution(String point, Rule rule, long started) {
-        String kind() {
+    /** One outermost execution under its rule. */
+    public record Execution(String point, String kind, Rule rule, long started) {
+        String action() {
             return rule == null ? "" : rule.kind();
         }
 
@@ -58,24 +74,115 @@ public final class Jdbc {
         }
     }
 
-    private static Execution begin(String sql) throws SQLException {
+    /** What the exit advice returns or throws in place of the driver's own result. */
+    public record Outcome(Object returned, Throwable thrown) {}
+
+    public static void prepared(Object statement, Object sql) {
+        if (statement != null && sql instanceof String text) {
+            PREPARED.put(statement, text);
+        }
+    }
+
+    /** Enter a statement execution; a fail rule throws here, before the driver runs. */
+    public static Object enter(Object statement, Object[] arguments) throws SQLException {
+        int[] depth = DEPTH.get();
+        depth[0] += 1;
         Core core = Core.current();
-        Kind kind = statementPoint(sql);
+        if (depth[0] > 1 || !core.enabled()) {
+            return null;
+        }
+        String sql = arguments.length > 0 && arguments[0] instanceof String text ? text : PREPARED.get(statement);
+        Kind kind = sql == null && !(statement instanceof java.sql.PreparedStatement) ? new Kind("store_write", BATCH)
+                : statementPoint(requireSql(core, sql));
         String point = RuleSet.pointId(core.settings.service(), kind.kind(), kind.locator());
         Rule rule = core.decide(point);
         if (rule != null) {
             Points.hold(core, rule);
         }
-        Execution execution = new Execution(point, rule, System.nanoTime());
-        if (execution.kind().equals("fail")) {
-            core.observe(point, "error", execution.elapsed(), rule);
+        Execution execution = new Execution(point, kind.kind(), rule, System.nanoTime());
+        if (execution.action().equals("fail")) {
+            core.observe(point, "error", 0, rule);
+            depth[0] -= 1;
             throw new SQLException("faultpoint: injected store failure", "08006");
         }
         return execution;
     }
 
-    private interface Run<T> {
-        T run() throws SQLException;
+    private static String requireSql(Core core, String sql) {
+        if (sql == null) {
+            core.abort("a prepared statement ran whose SQL the agent did not see prepared");
+        }
+        return sql;
+    }
+
+    /** The value a dropped write returns without reaching the database: one row affected. */
+    public static Object dropped(Object execution) {
+        return execution instanceof Execution running && running.action().equals("drop") ? Boolean.TRUE : null;
+    }
+
+    private static Object droppedResult(Class<?> type) {
+        if (type == int.class || type == Integer.class) {
+            return 1;
+        }
+        if (type == long.class || type == Long.class) {
+            return 1L;
+        }
+        if (type == boolean.class) {
+            return false;
+        }
+        return type == long[].class ? new long[] {1} : new int[] {1};
+    }
+
+    public static Outcome exit(Object execution, Object statement, Method method, Object[] arguments, Object dropped,
+                               Object returned, Throwable thrown) {
+        DEPTH.get()[0] -= 1;
+        if (!(execution instanceof Execution running)) {
+            return new Outcome(returned, thrown);
+        }
+        Core core = Core.current();
+        if (dropped != null) {
+            core.observe(running.point(), "ok", 1, running.rule());
+            return new Outcome(droppedResult(method.getReturnType()), null);
+        }
+        if (thrown == null && running.action().equals("duplicate")) {
+            DEPTH.get()[0] += 1;
+            try {
+                returned = method.invoke(statement, arguments);
+            } catch (InvocationTargetException failure) {
+                thrown = failure.getCause();
+            } catch (IllegalAccessException inaccessible) {
+                throw new IllegalStateException(inaccessible);
+            } finally {
+                DEPTH.get()[0] -= 1;
+            }
+        }
+        if (thrown != null) {
+            core.observe(running.point(), "error", running.elapsed(), running.rule());
+            return new Outcome(returned, thrown);
+        }
+        if (running.action().equals("fail_after")) {
+            core.observe(running.point(), "error", running.elapsed(), running.rule());
+            return new Outcome(returned, new SQLException("faultpoint: store failed after the statement ran", "08006"));
+        }
+        if (returned instanceof ResultSet rows) {
+            return new Outcome(observed(rows, running), null);
+        }
+        if (running.kind().equals("store_read")) {
+            core.observe(running.point(), Boolean.TRUE.equals(returned) ? "rows" : "empty", 0, running.rule());
+        } else {
+            core.observe(running.point(), "ok", affected(returned), running.rule());
+        }
+        return new Outcome(returned, null);
+    }
+
+    private static double affected(Object returned) {
+        if (returned instanceof Number count) {
+            return count.doubleValue();
+        }
+        if (returned instanceof int[] counts) {
+            return java.util.Arrays.stream(counts).sum();
+        }
+        return returned instanceof long[] counts ? java.util.Arrays.stream(counts).sum() : 0;
     }
 
     /** A result set that counts its rows and observes the read once it is exhausted or closed; under an
@@ -86,8 +193,8 @@ public final class Jdbc {
             boolean recorded;
 
             @Override
-            public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] arguments) throws Throwable {
-                if (method.getName().equals("next") && execution.kind().equals("empty")) {
+            public Object invoke(Object proxy, Method method, Object[] arguments) throws Throwable {
+                if (method.getName().equals("next") && execution.action().equals("empty")) {
                     record();
                     return false;
                 }
@@ -120,106 +227,9 @@ public final class Jdbc {
         return (ResultSet) Proxy.newProxyInstance(ResultSet.class.getClassLoader(), new Class<?>[] {ResultSet.class}, handler);
     }
 
-    private static ResultSet query(String sql, Run<ResultSet> run) throws SQLException {
-        if (!Core.current().enabled()) {
-            return run.run();
-        }
-        Execution execution = begin(sql);
-        try {
-            return observed(run.run(), execution);
-        } catch (SQLException failure) {
-            Core.current().observe(execution.point(), "error", execution.elapsed(), execution.rule());
-            throw failure;
-        }
-    }
-
-    private static int update(String sql, Run<Integer> run) throws SQLException {
-        Core core = Core.current();
-        if (!core.enabled()) {
-            return run.run();
-        }
-        Execution execution = begin(sql);
-        if (execution.kind().equals("drop")) {
-            core.observe(execution.point(), "ok", 1, execution.rule());
-            return 1;
-        }
-        int affected;
-        try {
-            affected = run.run();
-            if (execution.kind().equals("duplicate")) {
-                affected = run.run();
-            }
-        } catch (SQLException failure) {
-            core.observe(execution.point(), "error", execution.elapsed(), execution.rule());
-            throw failure;
-        }
-        if (execution.kind().equals("fail_after")) {
-            core.observe(execution.point(), "error", execution.elapsed(), execution.rule());
-            throw new SQLException("faultpoint: store failed after the statement ran", "08006");
-        }
-        core.observe(execution.point(), "ok", affected, execution.rule());
-        return affected;
-    }
-
-    /** execute() may read or write; a read through it is observed without its row count. */
-    private static boolean execute(String sql, Run<Boolean> run) throws SQLException {
-        if (statementPoint(sql).kind().equals("store_write")) {
-            int[] produced = {0};
-            update(sql, () -> {
-                produced[0] = run.run() ? 1 : 0;
-                return 0;
-            });
-            return produced[0] == 1;
-        }
-        boolean[] produced = {false};
-        query(sql, () -> {
-            produced[0] = run.run();
-            return null;
-        });
-        return produced[0];
-    }
-
-    public static PreparedStatement prepareStatement(Connection connection, String sql) throws SQLException {
-        PreparedStatement statement = connection.prepareStatement(sql);
-        PREPARED.put(statement, sql);
-        return statement;
-    }
-
-    public static ResultSet executeQuery(Statement statement, String sql) throws SQLException {
-        return query(sql, () -> statement.executeQuery(sql));
-    }
-
-    public static int executeUpdate(Statement statement, String sql) throws SQLException {
-        return update(sql, () -> statement.executeUpdate(sql));
-    }
-
-    public static boolean execute(Statement statement, String sql) throws SQLException {
-        return execute(sql, () -> statement.execute(sql));
-    }
-
-    private static String preparedSql(PreparedStatement statement) {
-        String sql = PREPARED.get(statement);
-        if (sql == null) {
-            throw new IllegalStateException("faultpoint: a prepared statement was created outside the configured packages");
-        }
-        return sql;
-    }
-
-    public static ResultSet executeQuery(PreparedStatement statement) throws SQLException {
-        return query(preparedSql(statement), statement::executeQuery);
-    }
-
-    public static int executeUpdate(PreparedStatement statement) throws SQLException {
-        return update(preparedSql(statement), statement::executeUpdate);
-    }
-
-    public static boolean execute(PreparedStatement statement) throws SQLException {
-        return execute(preparedSql(statement), statement::execute);
-    }
-
     public static final class JdbcPlugin implements Plugin {
-        static final Set<String> STATEMENTS = Set.of("java/sql/Statement", "java/sql/PreparedStatement", "java/sql/CallableStatement");
-        static final Set<String> PREPARED = Set.of("java/sql/PreparedStatement", "java/sql/CallableStatement");
+        static final List<String> EXECUTIONS = List.of("execute", "executeQuery", "executeUpdate", "executeLargeUpdate",
+                "executeBatch", "executeLargeBatch");
 
         @Override
         public String name() {
@@ -231,22 +241,17 @@ public final class Jdbc {
             installation.core().declare(Map.of(
                     "store_read", List.of("fail", "empty", "delay", "crash"),
                     "store_write", List.of("fail", "fail_after", "drop", "duplicate", "delay", "crash")));
-            Placement placement = installation.placement();
-            placement.replaceCalls(Set.of("java/sql/Connection"), "prepareStatement",
-                    "(Ljava/lang/String;)Ljava/sql/PreparedStatement;", Jdbc.class, "prepareStatement",
-                    "(Ljava/sql/Connection;Ljava/lang/String;)Ljava/sql/PreparedStatement;");
-            placement.replaceCalls(STATEMENTS, "executeQuery", "(Ljava/lang/String;)Ljava/sql/ResultSet;", Jdbc.class,
-                    "executeQuery", "(Ljava/sql/Statement;Ljava/lang/String;)Ljava/sql/ResultSet;");
-            placement.replaceCalls(STATEMENTS, "executeUpdate", "(Ljava/lang/String;)I", Jdbc.class,
-                    "executeUpdate", "(Ljava/sql/Statement;Ljava/lang/String;)I");
-            placement.replaceCalls(STATEMENTS, "execute", "(Ljava/lang/String;)Z", Jdbc.class,
-                    "execute", "(Ljava/sql/Statement;Ljava/lang/String;)Z");
-            placement.replaceCalls(PREPARED, "executeQuery", "()Ljava/sql/ResultSet;", Jdbc.class,
-                    "executeQuery", "(Ljava/sql/PreparedStatement;)Ljava/sql/ResultSet;");
-            placement.replaceCalls(PREPARED, "executeUpdate", "()I", Jdbc.class,
-                    "executeUpdate", "(Ljava/sql/PreparedStatement;)I");
-            placement.replaceCalls(PREPARED, "execute", "()Z", Jdbc.class,
-                    "execute", "(Ljava/sql/PreparedStatement;)Z");
+            Advices.install(installation.instrumentation(),
+                    ElementMatchers.hasSuperType(ElementMatchers.named("java.sql.Statement")).and(ElementMatchers.not(ElementMatchers.isInterface())),
+                    ElementMatchers.isPublic().and(ElementMatchers.not(ElementMatchers.isAbstract()))
+                            .and(ElementMatchers.namedOneOf(EXECUTIONS.toArray(String[]::new))),
+                    "faultpoint.JdbcAdvice");
+            Advices.install(installation.instrumentation(),
+                    ElementMatchers.hasSuperType(ElementMatchers.named("java.sql.Connection")).and(ElementMatchers.not(ElementMatchers.isInterface())),
+                    ElementMatchers.isPublic().and(ElementMatchers.not(ElementMatchers.isAbstract()))
+                            .and(ElementMatchers.namedOneOf("prepareStatement", "prepareCall"))
+                            .and(ElementMatchers.takesArgument(0, String.class)),
+                    "faultpoint.JdbcAdvice$Prepare");
         }
     }
 }

@@ -81,7 +81,8 @@ public final class Agent {
         return found;
     }
 
-    /** `scan --service NAME --packages a.b,c.d --classes DIR_OR_JAR [--config FILE]`: the points the agent would place. */
+    /** `scan --service NAME --packages a.b,c.d --classes DIR_OR_JAR [--classpath JARS] [--config FILE]`: the points
+     * the agent would place. */
     public static void main(String[] arguments) throws IOException {
         var options = new LinkedHashMap<String, String>();
         for (int index = 1; index + 1 < arguments.length; index += 2) {
@@ -89,7 +90,8 @@ public final class Agent {
         }
         if (arguments.length == 0 || !arguments[0].equals("scan") || !options.keySet().containsAll(
                 List.of("--service", "--packages", "--classes"))) {
-            System.err.println("usage: java -jar faultpoint-agent.jar scan --service NAME --packages a.b,c.d --classes DIR_OR_JAR [--config FILE]");
+            System.err.println("usage: java -jar faultpoint-agent.jar scan --service NAME --packages a.b,c.d --classes DIR_OR_JAR "
+                    + "[--classpath JARS] [--config FILE]");
             System.exit(2);
         }
         Settings.Config config = Settings.Config.read(options.get("--config"));
@@ -97,10 +99,19 @@ public final class Agent {
                 config.placement());
         placement.placePoints();
         Path location = Path.of(options.get("--classes"));
-        for (var entry : classes(location)) {
-            String internalName = entry.getKey().substring(0, entry.getKey().length() - ".class".length()).replace('\\', '/');
-            if (placement.covers(internalName)) {
-                placement.rewrite(entry.getValue(), Agent.class.getClassLoader());
+        var path = new java.util.ArrayList<java.net.URL>(List.of(location.toUri().toURL()));
+        for (String entry : options.getOrDefault("--classpath", "").split(java.io.File.pathSeparator)) {
+            if (!entry.isEmpty()) {
+                path.add(Path.of(entry).toUri().toURL());
+            }
+        }
+        // Call points depend on the exceptions callees declare, so the scan reads callees from the same class path the service runs with.
+        try (var loader = new java.net.URLClassLoader(path.toArray(java.net.URL[]::new), ClassLoader.getPlatformClassLoader())) {
+            for (var entry : classes(location)) {
+                String internalName = entry.getKey().substring(0, entry.getKey().length() - ".class".length()).replace('\\', '/');
+                if (placement.covers(internalName)) {
+                    placement.rewrite(entry.getValue(), loader);
+                }
             }
         }
         var manifest = new LinkedHashMap<String, Object>();

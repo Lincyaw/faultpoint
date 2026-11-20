@@ -10,11 +10,7 @@ import io.opentelemetry.context.propagation.TextMapPropagator;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
-import net.bytebuddy.agent.builder.AgentBuilder;
-import net.bytebuddy.asm.Advice;
-import net.bytebuddy.dynamic.ClassFileLocator;
 import net.bytebuddy.matcher.ElementMatchers;
-import net.bytebuddy.pool.TypePool;
 
 /** The rpc_server point of every request a jakarta HttpServlet serves; it restores the caller's trace
  * context and baggage for the servlet. It takes no servlet types, since the servlet API may live in a
@@ -98,8 +94,6 @@ public final class ServletBoundary {
     }
 
     public static final class ServletPlugin implements Plugin {
-        static final String ADVICE = "faultpoint.ServletAdvice";
-
         @Override
         public String name() {
             return "servlet";
@@ -111,14 +105,10 @@ public final class ServletBoundary {
                 identifierSegment = Pattern.compile(pattern);
             }
             installation.core().declare(Map.of("rpc_server", List.of("fail", "fail_after", "delay", "crash")));
-            ClassFileLocator locator = ClassFileLocator.ForClassLoader.of(ServletPlugin.class.getClassLoader());
-            var advice = Advice.to(TypePool.Default.of(locator).describe(ADVICE).resolve(), locator);
-            new AgentBuilder.Default()
-                    .type(ElementMatchers.named("jakarta.servlet.http.HttpServlet"))
-                    .transform((builder, type, loader, module, domain) -> builder.visit(advice.on(
-                            ElementMatchers.named("service").and(ElementMatchers.takesArguments(2))
-                                    .and(ElementMatchers.takesArgument(0, ElementMatchers.named("jakarta.servlet.ServletRequest"))))))
-                    .installOn(installation.instrumentation());
+            Advices.install(installation.instrumentation(), ElementMatchers.named("jakarta.servlet.http.HttpServlet"),
+                    ElementMatchers.named("service").and(ElementMatchers.takesArguments(2))
+                            .and(ElementMatchers.takesArgument(0, ElementMatchers.named("jakarta.servlet.ServletRequest"))),
+                    "faultpoint.ServletAdvice");
         }
     }
 }

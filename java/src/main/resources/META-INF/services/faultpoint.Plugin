@@ -2,3 +2,5 @@ faultpoint.Points$PointsPlugin
 faultpoint.ServletBoundary$ServletPlugin
 faultpoint.HttpClients$HttpClientPlugin
 faultpoint.Jdbc$JdbcPlugin
+faultpoint.SpringHttp$SpringHttpPlugin
+faultpoint.Lettuce$LettucePlugin

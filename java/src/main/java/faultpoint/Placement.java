@@ -91,9 +91,10 @@ public final class Placement implements ClassFileTransformer {
     byte[] rewrite(byte[] classfile, ClassLoader loader) {
         var node = new ClassNode();
         new ClassReader(classfile).accept(node, ClassReader.SKIP_FRAMES);
+        var declarations = new Declarations(loader == null ? ClassLoader.getSystemClassLoader() : loader);
         for (MethodNode method : node.methods) {
             if ((method.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE | Opcodes.ACC_BRIDGE)) == 0) {
-                new MethodPlacer(node.name, method).place();
+                new MethodPlacer(node.name, method, declarations).place();
             }
         }
         var writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES) {
@@ -136,16 +137,86 @@ public final class Placement implements ClassFileTransformer {
                 || opcode == Opcodes.LOOKUPSWITCH || (opcode >= Opcodes.IRETURN && opcode <= Opcodes.RETURN);
     }
 
+    /** The checked exceptions methods declare, read from the class files a class loader finds, so that a call
+     * point throws only what its callee may throw. */
+    static final class Declarations {
+        private final ClassLoader loader;
+        private final Map<String, ClassNode> classes = new HashMap<>();
+
+        Declarations(ClassLoader loader) {
+            this.loader = loader;
+        }
+
+        /** The class file of a type without code, or null when the loader cannot find it. */
+        ClassNode type(String internalName) {
+            return classes.computeIfAbsent(internalName, name -> {
+                try (var input = loader.getResourceAsStream(name + ".class")) {
+                    if (input == null) {
+                        return null;
+                    }
+                    var node = new ClassNode();
+                    new ClassReader(input).accept(node, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+                    return node;
+                } catch (java.io.IOException unreadable) {
+                    throw new java.io.UncheckedIOException(unreadable);
+                }
+            });
+        }
+
+        /** Whether an exception type is checked; a type whose class file is not found is treated as not. */
+        boolean checked(String exception) {
+            for (String current = exception; current != null; ) {
+                switch (current) {
+                    case "java/lang/RuntimeException", "java/lang/Error" -> {
+                        return false;
+                    }
+                    case "java/lang/Exception", "java/lang/Throwable" -> {
+                        return true;
+                    }
+                    default -> {
+                        ClassNode node = type(current);
+                        current = node == null ? null : node.superName;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /** The first checked exception the method a call resolves to declares, searching its owner's
+         * superclasses and interfaces, or null. */
+        String checkedException(String owner, String name, String descriptor) {
+            var pending = new java.util.ArrayDeque<String>(List.of(owner));
+            while (!pending.isEmpty()) {
+                ClassNode node = type(pending.poll());
+                if (node == null) {
+                    continue;
+                }
+                for (MethodNode declared : node.methods) {
+                    if (declared.name.equals(name) && declared.desc.equals(descriptor)) {
+                        return declared.exceptions.stream().filter(this::checked).findFirst().orElse(null);
+                    }
+                }
+                if (node.superName != null) {
+                    pending.add(node.superName);
+                }
+                pending.addAll(node.interfaces);
+            }
+            return null;
+        }
+    }
+
     /** Places the points of one method. */
     private final class MethodPlacer {
         final String owner;
         final MethodNode method;
+        final Declarations declarations;
         final Map<String, Integer> ordinals = new HashMap<>();
         final InsnList instructions;
 
-        MethodPlacer(String owner, MethodNode method) {
+        MethodPlacer(String owner, MethodNode method, Declarations declarations) {
             this.owner = owner;
             this.method = method;
+            this.declarations = declarations;
             this.instructions = method.instructions;
         }
 
@@ -176,6 +247,7 @@ public final class Placement implements ClassFileTransformer {
 
         void place() {
             if (placesPoints) {
+                var calls = throwingCalls();
                 var loops = loopHeaders();
                 var branches = guardedThrows();
                 var returns = switches.check() ? computedReturns() : List.<AbstractInsnNode>of();
@@ -193,6 +265,11 @@ public final class Placement implements ClassFileTransformer {
                 }
                 for (Map.Entry<JumpInsnNode, String> guarded : branches.entrySet()) {
                     forceable(guarded.getKey(), place("branch", guarded.getKey(), "throw " + guarded.getValue(), true));
+                }
+                for (Map.Entry<MethodInsnNode, String> throwing : calls.entrySet()) {
+                    MethodInsnNode invoked = throwing.getKey();
+                    observable(invoked, throwing.getValue(),
+                            place("call", invoked, "call " + invoked.owner + "." + invoked.name + invoked.desc, true));
                 }
             }
             for (AbstractInsnNode instruction : instructions.toArray()) {
@@ -273,6 +350,51 @@ public final class Placement implements ClassFileTransformer {
                 }
             }
             return computed ? returns : List.of();
+        }
+
+        /** The calls whose callee declares a checked exception, with that exception; constructors are left
+         * alone, since their receiver is not initialised while the call runs. */
+        Map<MethodInsnNode, String> throwingCalls() {
+            var calls = new java.util.LinkedHashMap<MethodInsnNode, String>();
+            if (!switches.call() || method.name.equals("<init>")) {
+                return calls;
+            }
+            for (AbstractInsnNode instruction : instructions.toArray()) {
+                if (instruction instanceof MethodInsnNode invoked && !invoked.name.equals("<init>")
+                        && !invoked.owner.startsWith("faultpoint/")) {
+                    String exception = declarations.checkedException(invoked.owner, invoked.name, invoked.desc);
+                    if (exception != null) {
+                        calls.put(invoked, exception);
+                    }
+                }
+            }
+            return calls;
+        }
+
+        /** Surround a call with its point: Points.call before it may throw the declared exception, and the
+         * call's own return or throw is observed and then continues unchanged. */
+        void observable(MethodInsnNode invoked, String exception, String id) {
+            var start = new LabelNode();
+            var end = new LabelNode();
+            var handler = new LabelNode();
+            var after = new LabelNode();
+            var before = new InsnList();
+            before.add(new LdcInsnNode(id));
+            before.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(exception)));
+            before.add(new MethodInsnNode(Opcodes.INVOKESTATIC, POINTS, "call", "(Ljava/lang/String;Ljava/lang/Class;)V", false));
+            before.add(start);
+            instructions.insertBefore(invoked, before);
+            var following = new InsnList();
+            following.add(end);
+            following.add(call(id, "returned", "(Ljava/lang/String;)V"));
+            following.add(new JumpInsnNode(Opcodes.GOTO, after));
+            following.add(handler);
+            following.add(new InsnNode(Opcodes.DUP));
+            following.add(call(id, "raised", "(Ljava/lang/Throwable;Ljava/lang/String;)V"));
+            following.add(new InsnNode(Opcodes.ATHROW));
+            following.add(after);
+            instructions.insert(invoked, following);
+            method.tryCatchBlocks.add(0, new org.objectweb.asm.tree.TryCatchBlockNode(start, end, handler, "java/lang/Throwable"));
         }
 
         /** Turn `if (condition) throw` into `if (Points.branch(condition, id)) throw`. */

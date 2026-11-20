@@ -131,6 +131,57 @@ public final class Points {
         return acquired;
     }
 
+    /** The rules of the calls in progress on this thread, innermost last, so that a call's outcome is attributed
+     * to the rule decided before it even when the callee holds call points of its own. */
+    private static final ThreadLocal<java.util.ArrayDeque<Object>> CALLS = ThreadLocal.withInitial(java.util.ArrayDeque::new);
+    private static final Object NO_RULE = new Object();
+
+    /** Before a call whose callee declares a checked exception: a fail rule throws that exception here. */
+    public static void call(String point, Class<?> declared) throws Exception {
+        Core core = Core.current();
+        if (!core.enabled()) {
+            return;
+        }
+        Rule rule = core.decide(point);
+        if (rule != null) {
+            hold(core, rule);
+        }
+        if (rule != null && rule.kind().equals("fail")) {
+            core.observe(point, "error", 0, rule);
+            throw declaredException(declared, point);
+        }
+        CALLS.get().push(rule == null ? NO_RULE : rule);
+    }
+
+    private static Exception declaredException(Class<?> declared, String point) throws ReflectiveOperationException {
+        String message = "faultpoint: injected at " + point;
+        for (var constructor : declared.getConstructors()) {
+            if (constructor.getParameterCount() == 1 && constructor.getParameterTypes()[0] == String.class) {
+                return (Exception) constructor.newInstance(message);
+            }
+        }
+        return (Exception) declared.getConstructor().newInstance();
+    }
+
+    private static Rule poppedRule() {
+        Object rule = CALLS.get().pop();
+        return rule == NO_RULE ? null : (Rule) rule;
+    }
+
+    public static void returned(String point) {
+        Core core = Core.current();
+        if (core.enabled()) {
+            core.observe(point, "ok", 0, poppedRule());
+        }
+    }
+
+    public static void raised(Throwable error, String point) {
+        Core core = Core.current();
+        if (core.enabled()) {
+            core.observe(point, "error", 0, poppedRule());
+        }
+    }
+
     /** Declares the in-process kinds and lets the placement put their points into the configured packages. */
     public static final class PointsPlugin implements Plugin {
         @Override
@@ -142,6 +193,7 @@ public final class Points {
         public void install(Installation installation, Map<String, Object> options) {
             installation.core().declare(Map.of(
                     "branch", List.of("fail", "delay", "crash"),
+                    "call", List.of("fail", "delay", "crash"),
                     "check", List.of("negate", "delay", "crash"),
                     "loop", List.of("delay", "crash"),
                     "value", List.of("set", "shift", "delay", "crash"),
