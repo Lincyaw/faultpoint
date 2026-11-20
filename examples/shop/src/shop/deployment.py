@@ -89,10 +89,11 @@ def build(sdk: Path) -> str:
     instrumented copies, the others attach at start."""
     commit = sdk_commit(sdk)
     BUILD.mkdir(parents=True, exist_ok=True)
-    run(["npm", "install", "--silent"], sdk / "typescript")
+    # npm ci installs from the lock files and never rewrites them, so the pinned SDK stays at its commit.
+    run(["npm", "ci", "--silent"], sdk / "typescript")
     run(["npx", "tsc", "-p", "tsconfig.json"], sdk / "typescript")
     run(["mvn", "-q", "-B", "package", "-DskipTests"], sdk / "java")
-    run(["npm", "install", "--silent"], SHOP / "gateway")
+    run(["npm", "ci", "--silent"], SHOP / "gateway")
     run(["npx", "tsc", "-p", "tsconfig.json"], SHOP / "gateway")
     run(["uv", "sync", "-q"], SHOP / "orders")
     # Python plugins are found through the faultpoint.plugins entry points, which only an installed package exposes.
