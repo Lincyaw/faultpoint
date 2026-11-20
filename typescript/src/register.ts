@@ -1,7 +1,8 @@
 import { registerHooks } from "node:module";
-import { relative, sep } from "node:path";
+import { resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { targetOf } from "./config.js";
 import { OtelContext } from "./context.js";
 import { CORE, type Core, type Plugin } from "./core.js";
 import { httpPlugin } from "./http.js";
@@ -14,23 +15,28 @@ import { instrumentModule } from "./transform.js";
 
 const RULES_POLL_MS = 500;
 
-/** Places points in the modules under the source root, outside node_modules, as Node loads them. */
+/** Places points in the business modules under the source root and in the installed packages the placement scope
+ * names, as Node loads them; native addons are not JavaScript and never pass through. */
 const loadHookPlugin: Plugin = {
   name: "load-hook",
   install(core: Core) {
     const { sourceRoot, service, config } = core.settings;
+    const root = resolve(sourceRoot);
     registerHooks({
       load(url, context, nextLoad) {
         const result = nextLoad(url, context);
-        if (!url.startsWith("file:") || (result.format !== "module" && result.format !== "commonjs")
-          || result.source === undefined || result.source === null) {
+        // A file require() reaches through createRequire may come without a format; its source is JavaScript all the same.
+        const javascript = result.format === "module" || result.format === "commonjs"
+          || (result.format === undefined && /\.[cm]?js$/.test(url));
+        if (!url.startsWith("file:") || !javascript || result.source === undefined || result.source === null) {
           return result;
         }
-        const path = relative(sourceRoot, fileURLToPath(url));
-        if (path.startsWith("..") || path.split(sep).includes("node_modules")) {
+        const target = targetOf(fileURLToPath(url).split(sep).join("/"), root.split(sep).join("/"), config.placement);
+        if (target === null) {
           return result;
         }
-        const { code } = instrumentModule(result.source.toString(), path.split(sep).join("/"), service, config.placement);
+        const { code } = instrumentModule(result.source.toString(), `${target.prefix}${target.path}`, service,
+          config.placement, target.kinds);
         return code === null ? result : { ...result, source: code };
       },
     });

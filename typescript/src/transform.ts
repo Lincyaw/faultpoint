@@ -93,7 +93,13 @@ class Placer {
   readonly printer = ts.createPrinter();
 
   constructor(readonly service: string, readonly path: string, readonly source: ts.SourceFile,
-    readonly factory: ts.NodeFactory, readonly placement: Placement) {}
+    readonly factory: ts.NodeFactory, readonly placement: Placement, readonly kinds?: readonly string[]) {}
+
+  /** Whether a placement rule is switched on and the module's scope allows its kind. */
+  allows(kind: "branch" | "check" | "loop" | "clock"): boolean {
+    const switched = kind === "clock" ? this.placement.clock.length > 0 : this.placement[kind];
+    return switched && (this.kinds === undefined || this.kinds.includes(kind));
+  }
 
   place(kind: string, node: ts.Node, anchor: ts.Node | null): string {
     const name = this.scopes.at(-1)?.name ?? "<module>";
@@ -191,7 +197,7 @@ class Placer {
     if (functionLike(node)) {
       const scope: Scope = { name: this.functionName(node), check: null, literals: 0 };
       this.scopes.push(scope);
-      scope.check = this.placement.check && this.checkable(node) ? this.place("check", node, null) : null;
+      scope.check = this.allows("check") && this.checkable(node) ? this.place("check", node, null) : null;
       let updated = ts.visitEachChild(node, recurse, context);
       if (scope.check !== null && ts.isArrowFunction(updated) && !ts.isBlock(updated.body)) {
         updated = factory.updateArrowFunction(updated, updated.modifiers, updated.typeParameters,
@@ -207,7 +213,7 @@ class Placer {
         ? factory.updateReturnStatement(updated, this.call("check", check, updated.expression))
         : updated;
     }
-    if (ts.isIfStatement(node) && this.scopes.length > 0 && this.placement.branch) {
+    if (ts.isIfStatement(node) && this.scopes.length > 0 && this.allows("branch")) {
       const then = node.thenStatement;
       const guards = ts.isThrowStatement(then) || (ts.isBlock(then) && then.statements.some(ts.isThrowStatement));
       const point = guards ? this.place("branch", node, node.expression) : null;
@@ -215,11 +221,11 @@ class Placer {
       return point === null ? updated : factory.updateIfStatement(updated,
         this.call("branch", point, updated.expression), updated.thenStatement, updated.elseStatement);
     }
-    if (ts.isIterationStatement(node, false) && this.scopes.length > 0 && this.placement.loop && !constantLoop(node)) {
+    if (ts.isIterationStatement(node, false) && this.scopes.length > 0 && this.allows("loop") && !constantLoop(node)) {
       const point = this.place("loop", node, node);
       return this.placeLoop(ts.visitEachChild(node, recurse, context), point);
     }
-    if (this.scopes.length > 0 && this.clockRead(node)) {
+    if (this.scopes.length > 0 && this.allows("clock") && this.clockRead(node)) {
       const point = this.place("clock", node, node);
       return this.call("clock", point, ts.visitEachChild(node, recurse, context) as ts.Expression);
     }
@@ -230,11 +236,11 @@ class Placer {
 /** A module's instrumented code and its points; no code when it holds no point. `path` is the
  * module's path relative to the source root, which point ids are built from. */
 export function instrumentModule(code: string, path: string, service: string,
-  placement: Placement): { code: string | null; points: PointEntry[] } {
+  placement: Placement, kinds?: readonly string[]): { code: string | null; points: PointEntry[] } {
   const source = ts.createSourceFile(path, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   let placer: Placer | undefined;
   const result = ts.transform(source, [(context) => (root) => {
-    placer = new Placer(service, path, source, context.factory, placement);
+    placer = new Placer(service, path, source, context.factory, placement, kinds);
     return placer.visit(root, context) as ts.SourceFile;
   }]);
   if (placer === undefined || placer.points.length === 0) {

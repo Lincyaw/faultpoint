@@ -24,6 +24,8 @@ export interface ObservationRecord {
 export const JsonlOptions = z.strictObject({
   flush_seconds: z.number().positive().default(2),
   exemplars: z.number().int().min(0).default(5),
+  /** The share of traces whose ids are kept as exemplars, for hot library paths; counts stay exact. */
+  exemplar_rate: z.number().min(0).max(1).default(1),
 });
 
 /** The default observation sink: observations aggregated per window and appended as JSON Lines. */
@@ -47,7 +49,9 @@ export class JsonlSink implements ObservationSink {
     };
     record.count += 1;
     record.total += observation.quantity;
-    if (observation.traceId !== null && record.exemplars.length < this.options.exemplars) {
+    // A trace is sampled by its id, so that every process keeps or skips the same traces.
+    if (observation.traceId !== null && record.exemplars.length < this.options.exemplars
+      && parseInt(observation.traceId.slice(-8), 16) % 10_000 < this.options.exemplar_rate * 10_000) {
       record.exemplars.push(observation.traceId);
     }
     this.tally.set(key, record);
