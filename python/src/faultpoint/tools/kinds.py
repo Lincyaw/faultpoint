@@ -1,6 +1,5 @@
+import importlib.resources
 import re
-from importlib.metadata import distribution
-from pathlib import Path
 from typing import Any, Final, Self
 
 from jsonschema import Draft202012Validator
@@ -8,9 +7,8 @@ from pydantic import BaseModel
 
 from faultpoint.rules import STRICT, Rule, RuleSet
 
-DISTRIBUTION: Final = "faultpoint"
-KINDS_FILE: Final = "faultpoint/tools/kinds.json"
-"""Where the wheel carries spec/kinds.json, relative to the installed distribution."""
+KINDS_FILE: Final = ("spec", "kinds.json")
+"""spec/kinds.json inside the package: a link to the repository's file in a checkout, its content in a wheel."""
 
 
 class KindSpec(BaseModel):
@@ -37,7 +35,7 @@ class KindTable(BaseModel):
 
     @classmethod
     def installed(cls) -> Self:
-        return cls.model_validate_json(Path(str(distribution(DISTRIBUTION).locate_file(KINDS_FILE))).read_bytes())
+        return cls.model_validate_json(importlib.resources.files("faultpoint").joinpath(*KINDS_FILE).read_bytes())
 
     def violations(self, ruleset: RuleSet) -> list[str]:
         return [f"rule {rule.id}: {problem}" for rule in ruleset.rules for problem in self.rule_violations(rule)]

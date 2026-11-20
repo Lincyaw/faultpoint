@@ -1,11 +1,10 @@
 import asyncio
 import functools
+import importlib.resources
 import re
 import time
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
-from importlib.metadata import distribution
-from pathlib import Path
 from types import ModuleType
 from typing import Annotated, Any, Final
 
@@ -20,9 +19,9 @@ from faultpoint.runtime import Decision, Plugin, Runtime
 
 REDIS_MODULE: Final = "redis"
 REDIS_ASYNCIO_MODULE: Final = "redis.asyncio"
-DISTRIBUTION: Final = "faultpoint"
-COMMANDS_FILE: Final = "faultpoint/adapters/redis-commands.json"
-"""Where the wheel carries spec/redis-commands.json, relative to the installed distribution."""
+COMMANDS_FILE: Final = ("spec", "redis-commands.json")
+"""spec/redis-commands.json inside the package: a link to the repository's file in a checkout, its content in a
+wheel."""
 KEY_POSITION: Final = r"^(after:\S+|numkeys:\d+)$"
 AFTER: Final = "after"
 STREAMS_KEY: Final = "after:STREAMS"
@@ -354,7 +353,7 @@ def patch(runtime: Runtime, key_identifier: re.Pattern[str], commands: dict[str,
 
 def install(runtime: Runtime, options: dict[str, JsonValue]) -> None:
     table = CommandTable.model_validate_json(
-        Path(str(distribution(DISTRIBUTION).locate_file(COMMANDS_FILE))).read_bytes())
+        importlib.resources.files("faultpoint").joinpath(*COMMANDS_FILE).read_bytes())
     extension = RedisOptions.model_validate(options)
     key_identifier = table.key_identifier if extension.key_identifier is None else extension.key_identifier
     commands = {name.upper(): command for name, command in {**table.commands, **extension.commands}.items()}
