@@ -8,6 +8,8 @@ dependencies = [
     "pydantic-settings>=2.6",
     # Baggage and trace context are read through the OpenTelemetry API so that an instrumented system propagates them without help.
     "opentelemetry-api>=1.27",
+    "wrapt>=2.0",
+    "sqlglot>=25",
 ]
 
 [project.optional-dependencies]
@@ -19,6 +21,9 @@ faultpoint = "faultpoint.tools.cli:app"
 [project.entry-points."faultpoint.plugins"]
 points = "faultpoint.points:PLUGIN"
 import-hook = "faultpoint.hook:PLUGIN"
+httpx = "faultpoint.adapters.http:HTTPX"
+asgi = "faultpoint.adapters.http:ASGI"
+dbapi = "faultpoint.adapters.dbapi:PLUGIN"
 
 [build-system]
 requires = ["hatchling"]

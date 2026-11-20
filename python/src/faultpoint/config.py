@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from faultpoint.rules import STRICT
 
-DEFAULT_PLUGINS: Final = ("points", "import-hook")
+DEFAULT_PLUGINS: Final = ("points", "import-hook", "httpx", "asgi", "dbapi")
 
 
 class Settings(BaseSettings):
