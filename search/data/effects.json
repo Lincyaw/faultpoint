@@ -50,6 +50,10 @@
     {"kind": "store_write", "outcomes": ["error"], "metric": "count", "faults": [{"kind": "fail"}],
      "reason": "A failed write is what fail returns."},
     {"kind": "store_write", "outcomes": ["ok", "error"], "metric": "mean", "faults": [],
-     "reason": "More rows per write is a change of the stored data that no store action produces."}
+     "reason": "More rows per write is a change of the stored data that no store action produces."},
+    {"kind": "syscall", "outcomes": ["EIO"], "metric": "count", "faults": [{"kind": "fail", "error": "EIO"}],
+     "reason": "A system call failing with EIO is what fail with EIO returns."},
+    {"kind": "syscall", "outcomes": ["ok", "EAGAIN"], "metric": "count", "faults": [],
+     "reason": "More system calls, or more would-block results of non-blocking sockets, only mean more work."}
   ]
 }

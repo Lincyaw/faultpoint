@@ -9,7 +9,7 @@ from pydantic import BaseModel, JsonValue
 from shop.workload import Scenarios
 
 from faultsearch.allocation import Strategy
-from faultsearch.catalog import DATA, FROZEN, Catalog, Fault, point_kind, point_service
+from faultsearch.catalog import DATA, FROZEN, Catalog, Fault, Layer, point_kind, point_layer, point_service
 from faultsearch.counterfactual import TreatmentRecord
 
 EFFECTS_FILE: Final = DATA / "effects.json"
@@ -103,6 +103,7 @@ class Edge(BaseModel):
     counterpart: Counterpart
     counterparts: tuple[Fault, ...]
     terminal: bool
+    effect_layer: Layer
 
     @property
     def held_in(self) -> frozenset[str]:
@@ -155,8 +156,8 @@ def counterparts(effect: EffectKey, verdicts: set[Verdict], effects: EffectMap,
     return (Counterpart.NONE if rules else Counterpart.UNMAPPED), ()
 
 
-def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: EffectMap,
-                catalog: Catalog) -> list[Edge]:
+def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: EffectMap, catalog: Catalog,
+                upstream: frozenset[str]) -> list[Edge]:
     """Every (fault, effect) pair the exercised records show, over the scenarios each fault was tested in."""
     by_fault: dict[str, list[TreatmentRecord]] = defaultdict(list)
     for record in records:
@@ -175,5 +176,6 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
             counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, effects, catalog)
             edges.append(Edge(cause=runs[0].fault, effect=effect, held=tuple(held), not_held=tuple(not_held),
                               conditions=learn_conditions(held_in, not_held, scenarios), counterpart=counterpart,
-                              counterparts=faults, terminal=effects.terminal(effect)))
+                              counterparts=faults, terminal=effects.terminal(effect),
+                              effect_layer=point_layer(effect.point, upstream)))
     return edges

@@ -1,18 +1,23 @@
+import subprocess
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from typing import Final
 
 from faultpoint.observations import ObservationRecord, read_records
 from faultpoint.rules import Rule, RuleSet
 from faultpoint.tools.analysis import Comparison, Effect, Selection, compare
 from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, Field
-from shop.deployment import SCOPE_KEY, STATUSES_FILE, Statuses, repetition
+from shop.deployment import REFUSAL_FILE, SCOPE_KEY, STATUSES_FILE, Statuses, refusal, repetition
 from shop.workload import Workload
 
 from faultsearch.catalog import FROZEN, Fault
 from faultsearch.store import CONTROLS, LEAKS, TREATMENTS, Store
+
+UNSCOPED: Final = ""
+"""The scope of observations no request baggage reached, such as the kernel's."""
 
 
 class RunSettings(BaseModel):
@@ -24,6 +29,9 @@ class RunSettings(BaseModel):
     alpha: float
     min_mean_increase: float
     workers: int = Field(ge=1)
+    pack_tenants: bool = True
+    """Whether faults share repetitions in different tenants; off when upstream components are observed, since no
+    tenant scope separates their observations."""
 
 
 class NamedWorkload(BaseModel):
@@ -57,6 +65,8 @@ class TreatmentRecord(BaseModel):
     effects: tuple[Effect, ...]
     leakage: dict[str, tuple[Effect, ...]]
     """The effects the untreated tenants of the same repetitions showed, by tenant."""
+    refusal: str | None = None
+    """What a service said when it refused the fault's rule, which then never ran."""
 
     @property
     def exercised(self) -> bool:
@@ -80,16 +90,22 @@ class Group(BaseModel):
     def labels(self, repetitions: int) -> list[str]:
         return [f"{self.workload.name}.{self.digest}.{index}" for index in range(repetitions)]
 
+    @property
+    def scoped(self) -> bool:
+        return all(fault.scoped for fault in self.faults)
+
     def tenants(self) -> list[str]:
-        """Every other tenant, since the load interleaves the tenants and a fault can break the request after its own."""
+        """Every other tenant, since the load interleaves the tenants and a fault can break the request after its own;
+        a fault no rule can scope reaches every tenant, and the first stands for them."""
         return self.workload.workload.tenant_names()[::2][:len(self.faults)]
 
     def untreated(self) -> list[str]:
-        return [tenant for tenant in self.workload.workload.tenant_names() if tenant not in self.tenants()]
+        return [tenant for tenant in self.workload.workload.tenant_names() if self.scoped and tenant not in self.tenants()]
 
     def ruleset(self, label: str) -> RuleSet:
         return RuleSet(experiment=label, rules=tuple(
-            Rule(id=fault.digest, point=fault.point, action=fault.action, scope={SCOPE_KEY: tenant})
+            Rule(id=fault.digest, point=fault.point, action=fault.action,
+                 scope={SCOPE_KEY: tenant} if fault.scoped else {})
             for fault, tenant in zip(self.faults, self.tenants(), strict=True)))
 
 
@@ -112,7 +128,8 @@ def control_labels(workload: NamedWorkload, repetitions: int) -> list[str]:
 
 def pack(pairs: list[tuple[Fault, NamedWorkload]]) -> list[Group]:
     """Groups of faults of one workload that share repetitions; a delay runs alone, since it acts through what the
-    tenants share (a connection, a lock, an event loop, the sequential load) and so leaks by construction."""
+    tenants share (a connection, a lock, an event loop, the sequential load) and so leaks by construction, and so
+    does a fault no rule can scope to a tenant."""
     by_workload: dict[str, list[Fault]] = defaultdict(list)
     workloads = {workload.name: workload for _, workload in pairs}
     for fault, workload in pairs:
@@ -121,8 +138,8 @@ def pack(pairs: list[tuple[Fault, NamedWorkload]]) -> list[Group]:
     for name, faults in by_workload.items():
         workload = workloads[name]
         capacity = workload.workload.tenants // 2
-        shared = [fault for fault in faults if not fault.delays]
-        groups += [Group(workload=workload, faults=(fault,)) for fault in faults if fault.delays]
+        shared = [fault for fault in faults if not fault.delays and fault.scoped]
+        groups += [Group(workload=workload, faults=(fault,)) for fault in faults if fault.delays or not fault.scoped]
         groups += [Group(workload=workload, faults=tuple(shared[start:start + capacity]))
                    for start in range(0, len(shared), capacity)]
     return groups
@@ -148,7 +165,8 @@ class Runner:
 
     def repeat(self, jobs: list[tuple[str, Workload, RuleSet]]) -> None:
         """Run the repetitions not run before."""
-        pending = [job for job in jobs if not (self.store.repetition(job[0]) / STATUSES_FILE).exists()]
+        pending = [job for job in jobs if not (self.store.repetition(job[0]) / STATUSES_FILE).exists()
+                   and not (self.store.repetition(job[0]) / REFUSAL_FILE).exists()]
         for _, _, ruleset in pending:
             violations = self.kinds.violations(ruleset)
             if violations:
@@ -158,8 +176,18 @@ class Runner:
                 print(label, statuses.tenants, flush=True)
 
     def repetition(self, job: tuple[str, Workload, RuleSet]) -> Statuses:
+        """One repetition; a service refusing a rule ends it, which is recorded so that the fault counts as never
+        exercised instead of stopping the experiment."""
         label, workload, ruleset = job
-        return repetition(self.store.repetition(label), workload, ruleset.model_dump(mode="json"), self.settings.sdk)
+        directory = self.store.repetition(label)
+        try:
+            return repetition(directory, workload, ruleset.model_dump(mode="json"), self.settings.sdk)
+        except subprocess.CalledProcessError:
+            reason = refusal(directory)
+            if reason is None:
+                raise
+            (directory / REFUSAL_FILE).write_text(reason)
+            return Statuses(tenants={})
 
     def controls(self, workloads: list[NamedWorkload]) -> list[ControlRecord]:
         missing = [workload for workload in workloads if not self.store.has(CONTROLS, f"{workload.name}.json")]
@@ -179,20 +207,34 @@ class Runner:
                        self.settings.alpha, self.settings.min_mean_increase)
 
     def group_records(self, group: Group) -> list[TreatmentRecord]:
+        """A record per fault: its tenant's comparison and, for a fault alone in its repetitions, the comparison of
+        what no tenant scope covers, such as the kernel's view of the upstream components."""
         control = self.controls([group.workload])[0].labels
         labels = group.labels(self.settings.repetitions)
+        refusals = [(self.store.repetition(label) / REFUSAL_FILE).read_text() for label in labels
+                    if (self.store.repetition(label) / REFUSAL_FILE).exists()]
+        if refusals:
+            return [TreatmentRecord(fault=fault, workload=group.workload.name, tenant=tenant, labels=tuple(labels),
+                                    packed_with=tuple(other.key for other in group.faults if other != fault),
+                                    injected=tuple(0 for _ in labels), statuses=tuple({} for _ in labels), effects=(),
+                                    leakage={}, refusal=refusals[0])
+                    for fault, tenant in zip(group.faults, group.tenants(), strict=True)]
         leakage = {tenant: effects for tenant in group.untreated()
                    if (effects := self.comparison(control, labels, tenant).effects)}
+        unscoped = self.comparison(control, labels, UNSCOPED)
         records = []
         for fault, tenant in zip(group.faults, group.tenants(), strict=True):
             comparison = self.comparison(control, labels, tenant)
-            injected = [sum(injection.counts[index] for injection in comparison.injections
+            injected = [sum(injection.counts[index] for injection in (*comparison.injections, *unscoped.injections)
                             if injection.rule == fault.digest) for index in range(len(labels))]
+            shown = {(effect.point, effect.outcome, effect.metric) for effect in comparison.effects}
+            beyond = tuple(effect for effect in unscoped.effects if len(group.faults) == 1
+                           and (effect.point, effect.outcome, effect.metric) not in shown)
             records.append(TreatmentRecord(
                 fault=fault, workload=group.workload.name, tenant=tenant, labels=tuple(labels),
                 packed_with=tuple(other.key for other in group.faults if other != fault), injected=tuple(injected),
                 statuses=tuple(self.statuses(label).tenants[tenant] for label in labels),
-                effects=comparison.effects, leakage=leakage))
+                effects=(*comparison.effects, *beyond), leakage=leakage))
         return records
 
     def run_groups(self, groups: list[Group]) -> list[Group]:
@@ -223,7 +265,10 @@ class Runner:
                 if not self.store.has(TREATMENTS, name, f"{digest}.json")]
 
     def treatments(self, pairs: list[tuple[Fault, NamedWorkload]]) -> list[TreatmentRecord]:
-        """The records of faults in workloads, packing faults that do not delay into shared repetitions."""
+        """The records of faults in workloads, packing faults that do not delay into shared repetitions when the
+        settings allow it."""
+        if not self.settings.pack_tenants:
+            return self.isolated_treatments(pairs)
         leaking = self.run_groups(pack(self.missing(pairs)))
         self.run_groups([Group(workload=group.workload, faults=(fault,)) for group in leaking for fault in group.faults])
         return self.recorded(pairs)

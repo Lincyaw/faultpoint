@@ -3,11 +3,12 @@ from typing import Annotated
 
 import typer
 from shop.deployment import MANIFESTS, build, verified_build
+from shop.upstream import PACKET_POINTS, UPSTREAM_SERVICES
 from shop.workload import Scenarios
 
 from faultsearch.allocation import (Allocation, AllocationSettings, Exploration, Strategy, phased_allocation,
                                     random_allocation)
-from faultsearch.catalog import ActionTable, Catalog, build_catalog, tenant_executions
+from faultsearch.catalog import ActionTable, Catalog, build_catalog, control_executions
 from faultsearch.chains import Stitching, stitch
 from faultsearch.counterfactual import NamedWorkload, Runner, RunSettings, treatment_record
 from faultsearch.edges import EdgeSet, EffectMap, build_edges
@@ -36,14 +37,16 @@ def recorded_runner(store: Store) -> Runner:
 
 
 def scenario_catalog(store: Store, runner: Runner, scenarios: Scenarios) -> Catalog:
-    """The catalog over the points of the manifests and of every scenario's controls."""
+    """The catalog over the points of the manifests, of every scenario's controls and of the deployment's
+    configuration."""
     controls = runner.controls([NamedWorkload(name=scenario.name, workload=scenarios.workload(scenario.name))
                                 for scenario in scenarios.scenarios])
-    executions = {control.workload.name: tenant_executions(
+    executions = {control.workload.name: control_executions(
         [record for label in control.labels for record in runner.observations(label)], len(control.labels),
-        control.workload.workload.tenants) for control in controls}
+        control.workload.workload.tenants, runner.kinds) for control in controls}
     actions = store.record_input(ActionTable.read(), INPUTS, ACTIONS_INPUT)
-    return store.record_input(build_catalog(MANIFESTS, executions, actions), CATALOG)
+    return store.record_input(build_catalog(MANIFESTS, executions, list(PACKET_POINTS), actions, runner.kinds,
+                                            UPSTREAM_SERVICES), CATALOG)
 
 
 @app.command()
@@ -60,6 +63,9 @@ def explore(experiment: Experiment,
             cluster_distance: float = 0.5,
             epsilon: float = 0.05,
             batch: int = 18,
+            pack_tenants: Annotated[bool, typer.Option(
+                help="Let faults share repetitions in different tenants; off when upstream components are "
+                     "observed.")] = True,
             rebuild: Annotated[bool, typer.Option(help="Build the SDK and the shop first.")] = False) -> None:
     """Run the controls of every scenario, build the fault catalog, and spend the budget with one strategy."""
     store = Store(experiment)
@@ -67,7 +73,7 @@ def explore(experiment: Experiment,
     commit = build(sdk) if rebuild else verified_build(sdk)
     runner = Runner(store, store.record_input(RunSettings(
         sdk=sdk, commit=commit, repetitions=repetitions, alpha=alpha, min_mean_increase=min_mean_increase,
-        workers=workers), RUN_SETTINGS))
+        workers=workers, pack_tenants=pack_tenants), RUN_SETTINGS))
     settings = store.record_input(AllocationSettings(
         budget=budget, seed=seed, round_robin_share=round_robin_share, cluster_distance=cluster_distance,
         epsilon=epsilon, batch=batch), ALLOCATION_SETTINGS)
@@ -90,7 +96,8 @@ def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
     allocation = store.load(Allocation, allocation_file(strategy))
     records = [treatment_record(store, assignment.fault, assignment.scenario) for assignment in allocation.assignments]
     edges = build_edges(records, recorded_scenarios(store),
-                        store.record_input(EffectMap.read(), INPUTS, EFFECTS_INPUT), store.load(Catalog, CATALOG))
+                        store.record_input(EffectMap.read(), INPUTS, EFFECTS_INPUT), store.load(Catalog, CATALOG),
+                        UPSTREAM_SERVICES)
     store.save(EdgeSet(strategy=strategy, edges=tuple(edges)), edges_file(strategy))
     stitching = stitch(edges, allocation, records, width, max_hops, kept)
     store.save(stitching, chains_file(strategy))
@@ -102,13 +109,16 @@ def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
 def validate_command(experiment: Experiment,
                      stitched_only: Annotated[int, typer.Option(help="Best chains that exist only by stitching.")] = 10,
                      single_scenario: Annotated[int, typer.Option(help="Best chains one scenario showed.")] = 3,
+                     cross_layer: Annotated[int, typer.Option(
+                         help="Best stitched-only chains across layers, besides those chosen already.")] = 0,
                      chain: Annotated[list[str], typer.Option(help="A chain to validate besides, by its key.")] = []
                      ) -> None:
     """Inject only the first fault of the best chains of the phased allocation in the workload their conditions
     merge into."""
     store = Store(experiment)
     stitching = store.load(Stitching, chains_file(Strategy.PHASED))
-    validations = validate(recorded_runner(store), selected(stitching, stitched_only, single_scenario, chain),
+    validations = validate(recorded_runner(store),
+                           selected(stitching, stitched_only, single_scenario, cross_layer, chain),
                            recorded_scenarios(store))
     store.save(validations, VALIDATIONS)
     for validation in validations.validations:

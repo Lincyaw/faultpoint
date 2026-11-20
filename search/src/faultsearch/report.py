@@ -5,8 +5,8 @@ from faultpoint.tools.analysis import Metric
 from pydantic import BaseModel
 
 from faultsearch.allocation import Allocation, Strategy
-from faultsearch.catalog import FROZEN, Catalog, Exclusion
-from faultsearch.chains import Stitching
+from faultsearch.catalog import FROZEN, Catalog, Exclusion, Layer
+from faultsearch.chains import LAYER_PATH_SEPARATOR, Chain, Stitching
 from faultsearch.edges import Counterpart, Edge, EdgeSet, EffectKey, EffectMap
 from faultsearch.counterfactual import ControlRecord, Leak, RunSettings, TreatmentRecord, treatment_record
 from faultsearch.store import (CATALOG, CONTROLS, EFFECTS_INPUT, INPUTS, LEAKS, REPETITIONS, RUN_SETTINGS,
@@ -14,6 +14,7 @@ from faultsearch.store import (CATALOG, CONTROLS, EFFECTS_INPUT, INPUTS, LEAKS, 
 from faultsearch.validation import VALIDATION_PREFIX, Selection, Validations
 
 EXAMPLES_PER_CONDITION: Final = 2
+CROSS_LAYER_SHOWN: Final = 15
 QUERY_SEPARATOR: Final = " => "
 
 
@@ -31,24 +32,41 @@ class StrategySummary(BaseModel):
     tested_once: int
     """Edges whose fault was tested in one scenario only, so that nothing tells whether they are conditional."""
     counterparts: dict[str, int]
+    edge_layers: dict[str, int]
+    """Edges by the layer of their fault and of their effect."""
     chains: int
     stitched_only: int
     single_scenario: int
     cycles: int
+    layer_paths: dict[str, int]
+    stitched_layer_paths: dict[str, int]
 
 
 class ValidationSummary(BaseModel):
     model_config = FROZEN
 
     chain: str
+    layer_path: str
     selection: Selection
     workload: str
     stitched_only: bool
     exercised: bool
     hops: tuple[bool, ...]
     confirmed: bool
-    random_has_edges: bool
-    random_has_chain: bool
+    random_has_edges: bool | None
+    """Whether the random allocation found every edge of the chain; absent when it did not run."""
+    random_has_chain: bool | None
+
+
+class LayerEffect(BaseModel):
+    """An effect at a layer below the business code, which the business points alone would never show."""
+
+    model_config = FROZEN
+
+    effect: str
+    layer: Layer
+    causes: dict[str, int]
+    """The faults that caused it, counted by their layer."""
 
 
 class EdgeComparison(BaseModel):
@@ -96,8 +114,11 @@ class Summary(BaseModel):
     repetitions: dict[str, int]
     strategies: tuple[StrategySummary, ...]
     conditional_examples: tuple[Edge, ...]
+    cross_layer_chains: tuple[Chain, ...]
+    layer_effects: tuple[LayerEffect, ...]
     validations: tuple[ValidationSummary, ...]
-    edges: EdgeComparison
+    edges: EdgeComparison | None
+    """Absent when the random allocation did not run."""
     single: SingleScenarioView
     lookups: tuple[EdgeLookup, ...]
 
@@ -126,9 +147,21 @@ def strategy_summary(allocation: Allocation, records: list[TreatmentRecord], edg
         cluster_sizes=tuple(sorted((len(cluster.members) for cluster in allocation.clusters), reverse=True)),
         edges=len(edges.edges), conditional=sum(bool(edge.not_held) for edge in edges.edges),
         tested_once=sum(tested[edge.cause.key] == 1 for edge in edges.edges),
-        counterparts=dict(Counter(edge.counterpart.value for edge in edges.edges)), chains=stitching.chains,
-        stitched_only=stitching.stitched_only, single_scenario=stitching.single_scenario,
-        cycles=len(stitching.cycles))
+        counterparts=dict(Counter(edge.counterpart.value for edge in edges.edges)),
+        edge_layers=dict(Counter(f"{edge.cause.layer}{LAYER_PATH_SEPARATOR}{edge.effect_layer}" for edge in edges.edges)),
+        chains=stitching.chains, stitched_only=stitching.stitched_only, single_scenario=stitching.single_scenario,
+        cycles=len(stitching.cycles), layer_paths=stitching.layer_paths,
+        stitched_layer_paths=stitching.stitched_layer_paths)
+
+
+def layer_effects(edges: EdgeSet) -> tuple[LayerEffect, ...]:
+    """The effects at the library and upstream layers, those with the most causes first."""
+    causes: dict[tuple[str, Layer], Counter[str]] = defaultdict(Counter)
+    for edge in edges.edges:
+        if edge.effect_layer in (Layer.LIBRARY, Layer.UPSTREAM):
+            causes[(edge.effect.key, edge.effect_layer)][edge.cause.layer] += 1
+    return tuple(LayerEffect(effect=effect, layer=layer, causes=dict(counted))
+                 for (effect, layer), counted in sorted(causes.items(), key=lambda item: -item[1].total()))
 
 
 def edge_comparison(edges: dict[Strategy, EdgeSet], stitchings: dict[Strategy, Stitching]) -> EdgeComparison:
@@ -156,16 +189,19 @@ def single_scenario_view(records: list[TreatmentRecord], stitching: Stitching,
                               stitched=len(stitched), beyond_single=len(stitched - union))
 
 
-def validation_summaries(validations: Validations, edges: EdgeSet, stitching: Stitching) -> list[ValidationSummary]:
-    keys = {edge.key for edge in edges.edges}
-    chains = set(stitching.keys)
+def validation_summaries(validations: Validations, random_edges: EdgeSet | None,
+                         random_stitching: Stitching | None) -> list[ValidationSummary]:
+    keys = None if random_edges is None else {edge.key for edge in random_edges.edges}
+    chains = None if random_stitching is None else set(random_stitching.keys)
     return [ValidationSummary(
-        chain=validation.chain.key, selection=validation.selection, workload=validation.workload.name,
-        stitched_only=validation.chain.stitched_only,
+        chain=validation.chain.key, layer_path=validation.chain.layer_path, selection=validation.selection,
+        workload=validation.workload.name, stitched_only=validation.chain.stitched_only,
         exercised=validation.record.exercised, hops=tuple(hop.confirmed for hop in validation.hops),
         confirmed=validation.confirmed,
-        random_has_edges=all(f"[{hop.cause.key}] {hop.effect.key}" in keys for hop in validation.chain.hops),
-        random_has_chain=validation.chain.key in chains) for validation in validations.validations]
+        random_has_edges=None if keys is None else all(f"[{hop.cause.key}] {hop.effect.key}" in keys
+                                                       for hop in validation.chain.hops),
+        random_has_chain=None if chains is None else validation.chain.key in chains)
+        for validation in validations.validations]
 
 
 def conditional_examples(edges: EdgeSet) -> tuple[Edge, ...]:
@@ -181,22 +217,26 @@ def conditional_examples(edges: EdgeSet) -> tuple[Edge, ...]:
 
 
 def summarise(store: Store, queries: list[str]) -> Summary:
+    """The summary of the strategies that ran, the phased allocation always among them."""
     catalog = store.load(Catalog, CATALOG)
     settings = store.load(RunSettings, RUN_SETTINGS)
-    allocations = {strategy: store.load(Allocation, allocation_file(strategy)) for strategy in Strategy}
+    strategies = [strategy for strategy in Strategy if store.has(allocation_file(strategy))]
+    allocations = {strategy: store.load(Allocation, allocation_file(strategy)) for strategy in strategies}
     records = {strategy: [treatment_record(store, assignment.fault, assignment.scenario)
                           for assignment in allocation.assignments] for strategy, allocation in allocations.items()}
-    edges = {strategy: store.load(EdgeSet, edges_file(strategy)) for strategy in Strategy}
-    stitchings = {strategy: store.load(Stitching, chains_file(strategy)) for strategy in Strategy}
+    edges = {strategy: store.load(EdgeSet, edges_file(strategy)) for strategy in strategies}
+    stitchings = {strategy: store.load(Stitching, chains_file(strategy)) for strategy in strategies}
     return Summary(
         commit=settings.commit, settings=settings, faults=len(catalog.faults), points=len(catalog.uses),
         excluded=catalog.excluded, repetitions=repetition_counts(store, settings.repetitions),
         strategies=tuple(strategy_summary(allocations[strategy], records[strategy], edges[strategy],
-                                          stitchings[strategy]) for strategy in Strategy),
+                                          stitchings[strategy]) for strategy in strategies),
         conditional_examples=conditional_examples(edges[Strategy.PHASED]),
-        validations=tuple(validation_summaries(store.load(Validations, VALIDATIONS), edges[Strategy.RANDOM],
-                                               stitchings[Strategy.RANDOM])),
-        edges=edge_comparison(edges, stitchings),
+        cross_layer_chains=stitchings[Strategy.PHASED].top_cross_layer[:CROSS_LAYER_SHOWN],
+        layer_effects=layer_effects(edges[Strategy.PHASED]),
+        validations=tuple(validation_summaries(store.load(Validations, VALIDATIONS), edges.get(Strategy.RANDOM),
+                                               stitchings.get(Strategy.RANDOM))),
+        edges=edge_comparison(edges, stitchings) if Strategy.RANDOM in strategies else None,
         single=single_scenario_view(records[Strategy.PHASED], stitchings[Strategy.PHASED],
                                     store.load(EffectMap, INPUTS, EFFECTS_INPUT)),
         lookups=tuple(EdgeLookup(query=query, found={
@@ -221,16 +261,23 @@ def render(summary: Summary) -> str:
                   f"  edges {strategy.edges}: {strategy.conditional} conditional, "
                   f"{strategy.edges - strategy.conditional} unconditional ({strategy.tested_once} of a fault tested "
                   f"in one scenario); counterparts {strategy.counterparts}",
+                  f"  edges by layer {strategy.edge_layers}",
                   f"  chains {strategy.chains}: {strategy.stitched_only} stitched only, {strategy.single_scenario} "
-                  f"shown end to end by one scenario; cycles {strategy.cycles}"]
+                  f"shown end to end by one scenario; cycles {strategy.cycles}",
+                  f"  stitched-only chains by layer path {strategy.stitched_layer_paths}"]
     lines += ["conditional edges:", *(f"  {edge.key} | held {sorted(edge.held_in)} not {list(edge.not_held)} | "
                                        f"condition {condition_text(edge)}" for edge in summary.conditional_examples)]
+    lines += ["chains across layers:", *(f"  {'stitched-only' if chain.stitched_only else 'single-scenario'} "
+                                         f"{chain.layer_path} | {chain.condition}\n    {chain.key}"
+                                         for chain in summary.cross_layer_chains)]
+    lines += ["effects below the business layer:", *(f"  {item.layer} {item.effect} caused by {item.causes}"
+                                                      for item in summary.layer_effects)]
     lines += ["validations:", *(f"  {'confirmed' if item.confirmed else 'refuted'} {item.selection} "
                                 f"{'stitched-only' if item.stitched_only else 'single-scenario'} in {item.workload} "
-                                f"hops {''.join('+' if hop else '-' for hop in item.hops)} random edges "
-                                f"{item.random_has_edges} chain {item.random_has_chain}\n    {item.chain}"
+                                f"hops {''.join('+' if hop else '-' for hop in item.hops)} layers {item.layer_path} "
+                                f"random edges {item.random_has_edges} chain {item.random_has_chain}\n    {item.chain}"
                                 for item in summary.validations)]
-    lines += [f"edges phased vs random: {summary.edges.model_dump()}",
+    lines += [f"edges phased vs random: {None if summary.edges is None else summary.edges.model_dump()}",
               f"single scenarios: {summary.single.model_dump()}"]
     lines += [f"lookup {lookup.query}: " + "; ".join(
         f"{strategy} " + (" ".join(f"held {sorted(edge.held_in)} not {list(edge.not_held)} condition "

@@ -1,12 +1,16 @@
-from collections import defaultdict
+from collections import Counter, defaultdict
 from statistics import fmean
+from typing import Final
 
 from pydantic import BaseModel
 
 from faultsearch.allocation import Allocation, Strategy
-from faultsearch.catalog import FROZEN, Fault, point_service
-from faultsearch.edges import Condition, Edge, EffectKey
+from faultsearch.catalog import FROZEN, Fault, Layer, point_service
 from faultsearch.counterfactual import TreatmentRecord
+from faultsearch.edges import Condition, Edge, EffectKey
+
+LAYER_PATH_SEPARATOR: Final = " > "
+CROSS_LAYER_KEPT: Final = 300
 
 
 class Hop(BaseModel):
@@ -16,6 +20,7 @@ class Hop(BaseModel):
     effect: EffectKey
     held: tuple[str, ...]
     cluster: int
+    effect_layer: Layer
 
 
 class Chain(BaseModel):
@@ -44,6 +49,19 @@ class Chain(BaseModel):
     @property
     def key(self) -> str:
         return " -> ".join(f"[{hop.cause.key}] {hop.effect.key}" for hop in self.hops)
+
+    @property
+    def layers(self) -> tuple[Layer, ...]:
+        """The layer of every hop's fault, then of the last effect."""
+        return *(hop.cause.layer for hop in self.hops), self.hops[-1].effect_layer
+
+    @property
+    def layer_path(self) -> str:
+        return LAYER_PATH_SEPARATOR.join(self.layers)
+
+    @property
+    def crosses_layers(self) -> bool:
+        return len(set(self.layers)) > 1
 
     def rank(self) -> tuple[bool, int, bool, bool, float]:
         return self.several_scenarios, len(self.services), self.terminal, self.novel, self.similarity
@@ -88,7 +106,13 @@ class Stitching(BaseModel):
     """The distinct (first fault, failure the user sees) pairs of the stitched-only chains."""
     keys: tuple[str, ...]
     """Every chain found, best ranked first."""
+    layer_paths: dict[str, int]
+    """How many chains follow each sequence of layers."""
+    stitched_layer_paths: dict[str, int]
+    """How many of the stitched-only chains follow each sequence of layers."""
     top: tuple[Chain, ...]
+    top_cross_layer: tuple[Chain, ...]
+    """The best ranked chains whose hops lie in more than one layer and that end in a failure the user sees."""
     cycles: tuple[Chain, ...]
 
 
@@ -143,7 +167,8 @@ def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[Tre
         effects = {edge.effect.key for edge in trail.edges}
         chains.append(Chain(
             hops=tuple(Hop(cause=edge.cause, effect=edge.effect, held=tuple(sorted(edge.held_in)),
-                           cluster=allocation.cluster_of[edge.cause.key].number) for edge in trail.edges),
+                           cluster=allocation.cluster_of[edge.cause.key].number, effect_layer=edge.effect_layer)
+                       for edge in trail.edges),
             condition=trail.conditions[0], several_scenarios=trail.several_scenarios(), services=trail.services(),
             terminal=trail.edges[-1].terminal, novel=clusters not in seen, similarity=trail.similarity(allocation),
             end_to_end=tuple(sorted(scenario for scenario, shown_effects in shown[trail.edges[0].cause.key]
@@ -162,5 +187,10 @@ def stitch(edges: list[Edge], allocation: Allocation, records: list[TreatmentRec
                      single_scenario=len(chains) - stitched_only, terminal_stitched_only=len(terminal),
                      stitched_terminal_pairs=tuple(sorted({(chain.hops[0].cause.key, chain.hops[-1].effect.key)
                                                            for chain in terminal})),
-                     keys=tuple(chain.key for chain in chains), top=tuple(chains[:kept]),
+                     keys=tuple(chain.key for chain in chains),
+                     layer_paths=dict(Counter(chain.layer_path for chain in chains)),
+                     stitched_layer_paths=dict(Counter(chain.layer_path for chain in chains if chain.stitched_only)),
+                     top=tuple(chains[:kept]),
+                     top_cross_layer=tuple([chain for chain in chains
+                                            if chain.crosses_layers and chain.terminal][:CROSS_LAYER_KEPT]),
                      cycles=tuple(ranked_chains(cycle_trails, allocation, records)))

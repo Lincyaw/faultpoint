@@ -19,6 +19,13 @@
       {"kind": "drop"},
       {"kind": "duplicate"},
       {"kind": "delay", "ms": 500}
-    ]
+    ],
+    "syscall": [{"kind": "fail", "error": "EIO"}],
+    "packet": [{"kind": "delay", "ms": 500}]
+  },
+  "library": {
+    "branch": [{"kind": "fail"}],
+    "call": [{"kind": "fail"}],
+    "check": [{"kind": "negate"}]
   }
 }
