@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"faultpoint"
-	"faultpoint/fpaction"
+	"faultpoint/internal/action"
 
 	"github.com/felixge/httpsnoop"
 	"go.opentelemetry.io/otel/propagation"
@@ -88,7 +88,7 @@ func Take(request *http.Request) *ServerCall {
 		point: faultpoint.PointID(faultpoint.Service(), "rpc_server", request.Method+" "+pathTemplate(request.URL.Path))}
 	call.Rule = faultpoint.Decide(ctx, call.point)
 	if call.Rule != nil {
-		fpaction.Hold(call.Rule)
+		action.Hold(call.Rule)
 	}
 	return call
 }
@@ -184,9 +184,9 @@ func errorOutcome(err error) string {
 	var netError net.Error
 	switch {
 	case errors.As(err, &netError) && netError.Timeout():
-		return fpaction.Timeout
+		return action.Timeout
 	case errors.Is(err, syscall.ECONNREFUSED):
-		return fpaction.Refused
+		return action.Refused
 	}
 	return "error"
 }
@@ -204,12 +204,12 @@ func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, erro
 	params := struct {
 		Status int    `json:"status"`
 		Error  string `json:"error"`
-	}{Error: fpaction.Timeout}
+	}{Error: action.Timeout}
 	rule.DecodeParams(&params)
 	if params.Status != 0 {
 		return syntheticResponse(request, params.Status), nil
 	}
-	return nil, fpaction.PeerError(rule, params.Error)
+	return nil, action.PeerError(rule, params.Error)
 }
 
 // RoundTrip sends a request under the rule of its point.
@@ -225,12 +225,12 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 		request.Method+" "+request.URL.Host+pathTemplate(request.URL.Path))
 	rule := faultpoint.Decide(ctx, point)
 	started := time.Now()
-	action := ""
+	kind := ""
 	if rule != nil {
-		fpaction.Hold(rule)
-		action = rule.Action.Kind
+		action.Hold(rule)
+		kind = rule.Action.Kind
 	}
-	if action == "duplicate" && request.Body != nil && request.GetBody == nil {
+	if kind == "duplicate" && request.Body != nil && request.GetBody == nil {
 		body, err := io.ReadAll(request.Body)
 		if err != nil {
 			return nil, err
@@ -240,22 +240,22 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	}
 	var response *http.Response
 	var err error
-	if action == "fail" {
+	if kind == "fail" {
 		response, err = failure(request, rule)
 	} else {
 		response, err = base.RoundTrip(request)
 	}
-	if err == nil && (action == "duplicate" || action == "fail_after") {
+	if err == nil && (kind == "duplicate" || kind == "fail_after") {
 		io.Copy(io.Discard, response.Body)
 		response.Body.Close()
 	}
-	if err == nil && action == "duplicate" && request.GetBody != nil {
+	if err == nil && kind == "duplicate" && request.GetBody != nil {
 		request.Body, err = request.GetBody()
 	}
-	if err == nil && action == "duplicate" {
+	if err == nil && kind == "duplicate" {
 		response, err = base.RoundTrip(request)
 	}
-	if err == nil && action == "fail_after" {
+	if err == nil && kind == "fail_after" {
 		response, err = failure(request, rule)
 	}
 	if err != nil {

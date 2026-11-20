@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"faultpoint"
-	"faultpoint/fpaction"
-	"faultpoint/sqlpoint"
+	"faultpoint/internal/action"
+	"faultpoint/internal/sqlpoint"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -57,7 +57,7 @@ func decide(ctx context.Context, query string) statement {
 		point: faultpoint.PointID(faultpoint.Service(), known.Kind, known.Locator)}
 	s.rule = faultpoint.Decide(ctx, s.point)
 	if s.rule != nil {
-		fpaction.Hold(s.rule)
+		action.Hold(s.rule)
 		s.action = s.rule.Action.Kind
 	}
 	return s
@@ -66,9 +66,9 @@ func decide(ctx context.Context, query string) statement {
 // refuse ends the process for an action this call cannot perform, such as dropping a statement whose rows the
 // caller reads.
 func (s statement) refuse(call string, actions ...string) {
-	for _, action := range actions {
-		if s.action == action {
-			faultpoint.Abort("rule %s: %s cannot %s at %s", s.rule.ID, call, action, s.point)
+	for _, refused := range actions {
+		if s.action == refused {
+			faultpoint.Abort("rule %s: %s cannot %s at %s", s.rule.ID, call, refused, s.point)
 		}
 	}
 }
@@ -102,7 +102,7 @@ func Exec(db execer, ctx context.Context, sql string, arguments ...any) (pgconn.
 	var err error
 	switch s.action {
 	case "fail":
-		err = fpaction.Failure(s.rule)
+		err = action.Failure(s.rule)
 	case "drop":
 		tag = pgconn.NewCommandTag(s.command + " 1")
 	default:
@@ -112,7 +112,7 @@ func Exec(db execer, ctx context.Context, sql string, arguments ...any) (pgconn.
 		tag, err = run()
 	}
 	if err == nil && s.action == "fail_after" {
-		tag, err = pgconn.CommandTag{}, fpaction.Failure(s.rule)
+		tag, err = pgconn.CommandTag{}, action.Failure(s.rule)
 	}
 	if err == nil && s.action == "empty" {
 		tag = pgconn.NewCommandTag(s.command + " 0")
@@ -133,7 +133,7 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 	s := decide(ctx, sql)
 	s.refuse("Query", "drop")
 	if s.action == "fail" {
-		err := fpaction.Failure(s.rule)
+		err := action.Failure(s.rule)
 		s.observe(0, err)
 		return failedRows{err: err}, err
 	}
@@ -146,7 +146,7 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 		rows, err = db.Query(s.inner, sql, arguments...)
 	}
 	if err == nil && s.action == "fail_after" {
-		err = fpaction.Failure(s.rule)
+		err = action.Failure(s.rule)
 		rows = failedRows{err: err}
 	}
 	if err != nil {
@@ -222,7 +222,7 @@ func (r *observedRow) Scan(dest ...any) error {
 	s := r.statement
 	var err error
 	if s.action == "fail" {
-		err = fpaction.Failure(s.rule)
+		err = action.Failure(s.rule)
 	} else {
 		err = r.row.Scan(dest...)
 	}
@@ -230,7 +230,7 @@ func (r *observedRow) Scan(dest ...any) error {
 		err = r.query().Scan(dest...)
 	}
 	if err == nil && s.action == "fail_after" {
-		err = fpaction.Failure(s.rule)
+		err = action.Failure(s.rule)
 	}
 	if err == nil && s.action == "empty" {
 		err = pgx.ErrNoRows
@@ -265,7 +265,7 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 	var err error
 	var results pgx.BatchResults
 	if s.action == "fail" {
-		err = fpaction.Failure(s.rule)
+		err = action.Failure(s.rule)
 	} else {
 		results = db.SendBatch(s.inner, batch)
 	}
@@ -276,7 +276,7 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 		results = db.SendBatch(s.inner, batch)
 	}
 	if err == nil && s.action == "fail_after" {
-		err = fpaction.Failure(s.rule)
+		err = action.Failure(s.rule)
 	}
 	if err != nil {
 		s.observe(0, err)
@@ -328,7 +328,7 @@ func begin(ctx context.Context, run func(context.Context) (pgx.Tx, error)) (pgx.
 	var tx pgx.Tx
 	var err error
 	if s.action == "fail" {
-		err = fpaction.Failure(s.rule)
+		err = action.Failure(s.rule)
 	} else {
 		tx, err = run(s.inner)
 	}

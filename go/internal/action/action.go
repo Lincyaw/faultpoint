@@ -1,6 +1,6 @@
-// Package fpaction holds what every plugin does the same way: delay and crash, and the error of a peer that timed
-// out or refused the connection.
-package fpaction
+// Package action holds what every plugin does the same way: delay and crash, and the error of a peer that timed out
+// or refused the connection.
+package action
 
 import (
 	"context"

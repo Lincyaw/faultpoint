@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"faultpoint"
-	"faultpoint/fpaction"
+	"faultpoint/internal/action"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -118,7 +118,7 @@ func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 	c := call{ctx: ctx, command: known, point: faultpoint.PointID(faultpoint.Service(), known.Kind, locator)}
 	c.rule = faultpoint.Decide(ctx, c.point)
 	if c.rule != nil {
-		fpaction.Hold(c.rule)
+		action.Hold(c.rule)
 		c.action = c.rule.Action.Kind
 	}
 	if c.action == "empty" && known.Empty == "never" {
@@ -153,7 +153,7 @@ func (c call) block(cmd redis.Cmder) {
 func (c call) settle(cmd redis.Cmder, err error) error {
 	switch {
 	case c.action == "fail" || (err == nil && c.action == "fail_after"):
-		err = fpaction.Failure(c.rule)
+		err = action.Failure(c.rule)
 	case err == nil && c.action == "empty":
 		err = emptied(cmd, c.command.Empty)
 	}

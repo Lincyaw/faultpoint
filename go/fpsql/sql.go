@@ -11,8 +11,8 @@ import (
 	"sync"
 
 	"faultpoint"
-	"faultpoint/fpaction"
-	"faultpoint/sqlpoint"
+	"faultpoint/internal/action"
+	"faultpoint/internal/sqlpoint"
 
 	"github.com/ngrok/sqlmw"
 )
@@ -66,27 +66,27 @@ func begin(ctx context.Context, query string) (string, *faultpoint.Rule, string)
 	if rule == nil {
 		return point, nil, ""
 	}
-	fpaction.Hold(rule)
+	action.Hold(rule)
 	return point, rule, rule.Action.Kind
 }
 
 func exec(ctx context.Context, query string, run func() (driver.Result, error)) (driver.Result, error) {
-	point, rule, action := begin(ctx, query)
+	point, rule, kind := begin(ctx, query)
 	var result driver.Result
 	var err error
-	switch action {
+	switch kind {
 	case "fail":
-		err = fpaction.Failure(rule)
+		err = action.Failure(rule)
 	case "drop":
 		result = driver.RowsAffected(1)
 	default:
 		result, err = run()
 	}
-	if err == nil && action == "duplicate" {
+	if err == nil && kind == "duplicate" {
 		result, err = run()
 	}
-	if err == nil && action == "fail_after" {
-		err = fpaction.Failure(rule)
+	if err == nil && kind == "fail_after" {
+		err = action.Failure(rule)
 	}
 	if err != nil {
 		faultpoint.Observe(ctx, point, "error", 0, rule)
@@ -111,11 +111,11 @@ type query struct {
 }
 
 func read(ctx context.Context, sql string, run func() (driver.Rows, error)) (context.Context, driver.Rows, error) {
-	point, rule, action := begin(ctx, sql)
+	point, rule, kind := begin(ctx, sql)
 	var rows driver.Rows
 	var err error
-	if action == "fail" {
-		err = fpaction.Failure(rule)
+	if kind == "fail" {
+		err = action.Failure(rule)
 	} else {
 		rows, err = run()
 	}
@@ -123,7 +123,7 @@ func read(ctx context.Context, sql string, run func() (driver.Rows, error)) (con
 		faultpoint.Observe(ctx, point, "error", 0, rule)
 		return ctx, nil, err
 	}
-	return context.WithValue(ctx, queryKey{}, &query{point: point, rule: rule, empty: action == "empty"}), rows, nil
+	return context.WithValue(ctx, queryKey{}, &query{point: point, rule: rule, empty: kind == "empty"}), rows, nil
 }
 
 type interceptor struct{ sqlmw.NullInterceptor }

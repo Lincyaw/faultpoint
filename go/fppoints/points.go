@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"faultpoint"
-	"faultpoint/fpaction"
+	"faultpoint/internal/action"
 )
 
 var enabled = faultpoint.Register(faultpoint.Plugin{Name: "points", Actions: map[string][]string{
@@ -40,7 +40,7 @@ func Branch(ctx context.Context, point string, taken bool) bool {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		fpaction.Hold(rule)
+		action.Hold(rule)
 		taken = taken || rule.Action.Kind == "fail"
 	}
 	outcome := "not_taken"
@@ -59,7 +59,7 @@ func Failed(ctx context.Context, point string, err *error) bool {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		fpaction.Hold(rule)
+		action.Hold(rule)
 	}
 	if rule != nil && rule.Action.Kind == "fail" {
 		var params struct {
@@ -90,7 +90,7 @@ func Check(ctx context.Context, point string, result bool) bool {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		fpaction.Hold(rule)
+		action.Hold(rule)
 		result = result != (rule.Action.Kind == "negate")
 	}
 	outcome := "false"
@@ -108,7 +108,7 @@ func Loop(ctx context.Context, point string) {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		fpaction.Hold(rule)
+		action.Hold(rule)
 	}
 	faultpoint.Observe(ctx, point, "iteration", 0, rule)
 }
@@ -121,7 +121,7 @@ func Value[T any](ctx context.Context, point string, observed T) T {
 	rule := faultpoint.Decide(ctx, point)
 	result := observed
 	if rule != nil {
-		fpaction.Hold(rule)
+		action.Hold(rule)
 	}
 	if rule != nil && rule.Action.Kind == "set" {
 		var params struct {
@@ -179,7 +179,7 @@ func Clock(ctx context.Context, point string, reading time.Time) time.Time {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		fpaction.Hold(rule)
+		action.Hold(rule)
 	}
 	if rule != nil && rule.Action.Kind == "shift" {
 		var params struct {
@@ -199,7 +199,7 @@ func Acquire(ctx context.Context, point string, acquired bool) bool {
 	}
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
-		fpaction.Hold(rule)
+		action.Hold(rule)
 		acquired = acquired && rule.Action.Kind != "fail"
 	}
 	outcome := "rejected"
