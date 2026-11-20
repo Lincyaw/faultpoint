@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io/fs"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,9 +23,9 @@ type module struct {
 	prefix string
 }
 
-// localModules are the source module and the local modules its packages import: the modules of the go.work that
-// governs the source, and modules replaced by directories, as the go command resolves them.
-func localModules(source string) []module {
+// importGraph is every package the source's packages import, directly or not, with its module, as the go command
+// resolves them from the source.
+func importGraph(source string) []*packages.Package {
 	config := &packages.Config{Dir: source, Mode: packages.NeedName | packages.NeedModule | packages.NeedImports | packages.NeedDeps}
 	loaded, err := packages.Load(config, "./...")
 	if err != nil {
@@ -33,16 +34,25 @@ func localModules(source string) []module {
 	if packages.PrintErrors(loaded) > 0 {
 		os.Exit(1)
 	}
+	var graph []*packages.Package
+	packages.Visit(loaded, nil, func(pkg *packages.Package) { graph = append(graph, pkg) })
+	return graph
+}
+
+// local is whether a module is part of the source: a module of the go.work that governs it, or a module replaced
+// by a directory.
+func local(found *packages.Module) bool {
+	return found != nil && found.Dir != "" && (found.Main || (found.Replace != nil && found.Replace.Version == ""))
+}
+
+// localModules are the source module and the local modules of its import graph.
+func localModules(source string, graph []*packages.Package) []module {
 	modules := []module{{dir: source}}
-	packages.Visit(loaded, nil, func(pkg *packages.Package) {
-		found := pkg.Module
-		if found == nil || found.Dir == "" || (!found.Main && (found.Replace == nil || found.Replace.Version != "")) {
-			return
+	for _, pkg := range graph {
+		if local(pkg.Module) && !slices.ContainsFunc(modules, func(known module) bool { return known.dir == pkg.Module.Dir }) {
+			modules = append(modules, module{dir: pkg.Module.Dir, prefix: pkg.Module.Path + "/"})
 		}
-		if !slices.ContainsFunc(modules, func(known module) bool { return known.dir == found.Dir }) {
-			modules = append(modules, module{dir: found.Dir, prefix: found.Path + "/"})
-		}
-	})
+	}
 	return modules
 }
 
@@ -167,6 +177,42 @@ func writeWorkspace(original, target string, copies []string, sdk string) {
 	case !errors.Is(err, fs.ErrNotExist):
 		log.Fatal(err)
 	}
+}
+
+// addReplacements replaces dependency modules by directories in the go.work or go.mod that the copy builds with.
+func addReplacements(path string, replacements map[string]string) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var formatted []byte
+	if filepath.Base(path) == "go.work" {
+		work, err := modfile.ParseWork(path, content, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, replaced := range slices.Sorted(maps.Keys(replacements)) {
+			if err := work.AddReplace(replaced, "", replacements[replaced], ""); err != nil {
+				log.Fatal(err)
+			}
+		}
+		work.Cleanup()
+		formatted = modfile.Format(work.Syntax)
+	} else {
+		parsed, err := modfile.Parse(path, content, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, replaced := range slices.Sorted(maps.Keys(replacements)) {
+			if err := parsed.AddReplace(replaced, "", replacements[replaced], ""); err != nil {
+				log.Fatal(err)
+			}
+		}
+		if formatted, err = parsed.Format(); err != nil {
+			log.Fatal(err)
+		}
+	}
+	writeFile(path, formatted)
 }
 
 func goVersion(path string) string {

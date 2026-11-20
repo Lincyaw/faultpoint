@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"go/ast"
 	"go/format"
 	"io/fs"
 	"log"
@@ -64,11 +65,11 @@ func readConfig(path string) Config {
 	return config
 }
 
-// loadPackages loads the packages of a module as the go command resolves them from its directory.
-func loadPackages(dir string) []*packages.Package {
+// loadPackages loads packages with their syntax and types as the go command resolves them from a directory.
+func loadPackages(dir string, patterns ...string) []*packages.Package {
 	config := &packages.Config{Dir: dir, Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
-		packages.NeedTypes | packages.NeedTypesInfo}
-	loaded, err := packages.Load(config, "./...")
+		packages.NeedTypes | packages.NeedTypesInfo | packages.NeedModule}
+	loaded, err := packages.Load(config, patterns...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -114,6 +115,18 @@ type rewritten struct {
 	name string
 }
 
+// rewriteFile adds the imports a rewritten file now needs and prints it.
+func rewriteFile(pkg *packages.Package, file *ast.File, imports []string) []byte {
+	for _, imported := range imports {
+		astutil.AddImport(pkg.Fset, file, imported)
+	}
+	var content bytes.Buffer
+	if err := format.Node(&content, pkg.Fset, file); err != nil {
+		log.Fatal(err)
+	}
+	return content.Bytes()
+}
+
 // instrumentPackage writes the rewritten files of a package of a module into the module's copy, with its error
 // registry, and returns the points it placed and the plugin packages it now imports.
 func instrumentPackage(service string, source module, copied string, config Config, pkg *packages.Package) ([]PointEntry, []string) {
@@ -121,23 +134,18 @@ func instrumentPackage(service string, source module, copied string, config Conf
 	var used []string
 	for _, file := range pkg.Syntax {
 		relative := relativePath(source.dir, pkg.Fset.Position(file.Pos()).Filename)
-		points := placePoints(service, source.prefix+relative, config, pkg, file)
+		var points []PointEntry
+		if slices.Contains(config.Plugins, pointsPlugin) {
+			points = placePoints(service, source.prefix+relative, config.Placement, pkg, file)
+		}
 		imports := wireBoundaries(pkg.TypesInfo, config.Plugins, file)
 		if len(points) > 0 {
 			imports = append(imports, pointsPackage)
 		}
-		if len(imports) == 0 {
-			continue
+		if len(imports) > 0 {
+			writeFile(filepath.Join(copied, relative), rewriteFile(pkg, file, imports))
+			placed, used = append(placed, points...), append(used, imports...)
 		}
-		for _, imported := range imports {
-			astutil.AddImport(pkg.Fset, file, imported)
-		}
-		var content bytes.Buffer
-		if err := format.Node(&content, pkg.Fset, file); err != nil {
-			log.Fatal(err)
-		}
-		writeFile(filepath.Join(copied, relative), content.Bytes())
-		placed, used = append(placed, points...), append(used, imports...)
 	}
 	if registry := errorRegistry(pkg); registry != nil && slices.Contains(config.Plugins, pointsPlugin) && config.Placement.Errors {
 		writeFile(filepath.Join(copied, relativePath(source.dir, filepath.Dir(pkg.GoFiles[0])), registryFile), registry)
@@ -158,7 +166,13 @@ func instrument(arguments []string) {
 		log.Fatal(usage)
 	}
 	config := readConfig(*configPath)
-	modules := localModules(absolutePath(*source))
+	sourceDir := absolutePath(*source)
+	graph := importGraph(sourceDir)
+	modules := localModules(sourceDir, graph)
+	libraries := map[string]ScopeEntry{}
+	if slices.Contains(config.Plugins, pointsPlugin) {
+		libraries = scopedLibraries(graph, config.Placement)
+	}
 	root, targetRoot, sdkRoot := commonDir(modules), absolutePath(*target), absolutePath(*sdk)
 	if _, err := os.Stat(targetRoot); !errors.Is(err, fs.ErrNotExist) {
 		log.Fatalf("the target %s exists; fprewrite writes a fresh copy", targetRoot)
@@ -177,7 +191,7 @@ func instrument(arguments []string) {
 		if err := copyTree(known.dir, copies[index]); err != nil {
 			log.Fatal(err)
 		}
-		for _, pkg := range loadPackages(known.dir) {
+		for _, pkg := range loadPackages(known.dir, "./...") {
 			if len(pkg.GoFiles) == 0 {
 				continue
 			}
@@ -190,19 +204,30 @@ func instrument(arguments []string) {
 				dir: filepath.Join(copies[index], relativePath(known.dir, filepath.Dir(pkg.GoFiles[0])))})
 		}
 	}
+	if len(libraries) > 0 {
+		used[pointsPackage] = true
+	}
 	plugins := slices.Sorted(maps.Keys(used))
 	for _, pkg := range written {
 		writeFile(filepath.Join(pkg.dir, initFile), packageInit(pkg.name, plugins, slices.Contains(config.Plugins, httpPlugin)))
 	}
-	if workspace := workspaceFile(absolutePath(*source)); workspace != "" {
+	builds := filepath.Join(copies[0], "go.mod")
+	if workspace := workspaceFile(sourceDir); workspace != "" {
 		writeWorkspace(workspace, targetRoot, copies, sdkRoot)
+		builds = filepath.Join(targetRoot, "go.work")
 	} else {
 		for _, copied := range copies {
 			requireSDK(copied, sdkRoot)
 		}
 	}
+	if len(libraries) > 0 {
+		points, replacements := copyLibraries(*service, config.Placement, libraries, copies[0], targetRoot)
+		manifest.Points = append(manifest.Points, points...)
+		addReplacements(builds, replacements)
+	}
 	writeManifest(filepath.Join(copies[0], manifestFile), manifest)
-	fmt.Printf("%d points placed in %d modules; the service is at %s\n", len(manifest.Points), len(modules), copies[0])
+	fmt.Printf("%d points placed in %d modules and %d dependency packages; the service is at %s\n",
+		len(manifest.Points), len(modules), len(libraries), copies[0])
 }
 
 func scan(arguments []string) {
@@ -217,13 +242,18 @@ func scan(arguments []string) {
 	}
 	config := readConfig(*configPath)
 	manifest := Manifest{Service: *service, Language: "go", Points: []PointEntry{}}
-	for _, known := range localModules(absolutePath(*source)) {
-		for _, pkg := range loadPackages(known.dir) {
+	sourceDir := absolutePath(*source)
+	graph := importGraph(sourceDir)
+	for _, known := range localModules(sourceDir, graph) {
+		for _, pkg := range loadPackages(known.dir, "./...") {
 			for _, file := range pkg.Syntax {
 				relative := known.prefix + relativePath(known.dir, pkg.Fset.Position(file.Pos()).Filename)
-				manifest.Points = append(manifest.Points, placePoints(*service, relative, config, pkg, file)...)
+				manifest.Points = append(manifest.Points, placePoints(*service, relative, config.Placement, pkg, file)...)
 			}
 		}
+	}
+	if libraries := scopedLibraries(graph, config.Placement); len(libraries) > 0 {
+		manifest.Points = append(manifest.Points, scanLibraries(*service, sourceDir, config.Placement, libraries)...)
 	}
 	writeManifest(*manifestPath, manifest)
 	fmt.Printf("%d points listed in %s\n", len(manifest.Points), *manifestPath)

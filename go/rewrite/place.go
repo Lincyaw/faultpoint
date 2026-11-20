@@ -41,14 +41,42 @@ func init() {
 }
 `))
 
-// Placement switches each placement rule and replaces its name lists, under "placement" in the configuration.
+// Placement switches each placement rule and replaces its name lists, under "placement" in the configuration; its
+// scope adds the dependency packages whose code gets points besides the local modules.
 type Placement struct {
-	Branch bool     `json:"branch"`
-	Call   bool     `json:"call"`
-	Check  bool     `json:"check"`
-	Loop   bool     `json:"loop"`
-	Clock  []string `json:"clock"`
-	Errors bool     `json:"errors"`
+	Branch  bool         `json:"branch"`
+	Call    bool         `json:"call"`
+	Check   bool         `json:"check"`
+	Loop    bool         `json:"loop"`
+	Clock   []string     `json:"clock"`
+	Errors  bool         `json:"errors"`
+	Scope   []ScopeEntry `json:"scope"`
+	Exclude []string     `json:"exclude"`
+}
+
+// ScopeEntry names a dependency package path, which includes the packages under it, limited to some kinds when
+// Kinds is given.
+type ScopeEntry struct {
+	Include string   `json:"include"`
+	Kinds   []string `json:"kinds"`
+}
+
+// limitedTo is the placement of a dependency whose scope entry allows only some kinds; the error registry serves
+// call points.
+func (p Placement) limitedTo(kinds []string) Placement {
+	if kinds == nil {
+		return p
+	}
+	limited := p
+	limited.Branch = p.Branch && slices.Contains(kinds, "branch")
+	limited.Call = p.Call && slices.Contains(kinds, "call")
+	limited.Check = p.Check && slices.Contains(kinds, "check")
+	limited.Loop = p.Loop && slices.Contains(kinds, "loop")
+	limited.Errors = p.Errors && slices.Contains(kinds, "call")
+	if !slices.Contains(kinds, "clock") {
+		limited.Clock = nil
+	}
+	return limited
 }
 
 // PointEntry is one point of the manifest, as spec/manifest.schema.json defines it.
@@ -102,12 +130,9 @@ type placer struct {
 	points    []PointEntry
 }
 
-// placePoints places the points of a file in its syntax tree, when the points plugin is enabled, and returns them.
-func placePoints(service, relative string, config Config, pkg *packages.Package, file *ast.File) []PointEntry {
-	if !slices.Contains(config.Plugins, pointsPlugin) {
-		return nil
-	}
-	p := &placer{service: service, path: relative, placement: config.Placement, fset: pkg.Fset, info: pkg.TypesInfo,
+// placePoints places the points of a file in its syntax tree and returns them.
+func placePoints(service, relative string, placement Placement, pkg *packages.Package, file *ast.File) []PointEntry {
+	p := &placer{service: service, path: relative, placement: placement, fset: pkg.Fset, info: pkg.TypesInfo,
 		anchors: map[ast.Node]string{}, ordinals: map[string]int{}}
 	astutil.Apply(file, p.pre, p.post)
 	return p.points
