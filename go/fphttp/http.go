@@ -4,6 +4,7 @@ package fphttp
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -64,6 +65,61 @@ func milliseconds(started time.Time) float64 {
 	return float64(time.Since(started).Microseconds()) / 1000
 }
 
+type takenKey struct{}
+
+// ServerCall is one request a server point took, with the rule decided for it; a framework adapter such as the gin
+// plugin uses it for the requests its framework serves.
+type ServerCall struct {
+	Request *http.Request
+	Rule    *faultpoint.Rule
+	point   string
+	started time.Time
+}
+
+// Take takes a request at its rpc_server point: it restores the caller's trace and baggage, decides the rule and
+// performs its delay or crash. It returns nil when a server point around this one already took the request, as
+// when a wrapped http.Server serves an instrumented framework, so that a request is one execution of one point.
+func Take(request *http.Request) *ServerCall {
+	if request.Context().Value(takenKey{}) != nil {
+		return nil
+	}
+	ctx := propagator.Extract(request.Context(), propagation.HeaderCarrier(request.Header))
+	call := &ServerCall{Request: request.WithContext(context.WithValue(ctx, takenKey{}, true)), started: time.Now(),
+		point: faultpoint.PointID(faultpoint.Service(), "rpc_server", request.Method+" "+pathTemplate(request.URL.Path))}
+	call.Rule = faultpoint.Decide(ctx, call.point)
+	if call.Rule != nil {
+		fpaction.Hold(call.Rule)
+	}
+	return call
+}
+
+// Action is the kind of the call's rule, empty without one.
+func (c *ServerCall) Action() string {
+	if c.Rule == nil {
+		return ""
+	}
+	return c.Rule.Action.Kind
+}
+
+// FailureStatus is the status a fail or fail_after rule answers with.
+func (c *ServerCall) FailureStatus() int {
+	params := struct {
+		Status int `json:"status"`
+	}{Status: defaultFailureStatus}
+	c.Rule.DecodeParams(&params)
+	return params.Status
+}
+
+// Finish observes the status the server answered.
+func (c *ServerCall) Finish(status int) {
+	faultpoint.Observe(c.Request.Context(), c.point, statusOutcome(status), milliseconds(c.started), c.Rule)
+}
+
+// Panicked observes a request whose handler panicked.
+func (c *ServerCall) Panicked() {
+	faultpoint.Observe(c.Request.Context(), c.point, "error", milliseconds(c.started), c.Rule)
+}
+
 type server struct{ next http.Handler }
 
 // Handler is the rpc_server point of every route of a handler, nil meaning http.DefaultServeMux as for an
@@ -86,40 +142,31 @@ func (s server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if next == nil {
 		next = http.DefaultServeMux
 	}
-	ctx := propagator.Extract(request.Context(), propagation.HeaderCarrier(request.Header))
-	request = request.WithContext(ctx)
-	point := faultpoint.PointID(faultpoint.Service(), "rpc_server", request.Method+" "+pathTemplate(request.URL.Path))
-	rule := faultpoint.Decide(ctx, point)
-	started := time.Now()
+	call := Take(request)
+	if call == nil {
+		next.ServeHTTP(writer, request)
+		return
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			faultpoint.Observe(ctx, point, "error", milliseconds(started), rule)
+			call.Panicked()
 			panic(recovered)
 		}
 	}()
-	action := ""
-	if rule != nil {
-		fpaction.Hold(rule)
-		action = rule.Action.Kind
-	}
 	var status int
-	switch action {
+	switch call.Action() {
 	case "fail", "fail_after":
-		params := struct {
-			Status int `json:"status"`
-		}{Status: defaultFailureStatus}
-		rule.DecodeParams(&params)
-		if action == "fail_after" {
-			next.ServeHTTP(discardWriter{header: http.Header{}}, request)
+		if call.Action() == "fail_after" {
+			next.ServeHTTP(discardWriter{header: http.Header{}}, call.Request)
 		}
-		status = params.Status
+		status = call.FailureStatus()
 		writer.WriteHeader(status)
 	default:
 		status = httpsnoop.CaptureMetricsFn(writer, func(captured http.ResponseWriter) {
-			next.ServeHTTP(captured, request)
+			next.ServeHTTP(captured, call.Request)
 		}).Code
 	}
-	faultpoint.Observe(ctx, point, statusOutcome(status), milliseconds(started), rule)
+	call.Finish(status)
 }
 
 type client struct{ base http.RoundTripper }
