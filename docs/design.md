@@ -313,8 +313,12 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | 部分 | Python | Go | Node / TypeScript | Java | Rust | eBPF 代理 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 核心与插件结构 | 已实现 | 已实现；核心只依赖标准库 | 已实现 | 已实现 | 已实现 | 已实现，复用 Go 核心 |
-| 进程内故障点 | `branch` `check` `loop` `value` `clock` `acquire` | 同左，另有 `call` 与错误登记 | `branch` `check` `loop` `value` `clock` `acquire` | 同左 | 同左，另有 `call` | — |
-| 边界适配 | httpx、ASGI（uvicorn）、DB-API | `net/http`、`database/sql` | HTTP 服务端、`fetch`、`http.request` | Servlet，以及业务代码中的 `HttpClient` 和 JDBC 调用 | tower（axum） | `syscall`、`packet` |
+| 进程内故障点 | `branch` `check` `loop` `value` `clock` `acquire`，以及在调用点抛出处理器所捕获异常的 `call` | `branch` `call` `check` `loop` `value` `clock` `acquire`，以及错误登记 | `branch` `check` `loop` `value` `clock` `acquire` | 同 Node，另有抛出被调方法所声明受检异常的 `call` | 同 Node，另有 `call` | — |
+| 边界适配 | httpx、httpx2、ASGI（uvicorn）、DB-API（sqlite3）、psycopg（含连接池）、redis-py | `net/http`、gin、`database/sql`、pgx（含 pgxpool）、go-redis | HTTP 服务端（含 fastify）、`fetch`、`http.request`、pg、ioredis | Servlet、JDBC 语句实现（覆盖 JdbcTemplate 与 Hikari）、Spring 的 HTTP 客户端、JDK `HttpClient`、Lettuce | tower（axum）、sqlx 与 redis-rs 的调用点 | `syscall`、`packet` |
+| 消息边界 | Redis Streams（经 redis-py） | Redis Streams（经 go-redis） | Redis Streams（经 ioredis） | Redis Streams（经 Lettuce） | Redis Streams（经 redis-rs） | — |
+| 依赖库中的故障点（第 6.4 节） | 已实现，只改写纯 Python 模块；`faultpoint candidates` 列出执行过的候选 | 已实现，模块副本加 `replace` | 已实现 | 已实现 | 已实现，crate 副本加 `[patch]` | — |
+| 原生函数中的故障点（第 6.5 节） | — | — | — | — | — | 只有可行性试验，尚未进入代理 |
 | 接入 | 导入钩子 | 构建副本，自动装配边界 | `--import` 加载钩子 | `-javaagent` | 构建副本 | 特权进程 |
-| 消息边界 | 规划中 | 规划中 | 规划中 | 规划中 | 规划中 | — |
-| 未覆盖 | 非 uvicorn 运行的 ASGI 应用 | 依赖内部创建的服务端和客户端 | 直接使用 undici | 第三方库内部的 HTTP 与 JDBC 调用 | 请求级 `rpc_client`、宏参数 | 自然丢包、32 位兼容系统调用、IPv6（未验证） |
+| 未覆盖 | 非 uvicorn 运行的 ASGI 应用 | 依赖内部创建的服务端和客户端；pgx 的 `CopyFrom` `Commit` `Rollback` | 直接使用 undici | WebClient、Feign、Apache HttpClient、OkHttp | reqwest、`query!` 宏、类型化的 Redis 命令方法 | 自然丢包、32 位兼容系统调用、IPv6（未验证） |
+| 只重放置候选故障点（第 6.4 节第 3 步） | 未实现 | 未实现 | 未实现 | 未实现 | 未实现 | — |
+| Kafka、RabbitMQ、NATS | 规划中 | 规划中 | 规划中 | 规划中 | 规划中 | — |
