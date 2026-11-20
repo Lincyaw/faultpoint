@@ -1,9 +1,10 @@
 from pathlib import Path
 from typing import Final, Self
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, Field, JsonValue, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from faultpoint.observations import JSONL_OPTIONS
 from faultpoint.rules import STRICT
 
 DEFAULT_PLUGINS: Final = ("points", "import-hook", "httpx", "asgi", "dbapi")
@@ -30,7 +31,15 @@ class Config(BaseModel):
 
     plugins: tuple[str, ...] = DEFAULT_PLUGINS
     options: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
+    """Options keyed by the name of the enabled plugin or default component that reads them."""
     placement: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_option_names(self) -> Self:
+        unknown = sorted(set(self.options) - {*self.plugins, JSONL_OPTIONS})
+        if unknown:
+            raise ValueError(f"options are given to {unknown}, which name no enabled plugin or component")
+        return self
 
     @classmethod
     def read(cls, path: Path | None) -> Self:

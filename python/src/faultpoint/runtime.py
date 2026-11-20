@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable, Mapping
 from importlib.metadata import entry_points
 from typing import Annotated, Final, NoReturn, Union
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from faultpoint.config import Config, Settings
 from faultpoint.context import ContextProvider, OtelContext
@@ -129,7 +129,8 @@ class Plugin(BaseModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     actions: dict[str, object] = Field(default_factory=dict)
-    install: Callable[[Runtime], None] | None = None
+    install: Callable[[Runtime, dict[str, JsonValue]], None] | None = None
+    """Called with the options the configuration gives under the plugin's name."""
     source: Callable[[Settings, Config], RuleSource | None] | None = None
     sink: Callable[[Settings, Config], ObservationSink | None] | None = None
     context: Callable[[Config], ContextProvider] | None = None
@@ -191,9 +192,9 @@ def start() -> None:
             RUNTIME.reload(source)
             threading.Thread(target=repeat, args=(POLL_INTERVAL_S, functools.partial(RUNTIME.reload, source)),
                              name="faultpoint-rules", daemon=True).start()
-        for plugin in plugins.values():
+        for name, plugin in plugins.items():
             if plugin.install is not None:
-                plugin.install(RUNTIME)
+                plugin.install(RUNTIME, config.options.get(name, {}))
         if RUNTIME.sink is not None:
             atexit.register(RUNTIME.sink.flush)
             threading.Thread(target=repeat, args=(RUNTIME.sink.interval, RUNTIME.sink.flush),

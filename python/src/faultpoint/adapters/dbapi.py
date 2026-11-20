@@ -9,14 +9,13 @@ from typing import Any, Final, Self
 
 import sqlglot
 import wrapt
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue
 from sqlglot import exp
 
 from faultpoint.actions import BoundaryError, BoundaryFail, Crash, Delay, Drop, Duplicate, Empty, FailAfter, Failure
 from faultpoint.rules import STRICT, point_id
 from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
 
-DBAPI_OPTIONS: Final = "dbapi"
 DEFAULT_DRIVERS: Final = ("sqlite3",)
 STATEMENT_CACHE_SIZE: Final = 4096
 DIGEST_LENGTH: Final = 8
@@ -223,10 +222,10 @@ def patch_driver(runtime: Runtime, dialect: str | None, driver: ModuleType) -> N
                                 functools.partial(connect_with_points, Store(runtime, driver, dialect)))
 
 
-def install(runtime: Runtime) -> None:
-    options = DbapiOptions.model_validate(runtime.config.options.get(DBAPI_OPTIONS, {}))
-    for driver in options.drivers:
-        wrapt.register_post_import_hook(functools.partial(patch_driver, runtime, options.dialect), driver)
+def install(runtime: Runtime, options: dict[str, JsonValue]) -> None:
+    dbapi = DbapiOptions.model_validate(options)
+    for driver in dbapi.drivers:
+        wrapt.register_post_import_hook(functools.partial(patch_driver, runtime, dbapi.dialect), driver)
 
 
 PLUGIN: Final = Plugin(actions={StoreKind.READ: implemented_actions(BoundaryFail, Empty, Delay, Crash),

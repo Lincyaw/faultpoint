@@ -8,13 +8,12 @@ from types import ModuleType
 from typing import Any, Final
 
 import wrapt
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue
 
 from faultpoint.actions import BoundaryFail, Crash, Delay, Duplicate, FailAfter
 from faultpoint.rules import STRICT, point_id
 from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
 
-HTTP_OPTIONS: Final = "http"
 HTTPX_MODULE: Final = "httpx"
 UVICORN_MODULE: Final = "uvicorn"
 DEFAULT_FAILURE_STATUS: Final = 503
@@ -129,10 +128,9 @@ def serve_points(runtime: Runtime, options: HttpOptions, load: Callable[[], None
     config.loaded_app = ServerPoint(config.loaded_app, runtime, options)
 
 
-def install_asgi(runtime: Runtime) -> None:
+def install_asgi(runtime: Runtime, options: dict[str, JsonValue]) -> None:
     """Wrap the application uvicorn serves, the one place every ASGI framework's requests pass through."""
-    options = HttpOptions.model_validate(runtime.config.options.get(HTTP_OPTIONS, {}))
-    wrapper = functools.partial(serve_points, runtime, options)
+    wrapper = functools.partial(serve_points, runtime, HttpOptions.model_validate(options))
     wrapt.register_post_import_hook(
         lambda module: wrapt.wrap_function_wrapper(module, "Config.load", wrapper), UVICORN_MODULE)
 
@@ -144,9 +142,9 @@ def patch_httpx(runtime: Runtime, options: HttpOptions, module: ModuleType) -> N
     faultpoint.adapters.httpx.patch(module, runtime, options)
 
 
-def install_httpx(runtime: Runtime) -> None:
-    options = HttpOptions.model_validate(runtime.config.options.get(HTTP_OPTIONS, {}))
-    wrapt.register_post_import_hook(functools.partial(patch_httpx, runtime, options), HTTPX_MODULE)
+def install_httpx(runtime: Runtime, options: dict[str, JsonValue]) -> None:
+    wrapt.register_post_import_hook(
+        functools.partial(patch_httpx, runtime, HttpOptions.model_validate(options)), HTTPX_MODULE)
 
 
 HTTPX: Final = Plugin(actions={RpcKind.CLIENT: implemented_actions(BoundaryFail, FailAfter, Duplicate, Delay, Crash)},

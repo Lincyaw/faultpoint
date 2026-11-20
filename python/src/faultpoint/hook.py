@@ -7,6 +7,8 @@ from pathlib import Path
 from types import CodeType, ModuleType
 from typing import Final
 
+from pydantic import JsonValue
+
 from faultpoint.placement import Placement, place_points, placeable
 from faultpoint.runtime import Plugin, Runtime
 
@@ -47,7 +49,7 @@ class PlacingFinder(importlib.abc.MetaPathFinder):
         return spec
 
 
-def install(runtime: Runtime) -> None:
+def install(runtime: Runtime, options: dict[str, JsonValue]) -> None:
     finder = PlacingFinder(runtime.settings.source_root.resolve(), runtime.settings.service,
                            Placement.model_validate(runtime.config.placement))
     sys.meta_path.insert(sys.meta_path.index(PathFinder), finder)
