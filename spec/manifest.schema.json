@@ -2,14 +2,15 @@
   "$defs": {
     "PointEntry": {
       "additionalProperties": false,
-      "description": "One fault point a rewriter placed.",
+      "description": "One fault point placed in a source file.",
       "properties": {
         "id": {
           "title": "Id",
           "type": "string"
         },
         "kind": {
-          "$ref": "#/$defs/PointKind"
+          "title": "Kind",
+          "type": "string"
         },
         "file": {
           "title": "File",
@@ -38,27 +39,6 @@
       ],
       "title": "PointEntry",
       "type": "object"
-    },
-    "PointKind": {
-      "enum": [
-        "branch",
-        "call",
-        "check",
-        "loop",
-        "value",
-        "clock",
-        "acquire",
-        "rpc_client",
-        "rpc_server",
-        "store_read",
-        "store_write",
-        "publish",
-        "consume",
-        "syscall",
-        "packet"
-      ],
-      "title": "PointKind",
-      "type": "string"
     }
   },
   "additionalProperties": false,

@@ -1,61 +1,11 @@
 {
   "$defs": {
-    "BoundaryError": {
-      "enum": [
-        "timeout",
-        "refused"
-      ],
-      "title": "BoundaryError",
-      "type": "string"
-    },
-    "Crash": {
-      "additionalProperties": false,
+    "Action": {
+      "additionalProperties": true,
+      "description": "An action kind and the free parameters the plugin that executes it interprets.",
       "properties": {
         "kind": {
-          "const": "crash",
-          "title": "Kind",
-          "type": "string"
-        },
-        "code": {
-          "default": 1,
-          "maximum": 255,
-          "minimum": 0,
-          "title": "Code",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "title": "Crash",
-      "type": "object"
-    },
-    "Delay": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "const": "delay",
-          "title": "Kind",
-          "type": "string"
-        },
-        "ms": {
-          "exclusiveMinimum": 0,
-          "title": "Ms",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "kind",
-        "ms"
-      ],
-      "title": "Delay",
-      "type": "object"
-    },
-    "Drop": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "const": "drop",
+          "minLength": 1,
           "title": "Kind",
           "type": "string"
         }
@@ -63,134 +13,7 @@
       "required": [
         "kind"
       ],
-      "title": "Drop",
-      "type": "object"
-    },
-    "Duplicate": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "const": "duplicate",
-          "title": "Kind",
-          "type": "string"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "title": "Duplicate",
-      "type": "object"
-    },
-    "Empty": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "const": "empty",
-          "title": "Kind",
-          "type": "string"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "title": "Empty",
-      "type": "object"
-    },
-    "Fail": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "const": "fail",
-          "title": "Kind",
-          "type": "string"
-        },
-        "error": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Error"
-        },
-        "status": {
-          "anyOf": [
-            {
-              "maximum": 599,
-              "minimum": 100,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Status"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "title": "Fail",
-      "type": "object"
-    },
-    "FailAfter": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "const": "fail_after",
-          "title": "Kind",
-          "type": "string"
-        },
-        "error": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/BoundaryError"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "status": {
-          "anyOf": [
-            {
-              "maximum": 599,
-              "minimum": 100,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Status"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "title": "FailAfter",
-      "type": "object"
-    },
-    "JsonValue": {},
-    "Negate": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "const": "negate",
-          "title": "Kind",
-          "type": "string"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "title": "Negate",
+      "title": "Action",
       "type": "object"
     },
     "Rule": {
@@ -202,58 +25,12 @@
           "type": "string"
         },
         "point": {
+          "pattern": "^[^:]+:[^:]+:.+$",
           "title": "Point",
           "type": "string"
         },
         "action": {
-          "discriminator": {
-            "mapping": {
-              "crash": "#/$defs/Crash",
-              "delay": "#/$defs/Delay",
-              "drop": "#/$defs/Drop",
-              "duplicate": "#/$defs/Duplicate",
-              "empty": "#/$defs/Empty",
-              "fail": "#/$defs/Fail",
-              "fail_after": "#/$defs/FailAfter",
-              "negate": "#/$defs/Negate",
-              "set": "#/$defs/SetValue",
-              "shift": "#/$defs/Shift"
-            },
-            "propertyName": "kind"
-          },
-          "oneOf": [
-            {
-              "$ref": "#/$defs/Fail"
-            },
-            {
-              "$ref": "#/$defs/FailAfter"
-            },
-            {
-              "$ref": "#/$defs/Delay"
-            },
-            {
-              "$ref": "#/$defs/Drop"
-            },
-            {
-              "$ref": "#/$defs/Duplicate"
-            },
-            {
-              "$ref": "#/$defs/Negate"
-            },
-            {
-              "$ref": "#/$defs/Empty"
-            },
-            {
-              "$ref": "#/$defs/SetValue"
-            },
-            {
-              "$ref": "#/$defs/Shift"
-            },
-            {
-              "$ref": "#/$defs/Crash"
-            }
-          ],
-          "title": "Action"
+          "$ref": "#/$defs/Action"
         },
         "scope": {
           "additionalProperties": {
@@ -272,45 +49,6 @@
         "action"
       ],
       "title": "Rule",
-      "type": "object"
-    },
-    "SetValue": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "const": "set",
-          "title": "Kind",
-          "type": "string"
-        },
-        "value": {
-          "$ref": "#/$defs/JsonValue"
-        }
-      },
-      "required": [
-        "kind",
-        "value"
-      ],
-      "title": "SetValue",
-      "type": "object"
-    },
-    "Shift": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "const": "shift",
-          "title": "Kind",
-          "type": "string"
-        },
-        "amount": {
-          "title": "Amount",
-          "type": "number"
-        }
-      },
-      "required": [
-        "kind",
-        "amount"
-      ],
-      "title": "Shift",
       "type": "object"
     },
     "Trigger": {
