@@ -36,7 +36,10 @@ type Point struct {
 	Command string
 }
 
-// Classifier classifies statements, a statement being a read when all its commands are read commands.
+// clauseCommands are the words go-sqllexer lexes as commands that are clauses of a statement, the joins of a SELECT.
+var clauseCommands = []string{"JOIN", "STRAIGHT_JOIN"}
+
+// Classifier classifies statements, a statement being a read when it only reads, as reads tells.
 type Classifier struct {
 	readCommands []string
 	points       sync.Map
@@ -60,11 +63,8 @@ func (c *Classifier) Classify(query string) Point {
 	if err != nil {
 		faultpoint.Abort("cannot normalize a statement: %v", err)
 	}
-	reads := len(metadata.Commands) > 0 && !slices.ContainsFunc(metadata.Commands, func(command string) bool {
-		return !slices.ContainsFunc(c.readCommands, func(read string) bool { return strings.EqualFold(read, command) })
-	})
 	point := Point{Kind: "store_write", Command: "-"}
-	if reads {
+	if c.reads(query) {
 		point.Kind = "store_read"
 	}
 	if len(metadata.Commands) > 0 {
@@ -78,6 +78,32 @@ func (c *Classifier) Classify(query string) Point {
 	point.Locator = tables + "#" + hex.EncodeToString(digest[:])[:hashDigits]
 	c.points.Store(query, point)
 	return point
+}
+
+// reads is whether a statement only reads: it runs a command, each a read command, and writes no table with INTO, as
+// SELECT ... INTO does. A join, and the UPDATE of a FOR UPDATE, FOR NO KEY UPDATE or ON DUPLICATE KEY UPDATE clause,
+// which go-sqllexer lexes as commands too, are clauses of their statement, not commands.
+func (c *Classifier) reads(query string) bool {
+	lexer := sqllexer.New(query)
+	previous := ""
+	commands := 0
+	for token := lexer.Scan(); token.Type != sqllexer.EOF; token = lexer.Scan() {
+		word := strings.ToUpper(token.Value)
+		command := token.Type == sqllexer.COMMAND && !slices.Contains(clauseCommands, word) &&
+			(word != "UPDATE" || (previous != "FOR" && previous != "KEY"))
+		switch {
+		case token.Type == sqllexer.KEYWORD && word == "INTO":
+			return false
+		case command && !slices.ContainsFunc(c.readCommands, func(read string) bool { return strings.EqualFold(read, word) }):
+			return false
+		case command:
+			commands++
+		}
+		if token.Type != sqllexer.SPACE && token.Type != sqllexer.COMMENT && token.Type != sqllexer.MULTILINE_COMMENT {
+			previous = word
+		}
+	}
+	return commands > 0
 }
 
 // ErrorDetail is the detail of a failed statement: the error's name and, when the driver reports one, its code: the
