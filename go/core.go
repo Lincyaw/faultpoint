@@ -8,10 +8,12 @@ import (
 	"hash/fnv"
 	"math/rand/v2"
 	"os"
+	"os/signal"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 )
 
 const invalidRulesExit = 70
@@ -59,6 +61,7 @@ type core struct {
 	installing sync.Mutex
 	mu         sync.Mutex
 	exit       sync.Mutex
+	end        sync.Once
 	cleanups   []func()
 }
 
@@ -277,24 +280,67 @@ func Observe(ctx context.Context, point, outcome string, total float64, rule *Ru
 // Service is the name the points of boundaries are identified by.
 func Service() string { return current.settings.service }
 
-// AtExit registers a cleanup that Crash and Abort run, in registration order, before the process ends, so that a
-// process owner such as the eBPF agent can undo what it changed on the host.
+// AtExit registers a cleanup that End runs, in registration order, before the process ends, so that a process owner
+// such as the eBPF agent can undo what it changed on the host.
 func AtExit(cleanup func()) {
 	current.exit.Lock()
 	defer current.exit.Unlock()
 	current.cleanups = append(current.cleanups, cleanup)
 }
 
+// End writes the pending observations and runs the registered cleanups, once however often it is called; Crash and
+// Abort call it, and the rewriter defers it in a program's main, so that a main that returns, as after a graceful
+// shutdown, loses nothing. A concurrent call returns once the first has finished.
+func End() {
+	current.end.Do(func() {
+		current.exit.Lock()
+		defer current.exit.Unlock()
+		if current.started.Load() && current.sink != nil {
+			current.sink.Flush()
+		}
+		for _, cleanup := range current.cleanups {
+			cleanup()
+		}
+	})
+}
+
+// EndOnSignals ends the process on SIGINT and SIGTERM as their default action does, by the same signal, once End
+// has run; the rewriter calls it first in the main of a build none of whose packages handles signals, since a
+// process cannot learn whether its code handles a signal. A signal the process ignores stays ignored.
+func EndOnSignals() {
+	var watched []os.Signal
+	for _, ending := range []os.Signal{syscall.SIGINT, syscall.SIGTERM} {
+		if current.enabled && !signal.Ignored(ending) {
+			watched = append(watched, ending)
+		}
+	}
+	// Notify without signals would relay every signal.
+	if len(watched) > 0 {
+		received := make(chan os.Signal, 1)
+		signal.Notify(received, watched...)
+		go endOnSignal(received)
+	}
+}
+
+// endOnSignal waits for a signal EndOnSignals watches, runs End, and lets the signal end the process by its default
+// action.
+func endOnSignal(received chan os.Signal) {
+	ending := <-received
+	End()
+	signal.Stop(received)
+	process, err := os.FindProcess(os.Getpid())
+	if err == nil {
+		err = process.Signal(ending)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "faultpoint: cannot end the process by %v: %v\n", ending, err)
+		os.Exit(1)
+	}
+}
+
 // Crash writes the pending observations, runs the registered cleanups and ends the process with code.
 func Crash(code int) {
-	// The lock is held until the process ends, so that a concurrent Crash waits for the cleanups instead of exiting first.
-	current.exit.Lock()
-	if current.started.Load() && current.sink != nil {
-		current.sink.Flush()
-	}
-	for _, cleanup := range current.cleanups {
-		cleanup()
-	}
+	End()
 	os.Exit(code)
 }
 

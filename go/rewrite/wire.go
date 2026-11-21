@@ -35,6 +35,8 @@ const (
 	ginPath        = "github.com/gin-gonic/gin"
 	// pgxDriver is pgx's database/sql driver, whose errors the SQL adapter builds through the pgx adapter.
 	pgxDriver = pgxModule + "/stdlib"
+	// signalPackage is the package through which a build handles signals, which faultpoint then leaves to it.
+	signalPackage = "os/signal"
 )
 
 // pluginPackages are the packages of the plugins a configuration can enable.
@@ -316,4 +318,38 @@ func packageInit(name string, plugins []string, wiresHTTP bool, errors []registe
 		log.Fatal(err)
 	}
 	return formatted
+}
+
+// endMain makes the main function of a program call the core functions of mainCalls first, then defer
+// faultpoint.End, so that the observations of a main that returns are written; it returns the import this needs, nil
+// for a file without the main function.
+func endMain(packageName string, file *ast.File, mainCalls []string) []string {
+	for _, declaration := range file.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if packageName != "main" || !isFunction || function.Recv != nil || function.Name.Name != "main" || function.Body == nil {
+			continue
+		}
+		var statements []ast.Stmt
+		for _, call := range mainCalls {
+			statements = append(statements, &ast.ExprStmt{X: sdkCall(corePackage, call)})
+		}
+		statements = append(statements, &ast.DeferStmt{Call: sdkCall(corePackage, "End")})
+		// The statements take the position of the brace, so that the printer keeps the body's leading comments after them.
+		for _, statement := range statements {
+			ast.Inspect(statement, func(node ast.Node) bool {
+				switch node := node.(type) {
+				case *ast.Ident:
+					node.NamePos = function.Body.Lbrace
+				case *ast.CallExpr:
+					node.Lparen, node.Rparen = function.Body.Lbrace, function.Body.Lbrace
+				case *ast.DeferStmt:
+					node.Defer = function.Body.Lbrace
+				}
+				return true
+			})
+		}
+		function.Body.List = append(statements, function.Body.List...)
+		return []string{corePackage}
+	}
+	return nil
 }

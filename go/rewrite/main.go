@@ -130,9 +130,10 @@ func rewriteFile(pkg *packages.Package, file *ast.File, imports []string) []byte
 	return content.Bytes()
 }
 
-// instrumentPackage writes the rewritten files of a package of a module into the module's copy, with its registry,
-// adds its points and registered errors to the manifest, and returns the plugin packages it now imports.
-func instrumentPackage(service string, source module, copied string, config Config, pkg *packages.Package, manifest *Manifest) []string {
+// instrumentPackage writes the rewritten files of a package of a module into the module's copy, with its registry and
+// a main that ends faultpoint, adds its points and registered errors to the manifest, and returns the plugin packages
+// it now imports.
+func instrumentPackage(service string, source module, copied string, config Config, pkg *packages.Package, manifest *Manifest, mainCalls []string) []string {
 	var used []string
 	var placed []PointEntry
 	for _, file := range pkg.Syntax {
@@ -145,8 +146,9 @@ func instrumentPackage(service string, source module, copied string, config Conf
 		if len(points) > 0 {
 			imports = append(imports, pointsPackage)
 		}
-		if len(imports) > 0 {
-			writeFile(filepath.Join(copied, relative), rewriteFile(pkg, file, imports))
+		ending := endMain(pkg.Name, file, mainCalls)
+		if len(imports)+len(ending) > 0 {
+			writeFile(filepath.Join(copied, relative), rewriteFile(pkg, file, append(slices.Clone(imports), ending...)))
 			placed, used = append(placed, points...), append(used, imports...)
 		}
 	}
@@ -190,6 +192,12 @@ func instrument(arguments []string) {
 		}
 	}
 	manifest := Manifest{Service: *service, Language: "go", Points: []PointEntry{}, Errors: []string{}}
+	// faultpoint ends a build on SIGINT and SIGTERM only when no package of it handles signals, which it could not
+	// tell at run time.
+	var mainCalls []string
+	if !slices.ContainsFunc(graph, func(pkg *packages.Package) bool { return pkg.Imports[signalPackage] != nil }) {
+		mainCalls = []string{"EndOnSignals"}
+	}
 	copies := make([]string, len(modules))
 	var written []rewritten
 	used := map[string]bool{}
@@ -202,7 +210,7 @@ func instrument(arguments []string) {
 			if len(pkg.GoFiles) == 0 {
 				continue
 			}
-			for _, imported := range instrumentPackage(*service, known, copies[index], config, pkg, &manifest) {
+			for _, imported := range instrumentPackage(*service, known, copies[index], config, pkg, &manifest, mainCalls) {
 				used[imported] = true
 			}
 			written = append(written, rewritten{name: pkg.Name,
