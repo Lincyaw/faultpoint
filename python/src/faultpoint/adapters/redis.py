@@ -12,7 +12,7 @@ import wrapt
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints
 
 from faultpoint.actions import (INJECTED_MESSAGE, BoundaryError, Crash, Delay, Drop, Duplicate, Empty, StoreFail,
-                                StoreFailAfter, StoreFailure)
+                                StoreFailAfter, StoreFailure, Wait)
 from faultpoint.adapters.store import (MessageKind, StoreKind, StoreOutcome, consume_actions, read_actions,
                                        write_actions)
 from faultpoint.observations import DetailKey, elapsed_ms, error_type
@@ -194,8 +194,10 @@ def copies(decided: Decided | None) -> int:
 
 
 def delay_seconds(decisions: list[Decided | None]) -> float:
-    delays = [decided.action for decided in decisions if decided is not None and isinstance(decided.action, Delay)]
-    return sum(delay.ms for delay in delays) / 1000
+    """The seconds to wait before sending: the delays, and the waits of the fails that fail commands unsent."""
+    waits = [decided.action.ms for decided in decisions
+             if decided is not None and isinstance(decided.action, Delay | Wait) and decided.action.ms is not None]
+    return sum(waits) / 1000
 
 
 class CommandPoints:
@@ -258,18 +260,23 @@ class CommandPoints:
                     codes = []
             return {DetailKey.ERROR: error_type(error), **({DetailKey.CODE: codes[0]} if codes else {})}
 
-    def prepare(self, decisions: list[Decided | None], started: float) -> float:
-        """Crash or fail before anything is sent, and the seconds to wait before sending."""
+    def prepare(self, decisions: list[Decided | None]) -> float:
+        """Crash before anything is sent, and the seconds to wait before sending or failing."""
         for decided in decisions:
             match decided:
                 case Decided(action=Crash(code=code)):
                     self.runtime.crash(code)
+        return delay_seconds(decisions)
+
+    def fail_unsent(self, decisions: list[Decided | None], started: float) -> None:
+        """Fail before anything is sent, once the wait is over, when a rule fails one of the commands."""
+        for decided in decisions:
+            match decided:
                 case Decided(decision=Decision(action=StoreFail()) as decision):
                     raised = self.failure(decision)
                     self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, elapsed_ms(started), decision,
                                          self.error_detail(raised))
                     raise raised
-        return delay_seconds(decisions)
 
     def failed(self, decisions: list[Decided | None], error: Exception, started: float) -> None:
         elapsed = elapsed_ms(started)
@@ -349,9 +356,10 @@ class CommandPoints:
                 kwargs: dict[str, Any]) -> Any:
         started = time.monotonic()
         decisions = [self.decide(args)]
-        delay = self.prepare(decisions, started)
+        delay = self.prepare(decisions)
         if delay:
             time.sleep(delay)
+        self.fail_unsent(decisions, started)
         try:
             replies = [execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
         except Exception as error:
@@ -364,9 +372,10 @@ class CommandPoints:
         started = time.monotonic()
         stack: list[Queued] = list(pipeline.command_stack)
         decisions = [self.decide(queued_args) for queued_args, _ in stack]
-        delay = self.prepare(decisions, started)
+        delay = self.prepare(decisions)
         if delay:
             time.sleep(delay)
+        self.fail_unsent(decisions, started)
         pipeline.command_stack[:] = [queued for queued, decided in zip(stack, decisions, strict=True)
                                      for _ in range(copies(decided))]
         try:
@@ -380,9 +389,10 @@ class CommandPoints:
                             args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         started = time.monotonic()
         decisions = [self.decide(args)]
-        delay = self.prepare(decisions, started)
+        delay = self.prepare(decisions)
         if delay:
             await asyncio.sleep(delay)
+        self.fail_unsent(decisions, started)
         try:
             replies = [await execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
         except Exception as error:
@@ -395,9 +405,10 @@ class CommandPoints:
         started = time.monotonic()
         stack: list[Queued] = list(pipeline.command_stack)
         decisions = [self.decide(queued_args) for queued_args, _ in stack]
-        delay = self.prepare(decisions, started)
+        delay = self.prepare(decisions)
         if delay:
             await asyncio.sleep(delay)
+        self.fail_unsent(decisions, started)
         pipeline.command_stack[:] = [queued for queued, decided in zip(stack, decisions, strict=True)
                                      for _ in range(copies(decided))]
         try:

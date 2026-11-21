@@ -6,7 +6,8 @@ from types import TracebackType
 from typing import Any, Final
 
 import faultpoint.runtime
-from faultpoint.actions import Crash, Delay, Fail, Negate, RaiseFail, RaiseFailAfter, Raising, SetValue, Shift
+from faultpoint.actions import (Crash, Delay, Fail, Negate, RaiseFail, RaiseFailAfter, Raising, SetValue, Shift,
+                                Wait)
 from faultpoint.observations import DetailKey, elapsed_ms, error_type
 from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
 
@@ -51,11 +52,11 @@ PLUGIN: Final = Plugin(actions={
 
 
 def decide_in_process(runtime: Runtime, point: str) -> Decision | None:
-    """The decision of an in-process point, whose delay blocks the thread as contention does; the point functions
-    run it as the SDK's own work."""
+    """The decision of an in-process point, whose delay, and the wait of a fail before it fails, block the thread as
+    contention does; the point functions run it as the SDK's own work."""
     decision = runtime.decide(point)
     match decision:
-        case Decision(action=Delay(ms=ms)):
+        case Decision(action=Delay(ms=ms)) | Decision(action=Wait(ms=int() as ms)):
             time.sleep(ms / 1000)
         case Decision(action=Crash(code=code)):
             runtime.crash(code)

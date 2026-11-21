@@ -24,10 +24,17 @@ class BoundaryError(StrEnum):
     REFUSED = "refused"
 
 
-class Fail(BaseModel):
-    """Forcing the error path of an in-process point."""
+class Wait(BaseModel):
+    """Waiting before a fail fails, as a slow failure does, such as a client library's after its retries; the wait
+    is that of a delay at the same point."""
 
     model_config = STRICT
+
+    ms: int | None = Field(default=None, gt=0)
+
+
+class Fail(Wait):
+    """Forcing the error path of an in-process point."""
 
     kind: Literal[ActionKind.FAIL]
     error: str | None = None
@@ -48,7 +55,7 @@ class Raising(BaseModel):
     error: ImportString[type[BaseException]] | None = None
 
 
-class RaiseFail(Raising):
+class RaiseFail(Raising, Wait):
     """Raising instead of running the call site's statement."""
 
     kind: Literal[ActionKind.FAIL]
@@ -69,7 +76,7 @@ class Failure(BaseModel):
     status: int | None = Field(default=None, ge=100, le=599)
 
 
-class BoundaryFail(Failure):
+class BoundaryFail(Failure, Wait):
     kind: Literal[ActionKind.FAIL]
 
 
@@ -102,7 +109,7 @@ class StoreFailure[Code: str](BaseModel):
         return self
 
 
-class StoreFail[Code: str](StoreFailure[Code]):
+class StoreFail[Code: str](StoreFailure[Code], Wait):
     kind: Literal[ActionKind.FAIL]
 
 

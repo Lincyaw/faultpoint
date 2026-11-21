@@ -180,7 +180,9 @@ class ServerPoint:
                 await self.app(scope, receive, send)
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
-            case Decision(action=BoundaryFail(status=status)):
+            case Decision(action=BoundaryFail(status=status, ms=ms)):
+                if ms is not None:
+                    await asyncio.sleep(ms / 1000)
                 await send_failure(send, status)
 
     async def respond_undecided(self, scope: Scope, exchange: ServerExchange, point: str) -> Decision | None:
@@ -313,7 +315,9 @@ class ClientPoint:
                 return send(request)
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
-            case Decision(action=BoundaryFail() as failure):
+            case Decision(action=BoundaryFail(ms=ms) as failure):
+                if ms is not None:
+                    time.sleep(ms / 1000)
                 return self.failed(failure, request)
             case Decision(action=Duplicate()):
                 request.read()
@@ -347,7 +351,9 @@ class ClientPoint:
                 return await send(request)
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
-            case Decision(action=BoundaryFail() as failure):
+            case Decision(action=BoundaryFail(ms=ms) as failure):
+                if ms is not None:
+                    await asyncio.sleep(ms / 1000)
                 return self.failed(failure, request)
             case Decision(action=Duplicate()):
                 await request.aread()

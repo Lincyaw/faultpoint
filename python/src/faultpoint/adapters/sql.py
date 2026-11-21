@@ -202,7 +202,9 @@ class Store:
                 return execute()
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
-            case Decision(action=StoreFail()):
+            case Decision(action=StoreFail(ms=ms)):
+                if ms is not None:
+                    time.sleep(ms / 1000)
                 raise self.failure(decision)
             case Decision(action=Drop()):
                 return None
@@ -230,7 +232,9 @@ class Store:
                 return await execute()
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
-            case Decision(action=StoreFail()):
+            case Decision(action=StoreFail(ms=ms)):
+                if ms is not None:
+                    await asyncio.sleep(ms / 1000)
                 raise self.failure(decision)
             case Decision(action=Drop()):
                 return None
