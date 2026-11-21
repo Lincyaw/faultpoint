@@ -17,7 +17,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::core::{Detail, Plugin, core};
-use crate::rules::{Rule, point_id};
+use crate::rules::{Rule, point_id, point_parts};
 
 /// spec/redis-commands.json, the table every SDK reads.
 const REDIS_COMMANDS: &str = include_str!("../../../spec/redis-commands.json");
@@ -32,11 +32,11 @@ static KEY_IDENTIFIER: LazyLock<Regex> = LazyLock::new(|| {
 
 static STATEMENTS: LazyLock<Mutex<HashMap<String, (&'static str, String)>>> = LazyLock::new(Mutex::default);
 
-/// What a rewritten call site supplies: the client's error for an injected failure, the value an empty read
-/// or a dropped write answers with, whether a read's value is empty, and the code a store gave an error, such as
-/// a SQLSTATE or the prefix of a Redis error reply.
+/// What a rewritten call site supplies: the client's error for an injected failure, which is the client's own error
+/// for the rule's code when it names one, the value an empty read or a dropped write answers with, whether a read's
+/// value is empty, and the code a store gave an error, such as a SQLSTATE or the prefix of a Redis error reply.
 pub struct Hooks<T, E> {
-    pub failure: fn() -> E,
+    pub failure: fn(Option<&str>) -> E,
     pub substitute: fn() -> Result<T, E>,
     pub is_empty: fn(&T) -> bool,
     pub code: fn(&E) -> Option<String>,
@@ -126,15 +126,16 @@ where
     let rule = core.decide(&point);
     let started = Instant::now();
     let action = rule.as_ref().map_or("", |rule| rule.action.kind.as_str());
+    let code = rule.as_ref().and_then(|rule| rule.action.parameters.get("code")).and_then(Value::as_str);
     let result = match (action, &rule) {
         ("delay", Some(rule)) => {
             tokio::time::sleep(Duration::from_secs_f64(number(rule, "ms") / 1000.0)).await;
             operation.await
         }
         ("crash", Some(rule)) => core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32),
-        ("fail", _) => Err((hooks.failure)()),
+        ("fail", _) => Err((hooks.failure)(code)),
         ("empty" | "drop", _) => (hooks.substitute)(),
-        ("fail_after", _) => operation.await.and_then(|_| Err((hooks.failure)())),
+        ("fail_after", _) => operation.await.and_then(|_| Err((hooks.failure)(code))),
         ("", _) => operation.await,
         (other, Some(rule)) => core.abort(&format!("rule {}: {other} is not implemented at {point}", rule.id)),
         (_, None) => unreachable!("an action comes from a rule"),
@@ -193,6 +194,85 @@ where
     }
 }
 
+/// The locators sql_point makes.
+static STATEMENT_LOCATOR: LazyLock<Regex> = LazyLock::new(|| Regex::new("^[^ ]+#[0-9a-f]{8}$").expect("a valid pattern"));
+static SQLSTATE: LazyLock<Regex> = LazyLock::new(|| Regex::new("^[0-9A-Z]{5}$").expect("a valid pattern"));
+/// The prefix of an error reply, which Redis writes as an upper-case word.
+static REPLY_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new("^[A-Z][A-Z0-9_]*$").expect("a valid pattern"));
+
+/// Why the store plugin cannot obey a rule: a code it cannot raise as the client's own error, which is a SQLSTATE at
+/// a statement point and an upper-case word, the prefix of an error reply, at a Redis point.
+fn refusal(rule: &Rule) -> Option<String> {
+    let code = rule.action.parameters.get("code")?.as_str()?;
+    let (_, kind) = point_parts(&rule.point).ok()?;
+    let locator = rule.point.splitn(3, ':').nth(2)?;
+    let (valid, form) = match redis_kind(locator.split(' ').next()?) {
+        Some(command) if command == kind => (REPLY_CODE.is_match(code), "the prefix of a Redis error reply, an upper-case word"),
+        None if (kind == "store_read" || kind == "store_write") && STATEMENT_LOCATOR.is_match(locator) => {
+            (SQLSTATE.is_match(code), "a SQLSTATE, five digits or upper-case letters")
+        }
+        _ => return None,
+    };
+    (!valid).then(|| format!("code {code} at {} is not {form}", rule.point))
+}
+
+/// The error a fail rule with a code raises at a sqlx call site: sqlx's Database variant, carrying an error whose
+/// code() is the SQLSTATE and whose kind() follows it as sqlx's PostgreSQL driver maps it. It expands in the
+/// application's crate, which depends on sqlx, since this crate depends on no client.
+#[macro_export]
+macro_rules! sqlx_database_error {
+    ($code:expr) => {{
+        #[derive(Debug)]
+        struct InjectedDatabaseError(::std::string::String);
+        impl ::std::fmt::Display for InjectedDatabaseError {
+            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                formatter.write_str("faultpoint: injected store failure")
+            }
+        }
+        impl ::std::error::Error for InjectedDatabaseError {}
+        impl ::sqlx::error::DatabaseError for InjectedDatabaseError {
+            fn message(&self) -> &str {
+                "faultpoint: injected store failure"
+            }
+            fn code(&self) -> ::std::option::Option<::std::borrow::Cow<'_, str>> {
+                ::std::option::Option::Some(::std::borrow::Cow::Borrowed(&self.0))
+            }
+            fn as_error(&self) -> &(dyn ::std::error::Error + ::core::marker::Send + ::core::marker::Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn ::std::error::Error + ::core::marker::Send + ::core::marker::Sync + 'static) {
+                self
+            }
+            fn into_error(self: ::std::boxed::Box<Self>)
+                -> ::std::boxed::Box<dyn ::std::error::Error + ::core::marker::Send + ::core::marker::Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> ::sqlx::error::ErrorKind {
+                match self.0.as_str() {
+                    "23505" => ::sqlx::error::ErrorKind::UniqueViolation,
+                    "23503" => ::sqlx::error::ErrorKind::ForeignKeyViolation,
+                    "23502" => ::sqlx::error::ErrorKind::NotNullViolation,
+                    "23514" => ::sqlx::error::ErrorKind::CheckViolation,
+                    _ => ::sqlx::error::ErrorKind::Other,
+                }
+            }
+        }
+        ::sqlx::Error::Database(::std::boxed::Box::new(InjectedDatabaseError(::std::string::ToString::to_string($code))))
+    }};
+}
+
+/// The error a fail rule with a code raises at a redis-rs call site: what redis-rs makes of an error reply with that
+/// prefix, read by its own parser. It expands in the application's crate, which depends on redis-rs.
+#[macro_export]
+macro_rules! redis_error_reply {
+    ($code:expr) => {
+        match ::redis::parse_redis_value(::std::format!("-{} faultpoint: injected Redis failure\r\n", $code).as_bytes()) {
+            ::std::result::Result::Err(error) => error,
+            ::std::result::Result::Ok(_) => ::std::unreachable!("redis-rs parses an error reply as an error"),
+        }
+    };
+}
+
 inventory::submit! {
     Plugin {
         name: "store",
@@ -202,6 +282,6 @@ inventory::submit! {
             ("publish", &["fail", "fail_after", "drop", "delay", "crash"]),
             ("consume", &["fail", "empty", "delay", "crash"]),
         ],
-        rule_source: None, sink: None, context: None,
+        rule_source: None, sink: None, context: None, check: Some(refusal),
     }
 }

@@ -395,7 +395,10 @@ fn sqlx_store(expression: &Expr) -> Option<Expr> {
         _ => return None,
     };
     Some(parse_quote!(::faultpoint::store::sql(#sql, #expression, ::faultpoint::store::Hooks {
-        failure: || ::sqlx::Error::Protocol(::std::string::String::from("faultpoint: injected store failure")),
+        failure: |code| match code {
+            ::std::option::Option::Some(code) => ::faultpoint::sqlx_database_error!(code),
+            ::std::option::Option::None => ::sqlx::Error::Protocol(::std::string::String::from("faultpoint: injected store failure")),
+        },
         substitute: #substitute,
         is_empty: #is_empty,
         code: |error| match error {
@@ -461,7 +464,10 @@ fn redis_store(expression: &Expr) -> Option<Expr> {
     // Arguments run left to right, so the key's text is taken before the chain moves the key, and the chain's
     // temporaries live to the end of the statement as they did before.
     Some(parse_quote!(::faultpoint::store::redis(#name, #key, #expression, ::faultpoint::store::Hooks {
-        failure: || ::redis::RedisError::from((::redis::ErrorKind::IoError, "faultpoint: injected Redis failure")),
+        failure: |code| match code {
+            ::std::option::Option::Some(code) => ::faultpoint::redis_error_reply!(code),
+            ::std::option::Option::None => ::redis::RedisError::from((::redis::ErrorKind::IoError, "faultpoint: injected Redis failure")),
+        },
         substitute: #substitute,
         is_empty: |_| false,
         code: |error| error.code().map(::std::borrow::ToOwned::to_owned),

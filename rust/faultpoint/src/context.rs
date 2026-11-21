@@ -37,9 +37,9 @@ fn file_rules(settings: &Settings, _: &Value) -> Option<Box<dyn RuleSource>> {
 }
 
 inventory::submit! {
-    Plugin { name: "otel", kinds: &[], rule_source: None, sink: None, context: Some(otel_context) }
+    Plugin { name: "otel", kinds: &[], rule_source: None, sink: None, context: Some(otel_context), check: None }
 }
 
 inventory::submit! {
-    Plugin { name: "file", kinds: &[], rule_source: Some(file_rules), sink: None, context: None }
+    Plugin { name: "file", kinds: &[], rule_source: Some(file_rules), sink: None, context: None, check: None }
 }

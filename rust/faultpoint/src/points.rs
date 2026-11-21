@@ -219,6 +219,6 @@ inventory::submit! {
             ("clock", &["shift", "delay", "crash"]),
             ("acquire", &["fail", "delay", "crash"]),
         ],
-        rule_source: None, sink: None, context: None,
+        rule_source: None, sink: None, context: None, check: None,
     }
 }

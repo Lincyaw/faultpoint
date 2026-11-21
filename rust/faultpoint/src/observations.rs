@@ -128,5 +128,5 @@ fn jsonl_sink(settings: &Settings, options: &Value) -> Option<Box<dyn Observatio
 }
 
 inventory::submit! {
-    Plugin { name: "jsonl", kinds: &[], rule_source: None, sink: Some(jsonl_sink), context: None }
+    Plugin { name: "jsonl", kinds: &[], rule_source: None, sink: Some(jsonl_sink), context: None, check: None }
 }

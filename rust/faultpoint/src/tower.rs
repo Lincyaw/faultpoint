@@ -158,6 +158,6 @@ inventory::submit! {
     Plugin {
         name: "tower",
         kinds: &[("rpc_server", &["fail", "fail_after", "delay", "crash"])],
-        rule_source: None, sink: None, context: None,
+        rule_source: None, sink: None, context: None, check: None,
     }
 }

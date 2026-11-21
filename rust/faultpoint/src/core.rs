@@ -48,6 +48,9 @@ pub struct Plugin {
     pub rule_source: Option<fn(&Settings, &Value) -> Option<Box<dyn RuleSource>>>,
     pub sink: Option<fn(&Settings, &Value) -> Option<Box<dyn ObservationSink>>>,
     pub context: Option<fn(&Settings, &Value) -> Box<dyn ContextProvider>>,
+    /// Why the plugin cannot obey a rule of this service, asked of every rule when its rule set loads, for what an
+    /// action's parameters ask that the plugin cannot do; a plugin passes over the kinds it does not serve.
+    pub check: Option<fn(&Rule) -> Option<String>>,
 }
 
 inventory::collect!(Plugin);
@@ -71,6 +74,7 @@ pub struct Core {
     pub settings: Settings,
     pub enabled: bool,
     declared: HashMap<&'static str, HashSet<&'static str>>,
+    checks: Vec<fn(&Rule) -> Option<String>>,
     state: RwLock<Arc<RuleState>>,
     counters: Mutex<HashMap<String, Counter>>,
     sink: Option<Box<dyn ObservationSink>>,
@@ -102,7 +106,7 @@ impl Core {
             panic!("faultpoint: FAULTPOINT_SERVICE is required when faultpoint is enabled");
         }
         let mut core = Core {
-            settings, enabled, declared: HashMap::new(), state: RwLock::default(), counters: Mutex::default(),
+            settings, enabled, declared: HashMap::new(), checks: Vec::new(), state: RwLock::default(), counters: Mutex::default(),
             sink: None, context: None, sources: Mutex::default(),
         };
         if !enabled {
@@ -119,6 +123,7 @@ impl Core {
                 let offered: HashSet<&'static str> = actions.iter().copied().collect();
                 core.declared.entry(kind).and_modify(|known| known.retain(|action| offered.contains(action))).or_insert(offered);
             }
+            core.checks.extend(plugin.check);
             if let Some(sink) = plugin.sink.and_then(|build| build(&core.settings, &options)) {
                 core.sink = Some(sink);
             }
@@ -145,6 +150,9 @@ impl Core {
             if !actions.contains(rule.action.kind.as_str()) {
                 self.abort(&format!("rule {}: not every plugin of this process serving it implements {} at a {kind} point",
                                     rule.id, rule.action.kind));
+            }
+            if let Some(refusal) = self.checks.iter().find_map(|check| check(&rule)) {
+                self.abort(&format!("rule {}: {refusal}", rule.id));
             }
             rules.entry(rule.point.clone()).or_default().push(rule);
         }
