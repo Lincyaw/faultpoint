@@ -80,14 +80,14 @@ INJECTED_MESSAGE: Final = "faultpoint: injected failure"
 that comes with the code."""
 
 
-class StoreFailure(BaseModel):
+class StoreFailure[Code: str](BaseModel):
     """What the caller of a failed store or message broker sees: a boundary error, or the client library's own error
-    with the code the rule names."""
+    with the code the rule names, in the form the plugin serving the point gives its codes."""
 
     model_config = STRICT
 
     error: BoundaryError | None = None
-    code: str | None = Field(default=None, min_length=1)
+    code: Code | None = None
     """The code the client library reports, such as a SQLSTATE or the prefix of a Redis error reply."""
 
     @model_validator(mode="after")
@@ -97,11 +97,11 @@ class StoreFailure(BaseModel):
         return self
 
 
-class StoreFail(StoreFailure):
+class StoreFail[Code: str](StoreFailure[Code]):
     kind: Literal[ActionKind.FAIL]
 
 
-class StoreFailAfter(StoreFailure):
+class StoreFailAfter[Code: str](StoreFailure[Code]):
     """A failure the caller sees after the write or the message took place."""
 
     kind: Literal[ActionKind.FAIL_AFTER]

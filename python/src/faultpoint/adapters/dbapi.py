@@ -7,8 +7,7 @@ from typing import Any, Final, Self
 import wrapt
 from pydantic import BaseModel, JsonValue
 
-from faultpoint.adapters.sql import CursorStatement, Store, quiet_classification
-from faultpoint.adapters.store import READ_ACTIONS, WRITE_ACTIONS, StoreKind
+from faultpoint.adapters.sql import STATEMENT_ACTIONS, CursorStatement, Store, quiet_classification, statement_points
 from faultpoint.rules import STRICT
 from faultpoint.runtime import Plugin, Runtime
 
@@ -120,4 +119,4 @@ def install(runtime: Runtime, options: dict[str, JsonValue]) -> None:
         wrapt.register_post_import_hook(functools.partial(patch_driver, runtime, dbapi.dialect), driver)
 
 
-PLUGIN: Final = Plugin(actions={StoreKind.READ: READ_ACTIONS, StoreKind.WRITE: WRITE_ACTIONS}, install=install)
+PLUGIN: Final = Plugin(actions=STATEMENT_ACTIONS, serves=statement_points, install=install)

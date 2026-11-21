@@ -13,8 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints
 
 from faultpoint.actions import (INJECTED_MESSAGE, BoundaryError, Crash, Delay, Drop, Duplicate, Empty, StoreFail,
                                 StoreFailAfter, StoreFailure)
-from faultpoint.adapters.store import (CONSUME_ACTIONS, READ_ACTIONS, WRITE_ACTIONS, MessageKind, StoreKind,
-                                       StoreOutcome)
+from faultpoint.adapters.store import (MessageKind, StoreKind, StoreOutcome, consume_actions, read_actions,
+                                       write_actions)
 from faultpoint.observations import DetailKey, error_type
 from faultpoint.rules import point_id
 from faultpoint.runtime import Decision, Plugin, Runtime
@@ -28,7 +28,10 @@ KEY_POSITION: Final = r"^(after:\S+|numkeys:\d+)$"
 AFTER: Final = "after"
 STREAMS_KEY: Final = "after:STREAMS"
 CONTAINERS: Final = (list, tuple, dict, set)
-ERROR_CODE: Final = re.compile(r"^[A-Z][A-Z0-9_]*(?= )")
+REPLY_CODE: Final = r"[A-Z][A-Z0-9_]*"
+"""The code of an error reply, its first word in capitals."""
+ERROR_CODE: Final = re.compile(rf"^{REPLY_CODE}(?= )")
+ReplyCode = Annotated[str, StringConstraints(pattern=rf"^{REPLY_CODE}$")]
 
 type Queued = tuple[tuple[Any, ...], dict[str, Any]]
 
@@ -231,15 +234,12 @@ class CommandPoints:
 
     def coded_error(self, decision: Decision, code: str) -> Exception:
         """The error redis-py raises for an error reply that starts with the code, from redis-py's own parsing of
-        the reply, which keeps the code only when it is the reply's first word in capitals."""
+        the reply."""
         try:
             error = self.parser.parse_error(f"{code} {INJECTED_MESSAGE}")
         except ValueError as reason:
             self.runtime.refuse(decision, f"redis-py builds the error of a {code} reply from the arguments Redis "
                                           f"sends with the code: {reason}")
-        if self.error_detail(error).get(DetailKey.CODE) != code:
-            self.runtime.refuse(decision, f"redis-py reports no code {code} for an error reply, whose code is its "
-                                          f"first word in capitals")
         return error
 
     def error_detail(self, error: BaseException) -> dict[str, str]:
@@ -395,15 +395,29 @@ def patch(runtime: Runtime, key_identifier: re.Pattern[str], commands: dict[str,
     wrapt.register_post_import_hook(functools.partial(patch_asyncio, points), REDIS_ASYNCIO_MODULE)
 
 
-def install(runtime: Runtime, options: dict[str, JsonValue]) -> None:
+def configured_table(options: dict[str, JsonValue]) -> CommandTable:
+    """The command table as the options extend it, its commands by upper-case name."""
     table = CommandTable.model_validate_json(
         importlib.resources.files("faultpoint").joinpath(*COMMANDS_FILE).read_bytes())
     extension = RedisOptions.model_validate(options)
-    key_identifier = table.key_identifier if extension.key_identifier is None else extension.key_identifier
-    commands = {name.upper(): command for name, command in {**table.commands, **extension.commands}.items()}
-    wrapt.register_post_import_hook(functools.partial(patch, runtime, key_identifier, commands), REDIS_MODULE)
+    return table.model_copy(update={
+        "key_identifier": table.key_identifier if extension.key_identifier is None else extension.key_identifier,
+        "commands": {name.upper(): command for name, command in {**table.commands, **extension.commands}.items()}})
 
 
-PLUGIN: Final = Plugin(actions={StoreKind.READ: READ_ACTIONS, StoreKind.WRITE: WRITE_ACTIONS,
-                                MessageKind.PUBLISH: WRITE_ACTIONS, MessageKind.CONSUME: CONSUME_ACTIONS},
-                       install=install)
+def command_points(options: dict[str, JsonValue]) -> Callable[[str], bool]:
+    """Which points the plugin serves: those whose locator starts with a command of the table."""
+    commands = configured_table(options).commands
+    return lambda locator: locator.partition(" ")[0] in commands
+
+
+def install(runtime: Runtime, options: dict[str, JsonValue]) -> None:
+    table = configured_table(options)
+    wrapt.register_post_import_hook(functools.partial(patch, runtime, table.key_identifier, table.commands),
+                                    REDIS_MODULE)
+
+
+PLUGIN: Final = Plugin(actions={StoreKind.READ: read_actions(ReplyCode), StoreKind.WRITE: write_actions(ReplyCode),
+                                MessageKind.PUBLISH: write_actions(ReplyCode),
+                                MessageKind.CONSUME: consume_actions(ReplyCode)},
+                       serves=command_points, install=install)

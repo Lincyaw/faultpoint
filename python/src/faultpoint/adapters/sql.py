@@ -3,19 +3,20 @@ import contextvars
 import functools
 import hashlib
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from types import ModuleType
-from typing import Any, Final
+from typing import Annotated, Any, Final
 
 import sqlglot
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue, StringConstraints
 from sqlglot import exp
 from sqlglot.errors import ErrorLevel
 
 from faultpoint.actions import (BoundaryError, Crash, Delay, Drop, Duplicate, Empty, StoreFail, StoreFailAfter,
                                 StoreFailure)
-from faultpoint.adapters.store import StoreKind, StoreOutcome
+from faultpoint.adapters.store import StoreKind, StoreOutcome, read_actions, write_actions
 from faultpoint.observations import DetailKey, error_type
 from faultpoint.rules import point_id
 from faultpoint.runtime import Decision, Runtime
@@ -23,8 +24,19 @@ from faultpoint.runtime import Decision, Runtime
 SQLGLOT_LOGGER: Final = "sqlglot"
 STATEMENT_CACHE_SIZE: Final = 4096
 DIGEST_LENGTH: Final = 8
+STATEMENT_LOCATOR: Final = re.compile(rf"^[^ ]+#[0-9a-f]{{{DIGEST_LENGTH}}}$")
+"""The shape of a statement point's locator, its tables and its hash, which no Redis command point has."""
 CLASSIFYING: Final = contextvars.ContextVar("faultpoint_classifying", default=False)
 ERROR_CODE_ATTRIBUTES: Final = ("sqlstate", "sqlite_errorname")
+SqlState = Annotated[str, StringConstraints(pattern=r"^[0-9A-Z]{5}$")]
+STATEMENT_ACTIONS: Final[dict[str, object]] = {StoreKind.READ: read_actions(SqlState),
+                                               StoreKind.WRITE: write_actions(SqlState)}
+"""The actions of the statement points of every SQL plugin, whose failures name SQLSTATEs."""
+
+
+def statement_points(options: dict[str, JsonValue]) -> Callable[[str], bool]:
+    """Which points a SQL plugin serves, whatever its options: the statement points."""
+    return lambda locator: STATEMENT_LOCATOR.fullmatch(locator) is not None
 
 
 class ClassificationFilter(logging.Filter):

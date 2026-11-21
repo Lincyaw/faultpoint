@@ -7,8 +7,7 @@ import wrapt
 from pydantic import BaseModel, JsonValue
 
 from faultpoint.actions import INJECTED_MESSAGE
-from faultpoint.adapters.sql import CursorStatement, Store, quiet_classification
-from faultpoint.adapters.store import READ_ACTIONS, WRITE_ACTIONS, StoreKind
+from faultpoint.adapters.sql import STATEMENT_ACTIONS, CursorStatement, Store, quiet_classification, statement_points
 from faultpoint.rules import STRICT
 from faultpoint.runtime import Decision, Plugin, Runtime
 
@@ -48,9 +47,6 @@ class PsycopgStore(Store):
             error_class = errors.lookup(code)
         except KeyError:
             self.runtime.refuse(decision, f"psycopg has no error class for the SQLSTATE {code}")
-        if error_class.sqlstate != code:
-            self.runtime.refuse(decision, f"{code} is not a SQLSTATE: psycopg reports this error with the SQLSTATE "
-                                          f"{error_class.sqlstate}")
         return error_class(INJECTED_MESSAGE, info={field.SEVERITY: b"ERROR", field.SQLSTATE: code.encode(),
                                                    field.MESSAGE_PRIMARY: INJECTED_MESSAGE.encode()})
 
@@ -156,4 +152,4 @@ def install(runtime: Runtime, options: dict[str, JsonValue]) -> None:
     wrapt.register_post_import_hook(functools.partial(patch, runtime, psycopg.dialect), PSYCOPG_MODULE)
 
 
-PLUGIN: Final = Plugin(actions={StoreKind.READ: READ_ACTIONS, StoreKind.WRITE: WRITE_ACTIONS}, install=install)
+PLUGIN: Final = Plugin(actions=STATEMENT_ACTIONS, serves=statement_points, install=install)

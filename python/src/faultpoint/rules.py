@@ -48,6 +48,10 @@ class Rule(BaseModel):
     def kind(self) -> str:
         return self.point.split(":", 2)[1]
 
+    @property
+    def locator(self) -> str:
+        return self.point.split(":", 2)[2]
+
 
 class RuleSet(BaseModel):
     model_config = STRICT

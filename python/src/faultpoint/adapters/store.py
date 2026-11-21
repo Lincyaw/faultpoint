@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Final
+from typing import Any
 
 from faultpoint.actions import Crash, Delay, Drop, Duplicate, Empty, StoreFail, StoreFailAfter
 from faultpoint.runtime import implemented_actions
@@ -24,7 +24,16 @@ class StoreOutcome(StrEnum):
     ERROR = "error"
 
 
-READ_ACTIONS: Final = implemented_actions(StoreFail, Empty, Delay, Crash)
-WRITE_ACTIONS: Final = implemented_actions(StoreFail, StoreFailAfter, Drop, Duplicate, Delay, Crash)
-"""The actions of store_write and publish points."""
-CONSUME_ACTIONS: Final = implemented_actions(StoreFail, StoreFailAfter, Duplicate, Empty, Delay, Crash)
+def read_actions(code: Any) -> object:
+    """The actions of store_read points, whose failures name codes of this type."""
+    return implemented_actions(StoreFail[code], Empty, Delay, Crash)
+
+
+def write_actions(code: Any) -> object:
+    """The actions of store_write and publish points, whose failures name codes of this type."""
+    return implemented_actions(StoreFail[code], StoreFailAfter[code], Drop, Duplicate, Delay, Crash)
+
+
+def consume_actions(code: Any) -> object:
+    """The actions of consume points, whose failures name codes of this type."""
+    return implemented_actions(StoreFail[code], StoreFailAfter[code], Duplicate, Empty, Delay, Crash)

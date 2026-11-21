@@ -92,34 +92,51 @@ def refusal(kind: str, issue: ErrorDetails) -> str:
     return f"rule {rule}: {problem}"
 
 
+class KindServer(BaseModel):
+    """A plugin serving a kind: the actions it parses, and which of the kind's points it serves by their locators;
+    None serves them all."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    actions: TypeAdapter[dict[str, BaseModel]]
+    serves: Callable[[str], bool] | None
+
+
 class Runtime:
     """The kinds this process's plugins serve, the rules it obeys, and where its observations go."""
 
     def __init__(self, settings: Settings, config: Config, plugins: Mapping[str, "Plugin"]) -> None:
         self.settings = settings
         self.config = config
-        self.kinds: dict[str, list[TypeAdapter[dict[str, BaseModel]]]] = {}
-        for plugin in plugins.values():
+        self.kinds: dict[str, list[KindServer]] = {}
+        for name, plugin in plugins.items():
+            serves = None if plugin.serves is None else plugin.serves(config.options.get(name, {}))
             for kind, actions in plugin.actions.items():
-                self.kinds.setdefault(kind, []).append(TypeAdapter(dict[str, actions]))
+                self.kinds.setdefault(kind, []).append(
+                    KindServer(actions=TypeAdapter(dict[str, actions]), serves=serves))
         self.context = provided((plugin.context for plugin in plugins.values()), otel_context)(config)
         self.sink = provided((plugin.sink for plugin in plugins.values()), jsonl_sink)(settings, config)
         self.rules = RulesInForce("", (), settings.seed)
 
     def load(self, ruleset: RuleSet) -> None:
-        """Obey a rule set once every plugin that serves the kind of one of its rules here parses its action."""
+        """Obey a rule set once every plugin here that serves the point of one of its rules parses its action."""
         applicable = [rule for rule in ruleset.rules
                       if rule.service == self.settings.service and rule.kind in self.kinds]
         actions: dict[str, BaseModel] = {}
         problems: list[str] = []
-        for kind, adapters in self.kinds.items():
-            declared = {rule.id: rule.action.model_dump() for rule in applicable if rule.kind == kind}
-            try:
-                actions |= [adapter.validate_python(declared) for adapter in adapters][0]
-            except ValidationError as error:
-                problems.extend(refusal(kind, issue) for issue in error.errors())
+        for rule in applicable:
+            servers = [server for server in self.kinds[rule.kind]
+                       if server.serves is None or server.serves(rule.locator)]
+            if not servers:
+                problems.append(f"rule {rule.id}: no plugin of this process serves the point {rule.point}")
+            for server in servers:
+                try:
+                    actions |= server.actions.validate_python({rule.id: rule.action.model_dump()})
+                except ValidationError as error:
+                    problems.extend(refusal(rule.kind, issue) for issue in error.errors())
         if problems:
-            raise RuleRefused("\n".join(problems))
+            # Plugins that parse a rule into the same models refuse it in the same words.
+            raise RuleRefused("\n".join(dict.fromkeys(problems)))
         if self.sink is not None:
             self.sink.flush()
         self.rules = RulesInForce(ruleset.experiment,
@@ -154,8 +171,9 @@ class Runtime:
         os._exit(code)
 
     def refuse(self, decision: Decision, problem: str) -> NoReturn:
-        """Stop the process at a rule the point it fires at cannot obey, which loading could not tell, since a
-        point id does not say which plugin reaches it; the observations so far are kept."""
+        """Stop the process at a rule the point it fires at cannot obey, which loading could not tell, since the id
+        of a point that several plugins serve does not say which of them reaches it; the observations so far are
+        kept."""
         if self.sink is not None:
             self.sink.flush()
         stop(RuleRefused(f"rule {decision.rule.id}: {problem}"))
@@ -167,8 +185,11 @@ class Plugin(BaseModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     actions: dict[str, object] = Field(default_factory=dict)
-    """The actions per kind; plugins serving one kind parse its actions into the same models, since a point id
-    does not say which of them reaches the point."""
+    """The actions per kind; plugins serving one point parse its actions into the same models, since its id does
+    not say which of them reaches it."""
+    serves: Callable[[dict[str, JsonValue]], Callable[[str], bool]] | None = None
+    """Which points of its kinds the plugin serves, by the shape of the locators its adapter gives, built from its
+    options; None serves them all. A rule is held only to the plugins that serve its point."""
     install: Callable[[Runtime, dict[str, JsonValue]], None] | None = None
     """Called with the options the configuration gives under the plugin's name."""
     source: Callable[[Settings, Config], RuleSource | None] | None = None
