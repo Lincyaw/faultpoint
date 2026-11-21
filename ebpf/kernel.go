@@ -6,6 +6,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"slices"
 
@@ -27,22 +28,28 @@ const (
 var syscallEntryPrefixes = map[string]string{"amd64": "__x64_sys_", "arm64": "__arm64_sys_"}
 
 // kernel holds what lives as long as the agent, including the triggers, so a rule set's injections stay readable
-// after it is detached, and the native points with the probes at their returns.
+// after it is detached, the native points with the probes at their returns, and the event points with their probes.
 type kernel struct {
 	spec    *ebpf.CollectionSpec
 	objects struct {
-		ObserveSyscall *ebpf.Program `ebpf:"observe_syscall"`
-		LeaveNative    *ebpf.Program `ebpf:"leave_native"`
-		CgroupServices *ebpf.Map     `ebpf:"cgroup_services"`
-		Marks          *ebpf.Map     `ebpf:"marks"`
-		Natural        *ebpf.Map     `ebpf:"natural"`
-		Triggers       *ebpf.Map     `ebpf:"triggers"`
-		NativeSites    *ebpf.Map     `ebpf:"native_sites"`
-		NativeRules    *ebpf.Map     `ebpf:"native_rules"`
-		NativeOutcomes *ebpf.Map     `ebpf:"native_outcomes"`
+		ObserveSyscall    *ebpf.Program `ebpf:"observe_syscall"`
+		LeaveNative       *ebpf.Program `ebpf:"leave_native"`
+		ObserveUsdt       *ebpf.Program `ebpf:"observe_usdt"`
+		ObserveTracepoint *ebpf.Program `ebpf:"observe_tracepoint"`
+		CgroupServices    *ebpf.Map     `ebpf:"cgroup_services"`
+		Marks             *ebpf.Map     `ebpf:"marks"`
+		Natural           *ebpf.Map     `ebpf:"natural"`
+		Triggers          *ebpf.Map     `ebpf:"triggers"`
+		NativeSites       *ebpf.Map     `ebpf:"native_sites"`
+		NativeRules       *ebpf.Map     `ebpf:"native_rules"`
+		NativeOutcomes    *ebpf.Map     `ebpf:"native_outcomes"`
+		EventServices     *ebpf.Map     `ebpf:"event_services"`
+		EventCounts       *ebpf.Map     `ebpf:"event_counts"`
 	}
-	points []nativePoint
-	links  []link.Link
+	points     []nativePoint
+	events     []eventPoint
+	eventFiles []*os.File
+	links      []link.Link
 }
 
 // injector holds what one rule set attached; closing it detaches every program, removes the qdiscs it installed and
@@ -138,9 +145,11 @@ func (k *kernel) Close() error {
 	for _, point := range k.points {
 		errs = append(errs, closeFiles(point.files))
 	}
-	errs = append(errs, k.objects.ObserveSyscall.Close(), k.objects.LeaveNative.Close(), k.objects.CgroupServices.Close(),
+	errs = append(errs, closeFiles(k.eventFiles), k.objects.ObserveSyscall.Close(), k.objects.LeaveNative.Close(),
+		k.objects.ObserveUsdt.Close(), k.objects.ObserveTracepoint.Close(), k.objects.CgroupServices.Close(),
 		k.objects.Marks.Close(), k.objects.Natural.Close(), k.objects.Triggers.Close(), k.objects.NativeSites.Close(),
-		k.objects.NativeRules.Close(), k.objects.NativeOutcomes.Close())
+		k.objects.NativeRules.Close(), k.objects.NativeOutcomes.Close(), k.objects.EventServices.Close(),
+		k.objects.EventCounts.Close())
 	return errors.Join(errs...)
 }
 

@@ -12,8 +12,8 @@ import (
 )
 
 // collect hands the sinks what the kernel counted since the last collection: the natural outcomes of the observed
-// syscalls, the natural and injected outcomes of the native points, and the executions each syscall or packet rule
-// injected, which are as many as its trigger fired up to its limit.
+// syscalls, the natural and injected outcomes of the native points, the firings of the event points, and the executions
+// each syscall or packet rule injected, which are as many as its trigger fired up to its limit.
 func (a *agent) collect() error {
 	err := countSince(a.kernel.objects.Natural, a.natural, func(key pointsNaturalKey, delta uint64) {
 		name := a.services[key.Service].name
@@ -37,6 +37,21 @@ func (a *agent) collect() error {
 	})
 	if err != nil {
 		return fmt.Errorf("cannot read the native counts: %w", err)
+	}
+	for index, event := range a.kernel.events {
+		var perCPU []uint64
+		if err := a.kernel.objects.EventCounts.Lookup(uint32(index), &perCPU); err != nil {
+			return fmt.Errorf("cannot read the count of event %s: %w", event.id, err)
+		}
+		var total uint64
+		for _, count := range perCPU {
+			total += count
+		}
+		if delta := total - a.fired[uint32(index)]; delta > 0 {
+			a.sinks[event.service].Add(faultpoint.Observation{Experiment: a.experiment, Point: event.id,
+				Outcome: outcomeFired, Count: int(delta)})
+		}
+		a.fired[uint32(index)] = total
 	}
 	if a.rules == nil {
 		return nil

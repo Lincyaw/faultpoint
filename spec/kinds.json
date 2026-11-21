@@ -101,6 +101,11 @@
       "actions": ["delay", "drop"],
       "outcomes": ["delayed", "dropped"],
       "scope": false
+    },
+    "event": {
+      "actions": [],
+      "outcomes": ["fired"],
+      "scope": false
     }
   }
 }

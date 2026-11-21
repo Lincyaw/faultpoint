@@ -7,6 +7,7 @@
 #define MAX_CGROUP_LEVEL 32
 #define MAX_NATIVE_SITES 4096
 #define MAX_RESULT_REGISTERS 4
+#define MAX_EVENTS 4096
 #define SIGKILL 9
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86DD
@@ -186,6 +187,21 @@ struct {
 	__type(key, struct native_key);
 	__type(value, __u64);
 } native_outcomes SEC(".maps");
+
+/* The service of each event point, indexed by the cookie of its probes. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_EVENTS);
+	__type(key, __u32);
+	__type(value, __u32);
+} event_services SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, MAX_EVENTS);
+	__type(key, __u32);
+	__type(value, __u64);
+} event_counts SEC(".maps");
 
 static __always_inline __u32 *current_service(void)
 {
@@ -402,6 +418,34 @@ int leave_native(struct pt_regs *ctx)
 		return 0;
 	}
 	count_native(site, 0, result);
+	return 0;
+}
+
+static __always_inline void count_event(void *ctx)
+{
+	__u32 *service = current_service();
+	if (!service)
+		return;
+	__u32 event = bpf_get_attach_cookie(ctx);
+	__u32 *owner = bpf_map_lookup_elem(&event_services, &event);
+	__u64 *count = bpf_map_lookup_elem(&event_counts, &event);
+	if (owner && count && *owner == *service)
+		__sync_fetch_and_add(count, 1);
+}
+
+/* At a site of a USDT probe, the probe fired. */
+SEC("uprobe")
+int observe_usdt(struct pt_regs *ctx)
+{
+	count_event(ctx);
+	return 0;
+}
+
+/* At a tracepoint, the event fired in the current task. */
+SEC("tracepoint")
+int observe_tracepoint(void *ctx)
+{
+	count_event(ctx);
 	return 0;
 }
 

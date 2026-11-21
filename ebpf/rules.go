@@ -38,9 +38,9 @@ const (
 )
 
 // actions are the actions the agent implements at each kind it serves, as a plugin declares them to the core; it
-// serves call and check points only in native functions.
+// serves call and check points only in native functions, and an event point is only observed.
 var actions = map[string][]string{kindSyscall: {actionFail, actionCrash}, kindPacket: {actionDelay, actionDrop},
-	kindCall: {actionFail, actionCrash}, kindCheck: {actionNegate, actionCrash}}
+	kindCall: {actionFail, actionCrash}, kindCheck: {actionNegate, actionCrash}, kindEvent: {}}
 
 var directions = map[string]pointsDirection{directionEgress: pointsDirectionEGRESS, directionIngress: pointsDirectionINGRESS}
 

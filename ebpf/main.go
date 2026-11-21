@@ -31,6 +31,7 @@ type agent struct {
 	sinks      map[string]*faultpoint.JSONLSink
 	natural    map[pointsNaturalKey]uint64
 	outcomes   map[pointsNativeKey]uint64
+	fired      map[uint32]uint64
 	injected   []uint64
 }
 
@@ -73,14 +74,21 @@ func main() {
 	if err != nil {
 		faultpoint.Abort("%v", err)
 	}
+	selected, err := selectedRecords(options, services)
+	if err != nil {
+		faultpoint.Abort("%v", err)
+	}
 	loaded, err := loadKernel(services)
 	if err != nil {
 		faultpoint.Abort("%v", err)
 	}
 	a := &agent{services: services, seed: seed, kernel: loaded, sinks: map[string]*faultpoint.JSONLSink{},
-		natural: map[pointsNaturalKey]uint64{}, outcomes: map[pointsNativeKey]uint64{}}
+		natural: map[pointsNaturalKey]uint64{}, outcomes: map[pointsNativeKey]uint64{}, fired: map[uint32]uint64{}}
 	faultpoint.AtExit(a.shutdown)
 	if err := loaded.observeFunctions(points, sites); err != nil {
+		faultpoint.Abort("%v", err)
+	}
+	if err := loaded.observeEvents(selected); err != nil {
 		faultpoint.Abort("%v", err)
 	}
 	for _, name := range options.Syscalls {

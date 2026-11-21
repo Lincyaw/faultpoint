@@ -170,23 +170,27 @@ type pointsTrigger struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	pointsMapCgroupServices  = "cgroup_services"
-	pointsMapMarks           = "marks"
-	pointsMapNativeOutcomes  = "native_outcomes"
-	pointsMapNativeRules     = "native_rules"
-	pointsMapNativeSites     = "native_sites"
-	pointsMapNatural         = "natural"
-	pointsMapPacketRules     = "packet_rules"
-	pointsMapSyscallRules    = "syscall_rules"
-	pointsMapTriggers        = "triggers"
-	pointsProgEnterNative    = "enter_native"
-	pointsProgInjectPacket   = "inject_packet"
-	pointsProgInjectSyscall  = "inject_syscall"
-	pointsProgLeaveNative    = "leave_native"
-	pointsProgObserveSyscall = "observe_syscall"
-	pointsVarCgroupLevels    = "cgroup_levels"
-	pointsVarPacketDirection = "packet_direction"
-	pointsVarPacketService   = "packet_service"
+	pointsMapCgroupServices     = "cgroup_services"
+	pointsMapEventCounts        = "event_counts"
+	pointsMapEventServices      = "event_services"
+	pointsMapMarks              = "marks"
+	pointsMapNativeOutcomes     = "native_outcomes"
+	pointsMapNativeRules        = "native_rules"
+	pointsMapNativeSites        = "native_sites"
+	pointsMapNatural            = "natural"
+	pointsMapPacketRules        = "packet_rules"
+	pointsMapSyscallRules       = "syscall_rules"
+	pointsMapTriggers           = "triggers"
+	pointsProgEnterNative       = "enter_native"
+	pointsProgInjectPacket      = "inject_packet"
+	pointsProgInjectSyscall     = "inject_syscall"
+	pointsProgLeaveNative       = "leave_native"
+	pointsProgObserveSyscall    = "observe_syscall"
+	pointsProgObserveTracepoint = "observe_tracepoint"
+	pointsProgObserveUsdt       = "observe_usdt"
+	pointsVarCgroupLevels       = "cgroup_levels"
+	pointsVarPacketDirection    = "packet_direction"
+	pointsVarPacketService      = "packet_service"
 )
 
 // loadPoints returns the embedded CollectionSpec for points.
@@ -231,11 +235,13 @@ type pointsSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type pointsProgramSpecs struct {
-	EnterNative    *ebpf.ProgramSpec `ebpf:"enter_native"`
-	InjectPacket   *ebpf.ProgramSpec `ebpf:"inject_packet"`
-	InjectSyscall  *ebpf.ProgramSpec `ebpf:"inject_syscall"`
-	LeaveNative    *ebpf.ProgramSpec `ebpf:"leave_native"`
-	ObserveSyscall *ebpf.ProgramSpec `ebpf:"observe_syscall"`
+	EnterNative       *ebpf.ProgramSpec `ebpf:"enter_native"`
+	InjectPacket      *ebpf.ProgramSpec `ebpf:"inject_packet"`
+	InjectSyscall     *ebpf.ProgramSpec `ebpf:"inject_syscall"`
+	LeaveNative       *ebpf.ProgramSpec `ebpf:"leave_native"`
+	ObserveSyscall    *ebpf.ProgramSpec `ebpf:"observe_syscall"`
+	ObserveTracepoint *ebpf.ProgramSpec `ebpf:"observe_tracepoint"`
+	ObserveUsdt       *ebpf.ProgramSpec `ebpf:"observe_usdt"`
 }
 
 // pointsMapSpecs contains maps before they are loaded into the kernel.
@@ -243,6 +249,8 @@ type pointsProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type pointsMapSpecs struct {
 	CgroupServices *ebpf.MapSpec `ebpf:"cgroup_services"`
+	EventCounts    *ebpf.MapSpec `ebpf:"event_counts"`
+	EventServices  *ebpf.MapSpec `ebpf:"event_services"`
 	Marks          *ebpf.MapSpec `ebpf:"marks"`
 	NativeOutcomes *ebpf.MapSpec `ebpf:"native_outcomes"`
 	NativeRules    *ebpf.MapSpec `ebpf:"native_rules"`
@@ -283,6 +291,8 @@ func (o *pointsObjects) Close() error {
 // It can be passed to loadPointsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type pointsMaps struct {
 	CgroupServices *ebpf.Map `ebpf:"cgroup_services"`
+	EventCounts    *ebpf.Map `ebpf:"event_counts"`
+	EventServices  *ebpf.Map `ebpf:"event_services"`
 	Marks          *ebpf.Map `ebpf:"marks"`
 	NativeOutcomes *ebpf.Map `ebpf:"native_outcomes"`
 	NativeRules    *ebpf.Map `ebpf:"native_rules"`
@@ -296,6 +306,8 @@ type pointsMaps struct {
 func (m *pointsMaps) Close() error {
 	return _PointsClose(
 		m.CgroupServices,
+		m.EventCounts,
+		m.EventServices,
 		m.Marks,
 		m.NativeOutcomes,
 		m.NativeRules,
@@ -320,11 +332,13 @@ type pointsVariables struct {
 //
 // It can be passed to loadPointsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type pointsPrograms struct {
-	EnterNative    *ebpf.Program `ebpf:"enter_native"`
-	InjectPacket   *ebpf.Program `ebpf:"inject_packet"`
-	InjectSyscall  *ebpf.Program `ebpf:"inject_syscall"`
-	LeaveNative    *ebpf.Program `ebpf:"leave_native"`
-	ObserveSyscall *ebpf.Program `ebpf:"observe_syscall"`
+	EnterNative       *ebpf.Program `ebpf:"enter_native"`
+	InjectPacket      *ebpf.Program `ebpf:"inject_packet"`
+	InjectSyscall     *ebpf.Program `ebpf:"inject_syscall"`
+	LeaveNative       *ebpf.Program `ebpf:"leave_native"`
+	ObserveSyscall    *ebpf.Program `ebpf:"observe_syscall"`
+	ObserveTracepoint *ebpf.Program `ebpf:"observe_tracepoint"`
+	ObserveUsdt       *ebpf.Program `ebpf:"observe_usdt"`
 }
 
 func (p *pointsPrograms) Close() error {
@@ -334,6 +348,8 @@ func (p *pointsPrograms) Close() error {
 		p.InjectSyscall,
 		p.LeaveNative,
 		p.ObserveSyscall,
+		p.ObserveTracepoint,
+		p.ObserveUsdt,
 	)
 }
 
