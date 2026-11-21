@@ -36,13 +36,20 @@ type agent struct {
 }
 
 // main ends through the core's Abort or Crash, whose registered cleanup detaches what the agent attached; with scan, it
-// only writes the hook catalog of the configured services.
+// only writes the hook catalog of the configured services, and with merge it adds a control's results to a catalog.
 func main() {
 	if len(os.Args) > 1 {
-		if len(os.Args) != 3 || os.Args[1] != scanCommand {
-			faultpoint.Abort("the agent takes no arguments, or %s and the directory to write the catalog to", scanCommand)
+		var err error
+		switch {
+		case len(os.Args) == 3 && os.Args[1] == scanCommand:
+			err = scan(os.Args[2])
+		case len(os.Args) == 5 && os.Args[1] == mergeCommand:
+			err = merge(os.Args[2], os.Args[3], os.Args[4])
+		default:
+			err = fmt.Errorf("the agent takes no arguments, or %s and the directory to write a catalog to, or %s, a "+
+				"catalog's directory, a control's observations and the control's experiment", scanCommand, mergeCommand)
 		}
-		if err := scan(os.Args[2]); err != nil {
+		if err != nil {
 			faultpoint.Abort("%v", err)
 		}
 		return
@@ -70,11 +77,15 @@ func main() {
 	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	points, sites, err := locateFunctions(options.Functions, services)
+	selected, err := selectedRecords(options, services)
 	if err != nil {
 		faultpoint.Abort("%v", err)
 	}
-	selected, err := selectedRecords(options, services)
+	functions, err := nativeFunctions(selected, options.Functions)
+	if err != nil {
+		faultpoint.Abort("%v", err)
+	}
+	points, sites, err := locateFunctions(functions, services)
 	if err != nil {
 		faultpoint.Abort("%v", err)
 	}

@@ -42,11 +42,22 @@ var registers = map[string]pointsRegisterName{"ax": pointsRegisterNameAX, "bx": 
 	"cx": pointsRegisterNameCX, "dx": pointsRegisterNameDX, "si": pointsRegisterNameSI, "di": pointsRegisterNameDI,
 	"r8": pointsRegisterNameR8, "r9": pointsRegisterNameR9, "r10": pointsRegisterNameR10, "r11": pointsRegisterNameR11}
 
-var resultTypes = map[string]pointsResultType{"int32": pointsResultTypeINT32, "int64": pointsResultTypeINT64,
-	"pointer": pointsResultTypePOINTER, "bool": pointsResultTypeBOOL}
+// The types a native function's result is read as, and the rules for which result is a failure.
+const (
+	typeInt32     = "int32"
+	typeInt64     = "int64"
+	typePointer   = "pointer"
+	typeBool      = "bool"
+	errorNonzero  = "nonzero"
+	errorNegative = "negative"
+	errorZero     = "zero"
+)
 
-var errorRules = map[string]pointsErrorRule{"nonzero": pointsErrorRuleNONZERO, "negative": pointsErrorRuleNEGATIVE,
-	"zero": pointsErrorRuleZERO}
+var resultTypes = map[string]pointsResultType{typeInt32: pointsResultTypeINT32, typeInt64: pointsResultTypeINT64,
+	typePointer: pointsResultTypePOINTER, typeBool: pointsResultTypeBOOL}
+
+var errorRules = map[string]pointsErrorRule{errorNonzero: pointsErrorRuleNONZERO, errorNegative: pointsErrorRuleNEGATIVE,
+	errorZero: pointsErrorRuleZERO}
 
 // nativeLocator is the shape of a native point's locator, <file name>@<build-id prefix>:<symbol>.
 var nativeLocator = regexp.MustCompile(`^[^/:@]+@[0-9a-f]{12}:.`)
@@ -98,14 +109,24 @@ type injectedWord struct {
 	Offset   uint64 `json:"offset"`
 }
 
-// nativePoint is a configured function as the agent found it in its service's containers: an open file for each inode
-// that holds it, since a uprobe is set on an inode, and the probe sites, which are alike in every file of one build. A
-// failed call with an integer result records the integer as its detail; a pointer's value is an address, unbounded.
+// nativeFunction is a function the agent places a point in: one the functions configuration names, or one generated
+// from a selected record of a scan's catalog, whose point id the record gives; negatable is whether a negate is legal,
+// which a generated check is once controls observed both its results.
+type nativeFunction struct {
+	options   functionOptions
+	record    string
+	negatable bool
+}
+
+// nativePoint is a function as the agent found it in its service's containers: an open file for each inode that holds
+// it, since a uprobe is set on an inode, and the probe sites, which are alike in every file of one build. A failed call
+// with an integer result records the integer as its detail; a pointer's value is an address, unbounded.
 type nativePoint struct {
 	id          string
 	kind        string
 	service     uint32
 	valued      bool
+	negatable   bool
 	errors      map[string][]pointsNativeWrite
 	files       []*os.File
 	executables []*link.Executable
@@ -129,10 +150,10 @@ type foundSite struct {
 	predicate *predicateOptions
 }
 
-// locateFunctions finds each configured function in the containers of its service; the cookies of the points' sites
-// index the sites it returns.
-func locateFunctions(configured []functionOptions, services []service) ([]nativePoint, []pointsNativeSite, error) {
-	if len(configured) == 0 {
+// locateFunctions finds each function in the containers of its service, a generated one with the point id of its
+// record; the cookies of the points' sites index the sites it returns.
+func locateFunctions(functions []nativeFunction, services []service) ([]nativePoint, []pointsNativeSite, error) {
+	if len(functions) == 0 {
 		return nil, nil, nil
 	}
 	if runtime.GOARCH != "amd64" {
@@ -144,10 +165,15 @@ func locateFunctions(configured []functionOptions, services []service) ([]native
 	}
 	var points []nativePoint
 	var sites []pointsNativeSite
-	for _, function := range configured {
-		point, located, err := locateFunction(function, services, hostRoot, uint32(len(points)), uint32(len(sites)))
+	for _, function := range functions {
+		options := function.options
+		point, located, err := locateFunction(options, function.negatable, services, hostRoot, uint32(len(points)),
+			uint32(len(sites)))
+		if err == nil && function.record != "" && point.id != function.record {
+			err = fmt.Errorf("the containers hold another build than the catalog's record %s", function.record)
+		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("function %s in %s of service %s: %w", function.Symbol, function.File, function.Service, err)
+			return nil, nil, fmt.Errorf("function %s in %s of service %s: %w", options.Symbol, options.File, options.Service, err)
 		}
 		if slices.ContainsFunc(points, func(other nativePoint) bool { return other.id == point.id }) {
 			return nil, nil, fmt.Errorf("point %s is configured twice", point.id)
@@ -159,7 +185,8 @@ func locateFunctions(configured []functionOptions, services []service) ([]native
 
 // locateFunction opens the function's file in each container of its service, once per inode, and lays out its sites
 // from the code of one of them, since all are one build.
-func locateFunction(function functionOptions, services []service, hostRoot int, index, firstCookie uint32) (nativePoint, []pointsNativeSite, error) {
+func locateFunction(function functionOptions, negatable bool, services []service, hostRoot int, index,
+	firstCookie uint32) (nativePoint, []pointsNativeSite, error) {
 	owner := slices.IndexFunc(services, func(s service) bool { return s.name == function.Service })
 	if owner < 0 || len(services[owner].cgroupPaths) == 0 {
 		return nativePoint{}, nil, errors.New("the service is not configured with a cgroup to find the file in")
@@ -206,7 +233,7 @@ func locateFunction(function functionOptions, services []service, hostRoot int, 
 		id: faultpoint.PointID(function.Service, function.Kind,
 			fmt.Sprintf("%s@%s:%s", filepath.Base(function.File), build[:buildIDDigits], function.Symbol)),
 		kind: function.Kind, service: services[owner].index, errors: injected, files: files, executables: executables,
-		entries: entries, returns: returns,
+		entries: entries, returns: returns, negatable: negatable,
 		valued: function.Kind == kindCall && resultTypes[function.Result.Type] != pointsResultTypePOINTER,
 	}, sites, nil
 }

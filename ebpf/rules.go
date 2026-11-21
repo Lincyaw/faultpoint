@@ -247,8 +247,12 @@ func (translated *kernelRules) addNative(rule faultpoint.Rule, index, point uint
 			return err
 		}
 		writes, known := function.errors[fail.Error]
+		if !known && len(function.errors) == 0 {
+			return fmt.Errorf("%s has no legal value to fail with: its entry gives none, or no control observed it fail",
+				function.id)
+		}
 		if !known {
-			return fmt.Errorf("%s fails with one of the errors configured for it, %v, not %q", function.id,
+			return fmt.Errorf("%s fails with one of the values legal for it, %v, not %q", function.id,
 				slices.Sorted(maps.Keys(function.errors)), fail.Error)
 		}
 		entry.Action, entry.Writes = pointsNativeActionFAIL, uint32(copy(entry.Write[:], writes))
@@ -263,6 +267,9 @@ func (translated *kernelRules) addNative(rule faultpoint.Rule, index, point uint
 	default:
 		if err := decodeParams(rule.Action.Params, &struct{}{}); err != nil {
 			return err
+		}
+		if !function.negatable {
+			return fmt.Errorf("negating %s gives a result no control observed there", function.id)
 		}
 		entry.Action = pointsNativeActionNEGATE
 	}

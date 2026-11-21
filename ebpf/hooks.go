@@ -71,9 +71,12 @@ type hookOptions struct {
 	Exclude  []string    `json:"exclude"`
 }
 
+// hookScope is an include of a selection; error, when given, is which result of the functions it selects counts as a
+// failure, for a function whose convention differs from its return class's, such as one returning 0 on failure.
 type hookScope struct {
 	Include string   `json:"include"`
 	Kinds   []string `json:"kinds"`
+	Error   string   `json:"error"`
 }
 
 // hookRecord is one (target, mechanism) of the catalog (design §6.6). Values are the legal values a rule may give, with
@@ -114,7 +117,7 @@ type hookTarget struct {
 type hookClone struct {
 	Symbol  string   `json:"symbol"`
 	Entry   uint64   `json:"entry"`
-	Returns []uint64 `json:"returns"`
+	Returns []uint64 `json:"returns,omitempty"`
 	Cold    bool     `json:"cold,omitempty"`
 }
 
@@ -135,7 +138,8 @@ type hookCoverage struct {
 	Undecodable   string `json:"undecodable,omitempty"`
 }
 
-// hookCatalog is one service's hook records with what the scan read: the kernel and every mapped file.
+// hookCatalog is one service's hook records with what the scan read, the kernel and every mapped file, and the control
+// experiments whose results a merge added to the records' observed values.
 type hookCatalog struct {
 	Service  string          `json:"service"`
 	Upstream bool            `json:"upstream"`
@@ -143,6 +147,7 @@ type hookCatalog struct {
 	Files    []binarySummary `json:"files"`
 	Refused  []refusedFile   `json:"refused"`
 	Records  []hookRecord    `json:"records"`
+	Controls []string        `json:"controls"`
 }
 
 // manifest and pointEntry are spec/manifest.schema.json, so that the search reads the selected records as it reads the
@@ -229,7 +234,7 @@ func scanOptions() (agentOptions, error) {
 
 // scanService reads every file a service's processes map and the kernel's lists into records, and selects them.
 func scanService(owner service, options hookOptions, kernel kernelInventory, hostRoot int) (hookCatalog, error) {
-	catalog := hookCatalog{Service: owner.name, Upstream: options.Upstream, Kernel: kernel.summary}
+	catalog := hookCatalog{Service: owner.name, Upstream: options.Upstream, Kernel: kernel.summary, Controls: []string{}}
 	targets, refused, err := openBinaries(owner, hostRoot)
 	if err != nil {
 		return catalog, err
@@ -254,7 +259,7 @@ func scanService(owner service, options hookOptions, kernel kernelInventory, hos
 	}
 	catalog.Records = append(catalog.Records, kernelRecords(owner.name, kernelLayer, kernel)...)
 	for index := range catalog.Records {
-		catalog.Records[index].Selected = options.selects(catalog.Records[index])
+		_, catalog.Records[index].Selected = options.selects(catalog.Records[index])
 	}
 	return catalog, nil
 }
@@ -268,8 +273,9 @@ func (options hookOptions) layers() (string, string) {
 	return layerLibrary, layerKernel
 }
 
-// selects is whether a service's hook options select a record, by its key or the key one of its aliases would give.
-func (options hookOptions) selects(record hookRecord) bool {
+// selects returns the first include of a service's hook options that selects a record, by its key or the key one of
+// its aliases would give, and whether one does.
+func (options hookOptions) selects(record hookRecord) (hookScope, bool) {
 	keys := []string{record.Key}
 	object, _, _ := strings.Cut(record.Key, ":")
 	for _, alias := range record.Target.Aliases {
@@ -278,10 +284,13 @@ func (options hookOptions) selects(record hookRecord) bool {
 	matches := func(prefix string) bool {
 		return slices.ContainsFunc(keys, func(key string) bool { return strings.HasPrefix(key, prefix) })
 	}
-	included := slices.ContainsFunc(options.Scope, func(scope hookScope) bool {
+	index := slices.IndexFunc(options.Scope, func(scope hookScope) bool {
 		return matches(scope.Include) && (len(scope.Kinds) == 0 || slices.Contains(scope.Kinds, record.Kind))
 	})
-	return included && !slices.ContainsFunc(options.Exclude, matches)
+	if index < 0 || slices.ContainsFunc(options.Exclude, matches) {
+		return hookScope{}, false
+	}
+	return options.Scope[index], true
 }
 
 // functionRecord is a function's record: a bool result makes it a check, which a negate at its returns changes, and any
