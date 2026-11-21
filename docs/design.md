@@ -74,7 +74,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | 类别 | 放置位置 | 可用动作 | 观测结果（outcome） |
 | --- | --- | --- | --- |
 | `branch` | 守卫错误返回或抛出的条件判断 | `fail`：强制进入该分支 | `taken` `not_taken` |
-| `call` | 返回错误值的调用点（Go 的 `err`） | `fail`：替换为错误值 | `error` `ok` |
+| `call` | 返回错误值的调用点（Go 的 `err`） | `fail`：不执行被调函数，直接得到错误；`fail_after`：被调函数执行完，再把结果换成错误 | `error` `ok` |
 | `check` | 返回布尔值的检测函数 | `negate` | `true` `false` |
 | `loop` | 循环体开头 | `delay`：每次迭代延迟 | `iteration` |
 | `value` | 业务计算结果（人工标注） | `set` `shift` | `observed`，数值记入 total |
@@ -212,7 +212,10 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 各语言的放置规则形式相同。每条规则都可以在配置中关闭，规则中的名单（例如读时钟的函数）可以在配置中替换：
 
 - `branch`：直接守卫抛出异常或返回非 nil 错误的条件判断，条件改为 `branch(id, 条件)`。
-- `call`：Go 中类型为 `error` 的 `err != nil`，改为 `Failed(ctx, id, &err)`，观测 err，注入时替换它。替换 err 而不是强制进入分支，是因为 err 为 nil 时强行进入分支，返回的仍是 nil 错误。
+- `call`：故障点放在 Go 中类型为 `error` 的 `err != nil` 处，观测 err。
+  - **能跳过的调用**：产生 err 的调用就在这个 `if` 的初始化语句里或紧挨在它前面，被调函数是标识符或标识符组成的选择器，且不是边界装配要改写的调用时，调用改为 `Call(ctx, id, f)(args)`。参数照常求值；`fail` 不调用 f，其余结果取零值，err 为注入的错误；`fail_after` 先调用 f，再替换 err。
+  - **只能在检查处注入的调用**：其余情形把检查改为 `Failed(ctx, id, &err)`，只实现 `fail_after`。替换 err 而不是强制进入分支，是因为 err 为 nil 时强行进入分支，返回的仍是 nil 错误。
+  - 其他语言的 `call` 的 `fail` 都在被调函数运行之前生效：Python 在语句执行前抛出，Java 在调用指令前抛出（接收者和参数已经求值）。
 - `check`：返回布尔值的函数，包装每个 `return`；所有返回值都是常量时跳过。有类型信息的语言按类型判断，Python 按返回注解判断，JS 按返回表达式的形状判断。
 - `loop`：在循环体开头插入 `loop(id)`；上界为常量的循环跳过。
 - `clock`：读当前时间的调用（缺省名单：Python 的 `time.time` `datetime.now` `datetime.utcnow`，Go 的 `time.Now`，JS 的 `Date.now` 和无参 `new Date`，Java 的 `System.currentTimeMillis` `Instant.now`，Rust 的 `SystemTime::now` `Instant::now`），包装为 `clock(id, 读数)`。
@@ -363,7 +366,7 @@ eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能
 
 - **选项按插件名给出**：每个插件只读取自己名下的选项，缺省组件读取自己的名字（例如 `jsonl`）。一个选项键不对应任何插件或组件时，进程在启动时终止，并在消息中给出这个键。Python 只认配置中启用的插件，Go 认编译进构建的插件。
 - **启用哪些插件**：给出 `plugins` 时只启用列出的插件。不给出时，Python 启用缺省集合（`points` `import-hook` `httpx` `asgi` `dbapi`），Go 启用编译进构建的全部插件（改写器缺省编译 `points` `http` `sql`）。
-- **放置规则的键**：Go 另有 `call` 和 `errors`（错误登记）两个开关；Go 的读时钟名单使用完整的函数名，例如 `time.Now`。
+- **放置规则的键**：Go 另有 `call` 和 `errors`（错误登记）两个开关，以及包路径名单 `error_packages`：改写器登记这些包导出的错误变量（例如 `context.Canceled`），缺省为空；Go 的读时钟名单使用完整的函数名，例如 `time.Now`。
 - **eBPF 代理的选项**在 `ebpf` 名下：`{"services": {"<服务>": {"cgroups": ["/sys/fs/cgroup/..."], "devices": [{"netns": "<网络命名空间路径，空表示代理自己的>", "name": "eth0", "transmits": "egress" 或 "ingress"}]}}, "syscalls": ["connect", ...], "functions": [<原生函数点，见第 6.5 节>], "catalog": "<scan 写出的目录>", "hooks": {"<服务>": <选择，见第 6.6 节>}}`。`syscalls` 只限定报告哪些系统调用，不给出时报告全部。代理不使用 `FAULTPOINT_SERVICE`，一个代理进程服务多个服务。有原生函数点时，代理需要 `--pid=host`，以便通过 `/proc/<pid>/root` 打开容器内的文件。文件不在容器根目录所在的挂载上，或进程的根目录就是宿主机时，代理拒绝该文件，以免探针挂到宿主机的文件上。
 - 规则和观测都未配置时，接入插件不安装任何东西；已经放置的故障点只读一个全局标志就返回。
 - 延迟有两种语义。边界上的延迟表示对端变慢，异步代码中不阻塞事件循环。进程内的延迟表示资源竞争，会阻塞当前线程。
