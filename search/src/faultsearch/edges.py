@@ -14,7 +14,7 @@ from shop.workload import Scenarios
 
 from faultsearch.allocation import Assignment, Phase, Strategy
 from faultsearch.catalog import (DATA, FROZEN, Catalog, Fault, Layer, point_kind, point_layer, point_scoped,
-                                 point_service)
+                                 point_service, point_symbol)
 from faultsearch.counterfactual import EffectKey, TreatmentRecord
 
 EFFECTS_FILE: Final = DATA / "effects.json"
@@ -72,8 +72,12 @@ class EffectRule(BaseModel):
     languages: tuple[str, ...] | None = None
     """The languages of the points the rule covers, as the manifests listing them name them; every point when absent,
     and no point that no manifest lists otherwise."""
+    functions: tuple[str, ...] | None = None
+    """The functions whose native function points the rule covers; every point when absent."""
     details: DetailValues = {}
     """The detail values the effect must show."""
+    excluded_details: DetailValues = {}
+    """The detail values the effect must not show; a key the detail lacks excludes nothing, since it is unknown."""
     registration: Registration | None = None
     """Whether the effect's error must be one its service's build registers, or one it does not; the rule then covers
     only effects whose detail names an error."""
@@ -99,7 +103,10 @@ class EffectRule(BaseModel):
         these effects of the called server point."""
         return (self.kind == point_kind(effect.point) and effect.outcome in self.outcomes
                 and self.metric == effect.metric and bool(verdicts & set(self.verdicts)) and layer in self.layers
-                and self.covers_manifest(effect, manifest) and shows(effect.detail, self.details)
+                and self.covers_manifest(effect, manifest)
+                and (self.functions is None or point_symbol(effect.point) in self.functions)
+                and shows(effect.detail, self.details)
+                and not any(effect.detail.get(name) in values for name, values in self.excluded_details.items())
                 and set(self.parameters.values()) <= effect.detail.keys()
                 and (self.peer is None
                      or any(peer.outcome in self.peer.outcomes and shows(peer.detail, self.peer.details)
