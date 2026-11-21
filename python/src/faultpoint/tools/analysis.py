@@ -7,7 +7,7 @@ from typing import Self
 from pydantic import BaseModel
 from scipy import stats
 
-from faultpoint.observations import ObservationRecord
+from faultpoint.observations import DetailItems, ObservationRecord
 from faultpoint.rules import STRICT
 
 
@@ -37,12 +37,13 @@ class Verdict(StrEnum):
 
 
 class Effect(BaseModel):
-    """An outcome the treatment produced more of than the control."""
+    """An outcome, with its detail, the treatment produced more of than the control."""
 
     model_config = STRICT
 
     point: str
     outcome: str
+    detail: dict[str, str]
     metric: Metric
     verdict: Verdict
     control: tuple[float, ...]
@@ -79,13 +80,14 @@ def exceeds(control: list[float], treatment: list[float], alpha: float) -> tuple
 
 
 def natural_tallies(records: list[ObservationRecord],
-                    selection: Selection) -> dict[tuple[str, str], tuple[int, float]]:
-    tallies: dict[tuple[str, str], tuple[int, float]] = defaultdict(lambda: (0, 0.0))
+                    selection: Selection) -> dict[tuple[str, str, DetailItems], tuple[int, float]]:
+    tallies: dict[tuple[str, str, DetailItems], tuple[int, float]] = defaultdict(lambda: (0, 0.0))
     for record in records:
         if (record.rule is None and record.experiment == selection.experiment
                 and record.scope == selection.scope):
-            count, total = tallies[(record.point, record.outcome)]
-            tallies[(record.point, record.outcome)] = (count + record.count, total + record.total)
+            key = (record.point, record.outcome, tuple(sorted(record.detail.items())))
+            count, total = tallies[key]
+            tallies[key] = (count + record.count, total + record.total)
     return tallies
 
 
@@ -98,27 +100,28 @@ def compare(records: list[ObservationRecord], control: list[Selection],
     treatment_tallies = [natural_tallies(records, selection) for selection in treatment]
     keys = sorted({key for tallies in control_tallies + treatment_tallies for key in tallies})
     effects: list[Effect] = []
-    for point, outcome in keys:
-        control_counts = [float(tallies.get((point, outcome), (0, 0.0))[0]) for tallies in control_tallies]
-        treatment_counts = [float(tallies.get((point, outcome), (0, 0.0))[0]) for tallies in treatment_tallies]
+    for point, outcome, detail in keys:
+        key = (point, outcome, detail)
+        control_counts = [float(tallies.get(key, (0, 0.0))[0]) for tallies in control_tallies]
+        treatment_counts = [float(tallies.get(key, (0, 0.0))[0]) for tallies in treatment_tallies]
         if all(count == 0 for count in control_counts) and all(count > 0 for count in treatment_counts):
-            effects.append(Effect(point=point, outcome=outcome, metric=Metric.COUNT, verdict=Verdict.NEW,
-                                  control=tuple(control_counts), treatment=tuple(treatment_counts),
-                                  p_value=None))
+            effects.append(Effect(point=point, outcome=outcome, detail=dict(detail), metric=Metric.COUNT,
+                                  verdict=Verdict.NEW, control=tuple(control_counts),
+                                  treatment=tuple(treatment_counts), p_value=None))
             continue
         larger, p_value = exceeds(control_counts, treatment_counts, alpha)
         if larger:
-            effects.append(Effect(point=point, outcome=outcome, metric=Metric.COUNT,
+            effects.append(Effect(point=point, outcome=outcome, detail=dict(detail), metric=Metric.COUNT,
                                   verdict=Verdict.INCREASE, control=tuple(control_counts),
                                   treatment=tuple(treatment_counts), p_value=p_value))
         control_means = [total / count for tallies in control_tallies
-                         for count, total in [tallies.get((point, outcome), (0, 0.0))] if count]
+                         for count, total in [tallies.get(key, (0, 0.0))] if count]
         treatment_means = [total / count for tallies in treatment_tallies
-                           for count, total in [tallies.get((point, outcome), (0, 0.0))] if count]
+                           for count, total in [tallies.get(key, (0, 0.0))] if count]
         if len(control_means) >= 2 and len(treatment_means) >= 2 and any(control_means + treatment_means):
             larger, p_value = exceeds(control_means, treatment_means, alpha)
             if larger and fmean(treatment_means) >= (1 + min_mean_increase) * fmean(control_means):
-                effects.append(Effect(point=point, outcome=outcome, metric=Metric.MEAN,
+                effects.append(Effect(point=point, outcome=outcome, detail=dict(detail), metric=Metric.MEAN,
                                       verdict=Verdict.INCREASE, control=tuple(control_means),
                                       treatment=tuple(treatment_means), p_value=p_value))
     injected: dict[tuple[str, str, str], list[int]] = defaultdict(lambda: [0] * len(treatment))

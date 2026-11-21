@@ -91,10 +91,12 @@ def diff(reports: Annotated[list[Path], typer.Argument(help="Observation files o
         injections.add_row(injection.rule, injection.point, injection.outcome,
                            " ".join(map(str, injection.counts)))
     CONSOLE.print(injections)
-    effects = Table("point", "outcome", "metric", "verdict", "control", "treatment", "p",
+    effects = Table("point", "outcome", "detail", "metric", "verdict", "control", "treatment", "p",
                     title="Effects")
     for effect in comparison.effects:
-        effects.add_row(effect.point, effect.outcome, effect.metric, effect.verdict,
+        effects.add_row(effect.point, effect.outcome,
+                        " ".join(f"{key}={value}" for key, value in sorted(effect.detail.items())),
+                        effect.metric, effect.verdict,
                         " ".join(f"{value:g}" for value in effect.control),
                         " ".join(f"{value:g}" for value in effect.treatment),
                         "" if effect.p_value is None else f"{effect.p_value:.3g}")
