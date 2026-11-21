@@ -110,12 +110,14 @@ type call struct {
 	command command
 	rule    *faultpoint.Rule
 	action  string
+	started time.Time
 }
 
 // decide finds a command in the table, decides its rule that acts before it is sent and performs the rule's delay or
 // crash; a command outside the table is not a point.
 func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 	defer faultpoint.Guard()
+	started := time.Now()
 	name := strings.ToUpper(cmd.Name())
 	known, found := commands[name]
 	if !found {
@@ -125,7 +127,8 @@ func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 	if found, exists := key(known.Key, cmd.Args()); exists {
 		locator += " " + identifier.ReplaceAllString(found, "{}")
 	}
-	c := call{ctx: ctx, command: known, point: faultpoint.PointID(faultpoint.Service(), known.Kind, locator)}
+	c := call{ctx: ctx, command: known, point: faultpoint.PointID(faultpoint.Service(), known.Kind, locator),
+		started: started}
 	c.rule = faultpoint.Decide(ctx, c.point, action.Before...)
 	if c.rule != nil {
 		action.Hold(c.rule)
@@ -192,7 +195,7 @@ func (c call) settle(cmd redis.Cmder, err error) error {
 	case reads:
 		outcome, total = "rows", size(cmd)
 	}
-	faultpoint.Observe(c.ctx, c.point, outcome, float64(total), c.rule, detail)
+	faultpoint.Observe(c.ctx, c.point, outcome, float64(total), faultpoint.Elapsed(c.started), c.rule, detail)
 	return err
 }
 

@@ -65,10 +65,6 @@ func pathTemplate(path string) string {
 
 func statusOutcome(status int) string { return strconv.Itoa(status/100) + "xx" }
 
-func milliseconds(started time.Time) float64 {
-	return float64(time.Since(started).Microseconds()) / 1000
-}
-
 type takenKey struct{}
 
 // ServerCall is one request a server point took, with the rule decided for it; a framework adapter such as the gin
@@ -143,7 +139,8 @@ func (c *ServerCall) abandoned() string {
 // Finish observes the status the server answered.
 func (c *ServerCall) Finish(status int) {
 	defer faultpoint.Guard()
-	faultpoint.Observe(c.Request.Context(), c.point, statusOutcome(status), milliseconds(c.started), c.Rule,
+	elapsed := faultpoint.Elapsed(c.started)
+	faultpoint.Observe(c.Request.Context(), c.point, statusOutcome(status), elapsed, elapsed, c.Rule,
 		map[string]string{"status": strconv.Itoa(status), "abandoned": c.abandoned()})
 }
 
@@ -154,7 +151,8 @@ func (c *ServerCall) Panicked(recovered any) {
 	if err, isError := recovered.(error); isError {
 		name = faultpoint.ErrorName(err)
 	}
-	faultpoint.Observe(c.Request.Context(), c.point, "error", milliseconds(c.started), c.Rule,
+	elapsed := faultpoint.Elapsed(c.started)
+	faultpoint.Observe(c.Request.Context(), c.point, "error", elapsed, elapsed, c.Rule,
 		map[string]string{"error": name, "abandoned": c.abandoned()})
 }
 
@@ -424,8 +422,9 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	if err == nil && kind == "fail_after" {
 		response, err = failure(request, rule)
 	}
+	elapsed := faultpoint.Elapsed(started)
 	if err != nil {
-		faultpoint.Observe(ctx, point, errorOutcome(err), milliseconds(started), rule,
+		faultpoint.Observe(ctx, point, errorOutcome(err), elapsed, elapsed, rule,
 			map[string]string{"error": faultpoint.ErrorName(err), "sent": strconv.FormatBool(wrote.Load())})
 		return nil, err
 	}
@@ -433,6 +432,6 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	if kind == "fail" || kind == "fail_after" {
 		detail["sent"] = strconv.FormatBool(kind == "fail_after")
 	}
-	faultpoint.Observe(ctx, point, statusOutcome(response.StatusCode), milliseconds(started), rule, detail)
+	faultpoint.Observe(ctx, point, statusOutcome(response.StatusCode), elapsed, elapsed, rule, detail)
 	return response, nil
 }

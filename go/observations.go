@@ -10,9 +10,10 @@ import (
 	"time"
 )
 
-// Observation is Count executions of a point with one outcome and Total their summed quantity: one execution
-// from the core, or the counts a kernel program already aggregated. Detail tells apart executions of one outcome
-// by bounded values, such as an exact status or an error type, with the keys spec/kinds.json gives the kind.
+// Observation is Count executions of a point with one outcome, Total their summed quantity and Elapsed their summed
+// milliseconds from entering the point to the outcome: one execution from the core, or the counts a kernel program
+// already aggregated. Detail tells apart executions of one outcome by bounded values, such as an exact status or an
+// error type, with the keys spec/kinds.json gives the kind.
 type Observation struct {
 	Experiment string
 	Point      string
@@ -21,6 +22,7 @@ type Observation struct {
 	Rule       string
 	Count      int
 	Total      float64
+	Elapsed    float64
 	TraceID    string
 	Detail     map[string]string
 }
@@ -45,6 +47,7 @@ type ObservationRecord struct {
 	Rule       *string           `json:"rule"`
 	Count      int               `json:"count"`
 	Total      float64           `json:"total"`
+	Elapsed    float64           `json:"elapsed"`
 	Exemplars  []string          `json:"exemplars"`
 	Detail     map[string]string `json:"detail"`
 }
@@ -71,6 +74,7 @@ type tallyKey struct {
 type tally struct {
 	count     int
 	total     float64
+	elapsed   float64
 	exemplars []string
 	detail    map[string]string
 }
@@ -132,6 +136,7 @@ func (s *JSONLSink) Add(observation Observation) {
 	}
 	counted.count += observation.Count
 	counted.total += observation.Total
+	counted.elapsed += observation.Elapsed
 	if len(counted.exemplars) < s.exemplars && s.keeps(observation.TraceID) {
 		counted.exemplars = append(counted.exemplars, observation.TraceID)
 	}
@@ -164,7 +169,8 @@ func (s *JSONLSink) Flush() {
 			Experiment: key.experiment, Service: s.service, Process: s.process,
 			Start: float64(start.UnixNano()) / 1e9, End: float64(end.UnixNano()) / 1e9,
 			Point: key.point, Outcome: key.outcome, Scope: key.scope, Count: counted.count,
-			Total: counted.total, Exemplars: append([]string{}, counted.exemplars...), Detail: counted.detail,
+			Total: counted.total, Elapsed: counted.elapsed, Exemplars: append([]string{}, counted.exemplars...),
+			Detail: counted.detail,
 		}
 		if key.rule != "" {
 			record.Rule = &key.rule

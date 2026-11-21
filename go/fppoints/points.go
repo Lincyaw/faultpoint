@@ -41,7 +41,7 @@ func Branch(ctx context.Context, point string, taken bool) bool {
 	if taken {
 		outcome = "taken"
 	}
-	faultpoint.Observe(ctx, point, outcome, 0, rule, nil)
+	faultpoint.Observe(ctx, point, outcome, 0, 0, rule, nil)
 	return taken
 }
 
@@ -62,13 +62,15 @@ func injected(rule *faultpoint.Rule, point string) error {
 	return registered
 }
 
-// observeCall records the error a call point's caller gets, with its name as the detail.
-func observeCall(ctx context.Context, point string, rule *faultpoint.Rule, err error) {
+// observeCall records the error a call point's caller gets, with its name as the detail, and the time since the
+// point was entered at started.
+func observeCall(ctx context.Context, point string, rule *faultpoint.Rule, err error, started time.Time) {
 	if err == nil {
-		faultpoint.Observe(ctx, point, "ok", 0, rule, nil)
+		faultpoint.Observe(ctx, point, "ok", 0, faultpoint.Elapsed(started), rule, nil)
 		return
 	}
-	faultpoint.Observe(ctx, point, "error", 0, rule, map[string]string{"error": faultpoint.ErrorName(err)})
+	faultpoint.Observe(ctx, point, "error", 0, faultpoint.Elapsed(started), rule,
+		map[string]string{"error": faultpoint.ErrorName(err)})
 }
 
 // Call is the call point of a call site whose error the caller checks: the rewriter calls Call(ctx, id, f)(args)
@@ -84,6 +86,7 @@ func Call[F any](ctx context.Context, point string, fn F) F {
 	callee := reflect.ValueOf(fn)
 	called := reflect.MakeFunc(callee.Type(), func(arguments []reflect.Value) []reflect.Value {
 		defer faultpoint.Guard()
+		started := time.Now()
 		rule := faultpoint.Decide(ctx, point, action.Before...)
 		if rule != nil {
 			action.Hold(rule)
@@ -109,7 +112,7 @@ func Call[F any](ctx context.Context, point string, fn F) F {
 			results[last] = replaced
 		}
 		err, _ := results[last].Interface().(error)
-		observeCall(ctx, point, rule, err)
+		observeCall(ctx, point, rule, err, started)
 		return results
 	})
 	return called.Interface().(F)
@@ -124,6 +127,7 @@ func Failed(ctx context.Context, point string, err *error) bool {
 		return *err != nil
 	}
 	defer faultpoint.Guard()
+	started := time.Now()
 	var rule *faultpoint.Rule
 	if *err == nil {
 		rule = faultpoint.Decide(ctx, point)
@@ -139,7 +143,7 @@ func Failed(ctx context.Context, point string, err *error) bool {
 	if rule != nil && rule.Action.Kind == "fail_after" {
 		*err = injected(rule, point)
 	}
-	observeCall(ctx, point, rule, *err)
+	observeCall(ctx, point, rule, *err, started)
 	return *err != nil
 }
 
@@ -158,7 +162,7 @@ func Check(ctx context.Context, point string, result bool) bool {
 	if result {
 		outcome = "true"
 	}
-	faultpoint.Observe(ctx, point, outcome, 0, rule, nil)
+	faultpoint.Observe(ctx, point, outcome, 0, 0, rule, nil)
 	return result
 }
 
@@ -168,11 +172,12 @@ func Loop(ctx context.Context, point string) {
 		return
 	}
 	defer faultpoint.Guard()
+	started := time.Now()
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
 		action.Hold(rule)
 	}
-	faultpoint.Observe(ctx, point, "iteration", 0, rule, nil)
+	faultpoint.Observe(ctx, point, "iteration", 0, faultpoint.Elapsed(started), rule, nil)
 }
 
 // Value is a business value, replaced by a set rule or offset by a shift rule.
@@ -198,7 +203,7 @@ func Value[T any](ctx context.Context, point string, observed T) T {
 	if rule != nil && rule.Action.Kind == "shift" {
 		result = shifted(rule, result)
 	}
-	faultpoint.Observe(ctx, point, "observed", numeric(result), rule, nil)
+	faultpoint.Observe(ctx, point, "observed", numeric(result), 0, rule, nil)
 	return result
 }
 
@@ -252,7 +257,7 @@ func Clock(ctx context.Context, point string, reading time.Time) time.Time {
 		rule.DecodeParams(&params)
 		reading = reading.Add(time.Duration(params.Amount * float64(time.Second)))
 	}
-	faultpoint.Observe(ctx, point, "read", 0, rule, nil)
+	faultpoint.Observe(ctx, point, "read", 0, 0, rule, nil)
 	return reading
 }
 
@@ -262,6 +267,7 @@ func Acquire(ctx context.Context, point string, acquired bool) bool {
 		return acquired
 	}
 	defer faultpoint.Guard()
+	started := time.Now()
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
 		action.Hold(rule)
@@ -271,6 +277,6 @@ func Acquire(ctx context.Context, point string, acquired bool) bool {
 	if acquired {
 		outcome = "acquired"
 	}
-	faultpoint.Observe(ctx, point, outcome, 0, rule, nil)
+	faultpoint.Observe(ctx, point, outcome, 0, faultpoint.Elapsed(started), rule, nil)
 	return acquired
 }

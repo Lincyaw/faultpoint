@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 const invalidRulesExit = 70
@@ -261,15 +262,16 @@ func (c *core) fires(state *ruleState, rule *Rule) bool {
 	return fires
 }
 
-// Observe hands one outcome of a point to the sink, with the detail of the kind; rule is the rule that injected at
-// this execution, or nil.
-func Observe(ctx context.Context, point, outcome string, total float64, rule *Rule, detail map[string]string) {
+// Observe hands one outcome of a point to the sink, with the detail of the kind and the milliseconds the execution
+// took from entering the point to its outcome, injected waits included, 0 for a kind without duration; rule is the
+// rule that injected at this execution, or nil.
+func Observe(ctx context.Context, point, outcome string, total, elapsed float64, rule *Rule, detail map[string]string) {
 	if !current.started.Load() || current.sink == nil {
 		return
 	}
 	defer Guard()
 	observation := Observation{Experiment: current.state.Load().experiment, Point: point, Outcome: outcome,
-		Count: 1, Total: total, Detail: detail}
+		Count: 1, Total: total, Elapsed: elapsed, Detail: detail}
 	if rule != nil {
 		observation.Rule = rule.ID
 	}
@@ -278,6 +280,11 @@ func Observe(ctx context.Context, point, outcome string, total float64, rule *Ru
 		observation.TraceID = current.context.TraceID(ctx)
 	}
 	current.sink.Add(observation)
+}
+
+// Elapsed is the milliseconds since started, the unit of an observation's elapsed time.
+func Elapsed(started time.Time) float64 {
+	return float64(time.Since(started).Microseconds()) / 1000
 }
 
 // Service is the name the points of boundaries are identified by.

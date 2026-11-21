@@ -8,6 +8,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"time"
 
 	"faultpoint"
 	"faultpoint/internal/action"
@@ -59,14 +60,16 @@ type statement struct {
 	command string
 	rule    *faultpoint.Rule
 	action  string
+	started time.Time
 }
 
 // decide classifies a statement, decides its rule that acts before it runs and performs the rule's delay or crash.
 func decide(ctx context.Context, query string) statement {
 	defer faultpoint.Guard()
+	started := time.Now()
 	known := classifier.Classify(query)
 	s := statement{ctx: ctx, inner: context.WithValue(ctx, ownerKey{}, true), kind: known.Kind, command: known.Command,
-		point: faultpoint.PointID(faultpoint.Service(), known.Kind, known.Locator)}
+		point: faultpoint.PointID(faultpoint.Service(), known.Kind, known.Locator), started: started}
 	s.rule = faultpoint.Decide(ctx, s.point, action.Before...)
 	if s.rule != nil {
 		action.Hold(s.rule)
@@ -101,11 +104,11 @@ func (s statement) refuse(call string, actions ...string) {
 }
 
 // observe records an outcome: error, with its name and SQLSTATE, rows or empty for a read, ok for a write, with the
-// rows read or affected.
+// rows read or affected and the time since the statement entered its point.
 func (s statement) observe(rows int64, err error) {
 	defer faultpoint.Guard()
 	if err != nil {
-		faultpoint.Observe(s.ctx, s.point, "error", 0, s.rule, sqlpoint.ErrorDetail(err))
+		faultpoint.Observe(s.ctx, s.point, "error", 0, faultpoint.Elapsed(s.started), s.rule, sqlpoint.ErrorDetail(err))
 		return
 	}
 	outcome := "ok"
@@ -115,7 +118,7 @@ func (s statement) observe(rows int64, err error) {
 	case s.kind == "store_read":
 		outcome = "empty"
 	}
-	faultpoint.Observe(s.ctx, s.point, outcome, float64(rows), s.rule, nil)
+	faultpoint.Observe(s.ctx, s.point, outcome, float64(rows), faultpoint.Elapsed(s.started), s.rule, nil)
 }
 
 type execer interface {

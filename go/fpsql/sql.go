@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"faultpoint"
 	"faultpoint/internal/action"
@@ -119,6 +120,7 @@ func begin(ctx context.Context, query string) (string, *faultpoint.Rule, string)
 
 func (i interceptor) exec(ctx context.Context, query string, run func() (driver.Result, error)) (driver.Result, error) {
 	defer faultpoint.Guard()
+	started := time.Now()
 	point, rule, kind := begin(ctx, query)
 	var result driver.Result
 	var err error
@@ -140,7 +142,7 @@ func (i interceptor) exec(ctx context.Context, query string, run func() (driver.
 		err = action.Failure(rule, i.coded)
 	}
 	if err != nil {
-		faultpoint.Observe(ctx, point, "error", 0, rule, sqlpoint.ErrorDetail(err))
+		faultpoint.Observe(ctx, point, "error", 0, faultpoint.Elapsed(started), rule, sqlpoint.ErrorDetail(err))
 		return nil, err
 	}
 	var affected int64
@@ -148,21 +150,23 @@ func (i interceptor) exec(ctx context.Context, query string, run func() (driver.
 	if err != nil {
 		affected = 0
 	}
-	faultpoint.Observe(ctx, point, "ok", float64(affected), rule, nil)
+	faultpoint.Observe(ctx, point, "ok", float64(affected), faultpoint.Elapsed(started), rule, nil)
 	return result, nil
 }
 
 type queryKey struct{}
 
 // query is a statement whose rows are being read, whose outcome is observed when its rows are closed; ended is
-// whether reading them reached their end or an error, and err is the error a fail_after rule gave.
+// whether reading them reached their end or an error, err is the error a fail_after rule gave, and started is when
+// the statement entered its point.
 type query struct {
-	point string
-	rule  *faultpoint.Rule
-	empty bool
-	rows  int
-	ended bool
-	err   error
+	point   string
+	rule    *faultpoint.Rule
+	empty   bool
+	rows    int
+	ended   bool
+	err     error
+	started time.Time
 }
 
 // advance records what reading a row gave: a row, or the end of the rows, where a fail_after rule may give its error
@@ -198,6 +202,7 @@ func (q *query) failAfter(ctx context.Context, coded func(code string) error) er
 
 func (i interceptor) read(ctx context.Context, sql string, run func() (driver.Rows, error)) (context.Context, driver.Rows, error) {
 	defer faultpoint.Guard()
+	started := time.Now()
 	point, rule, kind := begin(ctx, sql)
 	var rows driver.Rows
 	var err error
@@ -207,10 +212,11 @@ func (i interceptor) read(ctx context.Context, sql string, run func() (driver.Ro
 		faultpoint.Outside(func() { rows, err = run() })
 	}
 	if err != nil {
-		faultpoint.Observe(ctx, point, "error", 0, rule, sqlpoint.ErrorDetail(err))
+		faultpoint.Observe(ctx, point, "error", 0, faultpoint.Elapsed(started), rule, sqlpoint.ErrorDetail(err))
 		return ctx, nil, err
 	}
-	return context.WithValue(ctx, queryKey{}, &query{point: point, rule: rule, empty: kind == "empty"}), rows, nil
+	state := &query{point: point, rule: rule, empty: kind == "empty", started: started}
+	return context.WithValue(ctx, queryKey{}, state), rows, nil
 }
 
 // interceptor makes the statements of one wrapped driver store points; coded builds that driver's error with a code,
@@ -260,11 +266,12 @@ func (i interceptor) RowsClose(ctx context.Context, rows driver.Rows) (err error
 	}
 	switch {
 	case found && state.err != nil:
-		faultpoint.Observe(ctx, state.point, "error", 0, state.rule, sqlpoint.ErrorDetail(state.err))
+		faultpoint.Observe(ctx, state.point, "error", 0, faultpoint.Elapsed(state.started), state.rule,
+			sqlpoint.ErrorDetail(state.err))
 	case found && state.rows > 0:
-		faultpoint.Observe(ctx, state.point, "rows", float64(state.rows), state.rule, nil)
+		faultpoint.Observe(ctx, state.point, "rows", float64(state.rows), faultpoint.Elapsed(state.started), state.rule, nil)
 	case found:
-		faultpoint.Observe(ctx, state.point, "empty", 0, state.rule, nil)
+		faultpoint.Observe(ctx, state.point, "empty", 0, faultpoint.Elapsed(state.started), state.rule, nil)
 	}
 	return err
 }
