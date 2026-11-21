@@ -137,6 +137,10 @@ public final class Points {
     /** The calls in progress on this thread, innermost last, so that a call's outcome is attributed to the rule
      * decided before it even when the callee holds call points of its own. */
     private static final ThreadLocal<java.util.ArrayDeque<Pending>> CALLS = ThreadLocal.withInitial(java.util.ArrayDeque::new);
+    /** A fail_after rule acts on a call that returned, so it is decided and counted only then; the other rules
+     * act before the call. */
+    private static final java.util.function.Predicate<String> AFTER_CALL = "fail_after"::equals;
+    private static final java.util.function.Predicate<String> BEFORE_CALL = AFTER_CALL.negate();
 
     /** Before a call whose callee declares a checked exception: a fail rule throws that exception here, so the
      * callee does not run. */
@@ -145,7 +149,7 @@ public final class Points {
         if (!core.enabled()) {
             return;
         }
-        Rule rule = core.decide(point);
+        Rule rule = core.decide(point, BEFORE_CALL);
         if (rule != null) {
             hold(core, rule);
         }
@@ -167,23 +171,25 @@ public final class Points {
         return (Exception) declared.getConstructor().newInstance();
     }
 
-    /** After a call returned: under a fail_after rule the callee has run, and the exception it declares is thrown
-     * in place of its result. */
+    /** After a call returned: a fail_after rule decided now, which only a call that returned counts against its
+     * trigger, throws the exception the callee declares in place of its result. */
     public static void returned(String point) throws Exception {
         Core core = Core.current();
         if (!core.enabled()) {
             return;
         }
         Pending pending = CALLS.get().pop();
-        if (pending.rule() != null && pending.rule().kind().equals("fail_after")) {
+        Rule replacing = core.decide(point, AFTER_CALL);
+        if (replacing != null) {
             Exception injected = declaredException(pending.declared(), point);
-            core.observe(point, "error", 0, pending.rule(), Map.of("error", injected.getClass().getName()));
+            core.observe(point, "error", 0, replacing, Map.of("error", injected.getClass().getName()));
             throw injected;
         }
         core.observe(point, "ok", 0, pending.rule(), Map.of());
     }
 
-    /** After a call threw: its own failure is observed and not replaced. */
+    /** After a call threw: its own failure is observed under the rule decided before the call and not replaced, so
+     * a fail_after rule neither claims nor counts it. */
     public static void raised(Throwable error, String point) {
         Core core = Core.current();
         if (core.enabled()) {

@@ -54,6 +54,7 @@ public final class Core {
 
     /** The locators of every point of a kind, for a plugin that serves them all. */
     public static final Predicate<String> EVERY_LOCATOR = locator -> true;
+    private static final Predicate<String> EVERY_ACTION = action -> true;
 
     /** The kinds one plugin serves with the actions it implements there, at the points whose locators it serves. */
     private record Declaration(Map<String, List<String>> kinds, Predicate<String> locators) {}
@@ -120,15 +121,19 @@ public final class Core {
     }
 
     /** Install a rule set; a rule of this service at a point plugins serve must use an action each of those plugins
-     * implements, and rules of other services or of points no plugin here serves are left to their processes. */
+     * implements, a rule of a kind plugins here serve at a point none of them serves is refused, and rules of other
+     * services or of kinds no plugin here serves are left to their processes. */
     void apply(RuleSet ruleset) {
         var rules = new HashMap<String, List<Rule>>();
         for (Rule rule : ruleset.rules()) {
-            List<List<String>> serving = declarations.stream()
-                    .filter(declaration -> declaration.kinds().containsKey(rule.pointKind()) && declaration.locators().test(rule.locator()))
-                    .map(declaration -> declaration.kinds().get(rule.pointKind())).toList();
-            if (serving.isEmpty() || !rule.service().equals(settings.service())) {
+            List<Declaration> ofKind = declarations.stream().filter(declaration -> declaration.kinds().containsKey(rule.pointKind())).toList();
+            if (ofKind.isEmpty() || !rule.service().equals(settings.service())) {
                 continue;
+            }
+            List<List<String>> serving = ofKind.stream().filter(declaration -> declaration.locators().test(rule.locator()))
+                    .map(declaration -> declaration.kinds().get(rule.pointKind())).toList();
+            if (serving.isEmpty()) {
+                abort("rule " + rule.id() + ": no plugin of this process serves " + rule.point());
             }
             if (!serving.stream().allMatch(actions -> actions.contains(rule.kind()))) {
                 abort("rule " + rule.id() + ": not every plugin of this process serving its point implements " + rule.kind()
@@ -160,12 +165,20 @@ public final class Core {
 
     /** The first rule of a point whose scope matches the current request and whose trigger fires. */
     public Rule decide(String point) {
+        return decide(point, EVERY_ACTION);
+    }
+
+    /** The first rule of a point among the rules of the given actions whose scope matches the current request and
+     * whose trigger fires. Only those rules are counted, so that a point deciding before and after its operation
+     * counts a rule only where it can act. */
+    public Rule decide(String point, Predicate<String> actions) {
         List<Rule> rules = state.rules().get(point);
         if (rules == null) {
             return null;
         }
         for (Rule rule : rules) {
-            if (!rule.scope().entrySet().stream().allMatch(entry -> entry.getValue().equals(baggage(entry.getKey())))) {
+            if (!actions.test(rule.kind())
+                    || !rule.scope().entrySet().stream().allMatch(entry -> entry.getValue().equals(baggage(entry.getKey())))) {
                 continue;
             }
             synchronized (counters) {
