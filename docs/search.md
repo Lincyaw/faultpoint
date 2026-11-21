@@ -183,9 +183,9 @@ orders 的超时由环境变量 `RESERVE_TIMEOUT_S` 给出，作用于它的整�
 
 ### 4.3 越过租户的影响
 
-- **冷启动**：strict-timeout 的对照中，没有任何注入，每个租户的第一个请求也会超时失败（冷启动比 0.3 s 慢），对照的计数在重复间因此有波动。注入使被注入的租户先失败，后面的租户不再碰上冷启动，哨兵因此与对照不同；strict-timeout 中形成的打包组（1 组）因此改为单独运行，这个场景的 75 条处理记录都来自单独运行。
-- **下一个请求**：orders 中未处理的异常（`price()` 和 `charge()` 不处理 httpx 的传输错误，价格或扣款超时就以异常结束；写入 orders 表失败同样如此）之后，紧接着的下一个请求在 gateway 的 fetch 处失败（outcome `error`，用户得到 502），不论它属于哪个租户。被哨兵发现越界的 12 个打包组中，11 个是这种情形（baseline、clearance-sale 各 3 组，bulk-orders、tight-budget 各 2 组，limited-stock 1 组），另 1 个是上面的冷启动。机制未核实：可能是 uvicorn 在未处理的异常之后关闭连接，而 gateway 的 fetch 复用了这条连接。
-- 越过租户的影响只记录在处理记录的 `leakage` 中，不形成边。
+- **冷启动**：strict-timeout 的对照中，没有任何注入，每个租户的第一个请求也会超时失败（冷启动比 0.3 s 慢），对照的计数在重复间因此有波动。注入使被注入的租户先失败，后面的租户不再碰上冷启动，哨兵因此与对照不同；strict-timeout 中形成的打包组（1 组）因此改为单独运行，这个场景的 75 条处理记录都来自单独运行。这个冷启动来自挂上的 faultpoint：不挂 faultpoint 时，strict-timeout 的 84 次结账全部是 201；挂上而不带规则时，ledger 的第一次 `/charge` 在服务端用 210–236 ms（之后约 21 ms），orders 的 0.3 s 预算超时（`runs/shop/transparency-*`，SDK `eb49e50`）。其余 6 个场景挂与不挂的 84 个响应，状态码和正文逐条相同。
+- **下一个请求**：orders 中未处理的异常（`price()` 和 `charge()` 不处理 httpx 的传输错误，价格或扣款超时就以异常结束；写入 orders 表失败同样如此）之后，紧接着的下一个请求在 gateway 的 fetch 处失败（outcome `error`，用户得到 502），不论它属于哪个租户。被哨兵发现越界的 12 个打包组中，11 个是这种情形（baseline、clearance-sale 各 3 组，bulk-orders、tight-budget 各 2 组，limited-stock 1 组），另 1 个是上面的冷启动。机制：Starlette 的 `ServerErrorMiddleware` 先发出一个不带 `Connection: close` 的 500，再把异常交给 uvicorn，uvicorn 随即关闭连接；gateway 的 fetch（undici）在收到 FIN 之前已经把排队的下一个请求写上这条连接，得到 “other side closed”，而 fetch 不重试 POST。不挂 SDK 时 20 次中 20 次复现；不经 Starlette 的 ASGI 应用和注册了异常处理的应用都不出现（`runs/python-sdk/keepalive_sample/`；`starlette/middleware/errors.py:149-186`，`uvicorn/protocols/http/h11_impl.py:409-420`）。
+- **这是真实的效应，不是噪声**：范围只限制注入，不限制效应。服务之间共用的连接把一个租户的故障带给下一个请求，不论它属于哪个租户；以这样的失败为效果的边是真实的跨请求传播。搜索按被注入的租户比较效果，所以落在其他租户上的这类影响记录在处理记录的 `leakage` 中，不形成边。
 
 ### 4.4 链与验证
 
