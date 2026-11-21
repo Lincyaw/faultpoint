@@ -74,7 +74,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | 类别 | 放置位置 | 可用动作 | 观测结果（outcome） |
 | --- | --- | --- | --- |
 | `branch` | 守卫错误返回或抛出的条件判断 | `fail`：强制进入该分支 | `taken` `not_taken` |
-| `call` | 返回错误值的调用点（Go 的 `err`） | `fail`：不执行被调函数，直接得到错误；`fail_after`：被调函数执行完，再把结果换成错误 | `error` `ok` |
+| `call` | 返回错误值的调用点（Go 的 `err`） | `fail`：不执行被调函数，直接得到错误；`fail_after`：被调函数正常完成后，再把结果换成错误；被调函数自己失败时保留它自己的失败，记为自然结果，也不消耗规则的触发次数 | `error` `ok` |
 | `check` | 返回布尔值的检测函数 | `negate` | `true` `false` |
 | `loop` | 循环体开头 | `delay`：每次迭代延迟 | `iteration` |
 | `value` | 业务计算结果（人工标注） | `set` `shift` | `observed`，数值记入 total |
