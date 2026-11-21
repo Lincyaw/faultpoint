@@ -222,12 +222,12 @@ public final class ServletBoundary {
                 identifierSegment = Pattern.compile(pattern);
             }
             installation.core().declare(Map.of("rpc_server", List.of("fail", "fail_after", "delay", "crash")), Core.EVERY_LOCATOR);
-            Advices.install(installation.instrumentation(), ElementMatchers.named("jakarta.servlet.http.HttpServlet"),
+            installation.advise(ElementMatchers.named("jakarta.servlet.http.HttpServlet"),
                     new Advices.Method(ElementMatchers.named("service").and(ElementMatchers.takesArguments(2))
                             .and(ElementMatchers.takesArgument(0, ElementMatchers.named("jakarta.servlet.ServletRequest"))),
                             "faultpoint.ServletAdvice"));
             // A response's answer is decided where its status becomes known, and a replaced answer drops what follows.
-            Advices.install(installation.instrumentation(),
+            installation.advise(
                     ElementMatchers.hasSuperType(ElementMatchers.named("jakarta.servlet.http.HttpServletResponse"))
                             .and(ElementMatchers.not(ElementMatchers.isInterface())),
                     new Advices.Method(ElementMatchers.named("setStatus").and(ElementMatchers.takesArguments(int.class)),
@@ -244,7 +244,7 @@ public final class ServletBoundary {
                             "setDateHeader", "addDateHeader", "setContentLength", "setContentLengthLong", "setContentType",
                             "setCharacterEncoding", "setLocale", "addCookie", "reset", "resetBuffer", "setBufferSize"),
                             "faultpoint.ServletAdvice$Dropped"));
-            Advices.install(installation.instrumentation(),
+            installation.advise(
                     ElementMatchers.hasSuperType(ElementMatchers.named("jakarta.servlet.ServletOutputStream"))
                             .and(ElementMatchers.not(ElementMatchers.isInterface())),
                     new Advices.Method(ElementMatchers.named("write").and(ElementMatchers.not(ElementMatchers.isAbstract())),

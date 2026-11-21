@@ -4,11 +4,14 @@ import java.io.IOException;
 import java.lang.instrument.Instrumentation;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.ServiceLoader;
 import java.util.jar.JarFile;
 import java.util.stream.Stream;
+import net.bytebuddy.description.type.TypeDescription;
+import net.bytebuddy.matcher.ElementMatcher;
 
 /** Attached with `-javaagent:faultpoint-agent.jar` (for example through JAVA_TOOL_OPTIONS), so that business
  * code and its build stay free of the SDK; `java -jar faultpoint-agent.jar scan` lists the points offline. */
@@ -33,6 +36,7 @@ public final class Agent {
         if (settings.rules() != null) {
             core.useRuleSource(new Defaults.FileRuleSource(settings.rules(), RULES_POLL_MS));
         }
+        List<Advices.Advice> advice = new ArrayList<>();
         Plugin.Installation installation = new Plugin.Installation() {
             @Override
             public Core core() {
@@ -45,8 +49,8 @@ public final class Agent {
             }
 
             @Override
-            public Instrumentation instrumentation() {
-                return instrumentation;
+            public void advise(ElementMatcher<? super TypeDescription> types, Advices.Method... methods) {
+                advice.add(new Advices.Advice(types, List.of(methods)));
             }
         };
         // The placement transforms before the plugins' advice, so it sees a class's original bytes, as the offline scan does.
@@ -56,6 +60,7 @@ public final class Agent {
                 plugin.install(installation, settings.config().options(plugin.name()));
             }
         }
+        Advices.install(instrumentation, advice);
         Core.install(core);
         core.start();
     }

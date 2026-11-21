@@ -181,12 +181,12 @@ public final class SpringHttp {
         @Override
         public void install(Installation installation, Map<String, Object> options) {
             installation.core().declare(Map.of("rpc_client", List.of("fail", "fail_after", "delay", "crash")), Core.EVERY_LOCATOR);
-            Advices.install(installation.instrumentation(),
+            installation.advise(
                     ElementMatchers.hasSuperType(ElementMatchers.named("org.springframework.http.client.ClientHttpRequest"))
                             .and(ElementMatchers.not(ElementMatchers.isInterface())),
                     new Advices.Method(ElementMatchers.named("execute").and(ElementMatchers.takesArguments(0))
                             .and(ElementMatchers.not(ElementMatchers.isAbstract())), "faultpoint.SpringHttpAdvice"));
-            Advices.install(installation.instrumentation(),
+            installation.advise(
                     ElementMatchers.hasSuperType(ElementMatchers.named("org.springframework.http.client.AbstractStreamingClientHttpRequest")),
                     new Advices.Method(ElementMatchers.named("executeInternal").and(ElementMatchers.takesArguments(2))
                             .and(ElementMatchers.takesArgument(1, ElementMatchers.named("org.springframework.http.StreamingHttpOutputMessage$Body")))

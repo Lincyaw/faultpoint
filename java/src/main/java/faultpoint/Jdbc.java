@@ -298,11 +298,13 @@ public final class Jdbc {
                     "store_read", List.of("fail", "empty", "delay", "crash"),
                     "store_write", List.of("fail", "fail_after", "drop", "duplicate", "delay", "crash")), Jdbc::statementLocator);
             installation.core().check(Jdbc::refusal);
-            Advices.install(installation.instrumentation(),
+            // Classifying a statement now loads the parser while the agent starts, not while the application runs its first statement.
+            statementPoint("SELECT a FROM b WHERE c = ?");
+            installation.advise(
                     ElementMatchers.hasSuperType(ElementMatchers.named("java.sql.Statement")).and(ElementMatchers.not(ElementMatchers.isInterface())),
                     new Advices.Method(ElementMatchers.isPublic().and(ElementMatchers.not(ElementMatchers.isAbstract()))
                             .and(ElementMatchers.namedOneOf(EXECUTIONS.toArray(String[]::new))), "faultpoint.JdbcAdvice"));
-            Advices.install(installation.instrumentation(),
+            installation.advise(
                     ElementMatchers.hasSuperType(ElementMatchers.named("java.sql.Connection")).and(ElementMatchers.not(ElementMatchers.isInterface())),
                     new Advices.Method(ElementMatchers.isPublic().and(ElementMatchers.not(ElementMatchers.isAbstract()))
                             .and(ElementMatchers.namedOneOf("prepareStatement", "prepareCall"))

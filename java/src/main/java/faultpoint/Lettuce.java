@@ -135,7 +135,7 @@ public final class Lettuce {
                     "publish", List.of("fail", "drop", "delay", "crash"),
                     "consume", List.of("fail", "empty", "delay", "crash")), RedisCommands::commandLocator);
             installation.core().check(Lettuce::refusal);
-            Advices.install(installation.instrumentation(),
+            installation.advise(
                     ElementMatchers.named("io.lettuce.core.RedisChannelHandler"),
                     new Advices.Method(ElementMatchers.named("dispatch").and(ElementMatchers.takesArguments(1))
                             .and(ElementMatchers.takesArgument(0, ElementMatchers.named("io.lettuce.core.protocol.RedisCommand"))),
