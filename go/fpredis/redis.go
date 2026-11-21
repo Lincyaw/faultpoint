@@ -158,16 +158,18 @@ func (c call) block(cmd redis.Cmder) {
 }
 
 // settle applies what a rule does once the command was sent or kept back, and observes the outcome; a fail_after
-// rule is decided only for a command that no rule acted on before and that Redis answered without an error.
+// rule is decided only for a command that no rule acted on before and that completed normally: answered without an
+// error reply, or, for a read, with the empty reply redis.Nil stands for.
 func (c call) settle(cmd redis.Cmder, err error) error {
-	if err == nil && c.rule == nil {
+	reads := c.command.Kind == "store_read" || c.command.Kind == "consume"
+	if (err == nil || (reads && c.command.Empty == "nil" && errors.Is(err, redis.Nil))) && c.rule == nil {
 		c.rule = faultpoint.Decide(c.ctx, c.point, "fail_after")
 	}
 	if c.rule != nil {
 		c.action = c.rule.Action.Kind
 	}
 	switch {
-	case c.action == "fail" || (err == nil && c.action == "fail_after"):
+	case c.action == "fail" || c.action == "fail_after":
 		err = action.Failure(c.rule, replyError)
 	case err == nil && c.action == "empty":
 		err = emptied(cmd, c.command.Empty)
@@ -177,7 +179,6 @@ func (c call) settle(cmd redis.Cmder, err error) error {
 	}
 	outcome, total := "ok", 0
 	var detail map[string]string
-	reads := c.command.Kind == "store_read" || c.command.Kind == "consume"
 	switch {
 	case reads && c.command.Empty == "nil" && errors.Is(err, redis.Nil):
 		outcome = "empty"

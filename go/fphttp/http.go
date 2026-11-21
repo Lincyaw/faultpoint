@@ -3,6 +3,7 @@
 package fphttp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -79,9 +80,10 @@ type ServerCall struct {
 	started time.Time
 }
 
-// Take takes a request at its rpc_server point: it restores the caller's trace and baggage, decides the rule and
-// performs its delay or crash. It returns nil when a server point around this one already took the request, as
-// when a wrapped http.Server serves an instrumented framework, so that a request is one execution of one point.
+// Take takes a request at its rpc_server point: it restores the caller's trace and baggage, decides the rule that
+// acts before the handler runs and performs its delay or crash. It returns nil when a server point around this one
+// already took the request, as when a wrapped http.Server serves an instrumented framework, so that a request is
+// one execution of one point.
 func Take(request *http.Request) *ServerCall {
 	if request.Context().Value(takenKey{}) != nil {
 		return nil
@@ -89,12 +91,29 @@ func Take(request *http.Request) *ServerCall {
 	ctx := propagator.Extract(request.Context(), propagation.HeaderCarrier(request.Header))
 	call := &ServerCall{Request: request.WithContext(context.WithValue(ctx, takenKey{}, true)), started: time.Now(),
 		point: faultpoint.PointID(faultpoint.Service(), "rpc_server", request.Method+" "+pathTemplate(request.URL.Path))}
-	call.Rule = faultpoint.Decide(ctx, call.point)
+	call.Rule = faultpoint.Decide(ctx, call.point, action.Before...)
 	if call.Rule != nil {
 		action.Hold(call.Rule)
 	}
 	return call
 }
+
+// Answer is the status to send once the handler's is known: the handler's, or a fail_after rule's, which is decided
+// only for a 2xx or 3xx status of a request no rule acted on before.
+func (c *ServerCall) Answer(status int) int {
+	if c.Rule != nil || !succeeded(status) {
+		return status
+	}
+	c.Rule = faultpoint.Decide(c.Request.Context(), c.point, "fail_after")
+	if c.Rule == nil {
+		return status
+	}
+	return c.FailureStatus()
+}
+
+// succeeded is whether a status is a 2xx or 3xx answer, the normal completion of an rpc point that a fail_after rule
+// replaces.
+func succeeded(status int) bool { return status >= http.StatusOK && status < http.StatusBadRequest }
 
 // Action is the kind of the call's rule, empty without one.
 func (c *ServerCall) Action() string {
@@ -145,11 +164,101 @@ func Handler(next http.Handler) http.Handler {
 	return server{next: next}
 }
 
-type discardWriter struct{ header http.Header }
+// answer passes a handler's response through until its status is known, when a fail_after rule may replace a 2xx
+// or 3xx status with its own, whose body is empty; status is the status sent, 0 before it is known.
+type answer struct {
+	call   *ServerCall
+	writer http.ResponseWriter
+	status int
+}
 
-func (d discardWriter) Header() http.Header            { return d.header }
-func (d discardWriter) Write(body []byte) (int, error) { return len(body), nil }
-func (d discardWriter) WriteHeader(int)                {}
+func (a *answer) replaced() bool { return a.call.Action() == "fail_after" }
+
+// settle settles the status once the handler's is known, dropping the headers the handler set when a rule replaces
+// its answer, so that they do not describe a body that is not sent.
+func (a *answer) settle(code int) {
+	a.status = a.call.Answer(code)
+	if a.replaced() {
+		clear(a.writer.Header())
+	}
+}
+
+// header settles the first final status the handler writes and writes the status settled on.
+func (a *answer) header(next httpsnoop.WriteHeaderFunc) httpsnoop.WriteHeaderFunc {
+	return func(code int) {
+		if a.status == 0 && code >= http.StatusOK {
+			a.settle(code)
+			code = a.status
+		}
+		next(code)
+	}
+}
+
+// implicit settles the 200 that net/http sends for a handler that writes, flushes or returns without a status, and
+// writes the status of a rule that replaces it.
+func (a *answer) implicit() {
+	if a.status != 0 {
+		return
+	}
+	a.settle(http.StatusOK)
+	if a.replaced() {
+		a.writer.WriteHeader(a.status)
+	}
+}
+
+func (a *answer) write(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
+	return func(body []byte) (int, error) {
+		a.implicit()
+		if a.replaced() {
+			return len(body), nil
+		}
+		return next(body)
+	}
+}
+
+func (a *answer) writeString(next httpsnoop.WriteStringFunc) httpsnoop.WriteStringFunc {
+	return func(body string) (int, error) {
+		a.implicit()
+		if a.replaced() {
+			return len(body), nil
+		}
+		return next(body)
+	}
+}
+
+func (a *answer) readFrom(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
+	return func(source io.Reader) (int64, error) {
+		a.implicit()
+		if a.replaced() {
+			return io.Copy(io.Discard, source)
+		}
+		return next(source)
+	}
+}
+
+func (a *answer) flush(next httpsnoop.FlushFunc) httpsnoop.FlushFunc {
+	return func() {
+		a.implicit()
+		next()
+	}
+}
+
+func (a *answer) flushError(next httpsnoop.FlushErrorFunc) httpsnoop.FlushErrorFunc {
+	return func() error {
+		a.implicit()
+		return next()
+	}
+}
+
+// hijack leaves a hijacked connection's answer to the handler, observed as 200 as net/http reports it.
+func (a *answer) hijack(next httpsnoop.HijackFunc) httpsnoop.HijackFunc {
+	return func() (net.Conn, *bufio.ReadWriter, error) {
+		if a.status == 0 {
+			a.status = http.StatusOK
+		}
+		return next()
+	}
+}
 
 func (s server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	next := s.next
@@ -168,17 +277,16 @@ func (s server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 	}()
 	var status int
-	switch call.Action() {
-	case "fail", "fail_after":
-		if call.Action() == "fail_after" {
-			next.ServeHTTP(discardWriter{header: http.Header{}}, call.Request)
-		}
+	if call.Action() == "fail" {
 		status = call.FailureStatus()
 		writer.WriteHeader(status)
-	default:
-		status = httpsnoop.CaptureMetricsFn(writer, func(captured http.ResponseWriter) {
-			next.ServeHTTP(captured, call.Request)
-		}).Code
+	} else {
+		answered := &answer{call: call, writer: writer}
+		next.ServeHTTP(httpsnoop.Wrap(writer, httpsnoop.Hooks{WriteHeader: answered.header, Write: answered.write,
+			WriteString: answered.writeString, ReadFrom: answered.readFrom, Flush: answered.flush,
+			FlushError: answered.flushError, Hijack: answered.hijack}), call.Request)
+		answered.implicit()
+		status = answered.status
 	}
 	call.Finish(status)
 }
@@ -226,9 +334,9 @@ func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, erro
 	return nil, action.PeerError(rule, params.Error)
 }
 
-// RoundTrip sends a request under the rule of its point, a fail_after rule replacing only a response the peer gave;
-// a failure's detail tells whether the request was written completely, that is whether the peer may have acted on
-// it.
+// RoundTrip sends a request under the rule of its point, a fail_after rule replacing only a 2xx or 3xx response of
+// the peer; a failure's detail tells whether the request was written completely, that is whether the peer may have
+// acted on it.
 func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	base := c.base
 	if base == nil {
@@ -264,7 +372,7 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	} else {
 		response, err = base.RoundTrip(request)
 	}
-	if err == nil && rule == nil {
+	if err == nil && rule == nil && succeeded(response.StatusCode) {
 		rule = faultpoint.Decide(ctx, point, "fail_after")
 	}
 	if err == nil && rule != nil {

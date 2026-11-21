@@ -22,13 +22,60 @@ func Instrument(engine *gin.Engine) *gin.Engine {
 	return engine
 }
 
-// discardWriter swallows what a handler writes under fail_after, whose response the rule replaces.
-type discardWriter struct{ gin.ResponseWriter }
+// answer passes a handler's response through until its status is known, when a fail_after rule may replace a 2xx
+// or 3xx status with its own, whose body is empty.
+type answer struct {
+	gin.ResponseWriter
+	call    *fphttp.ServerCall
+	settled bool
+}
 
-func (discardWriter) Write(body []byte) (int, error)       { return len(body), nil }
-func (discardWriter) WriteString(body string) (int, error) { return len(body), nil }
-func (discardWriter) WriteHeader(int)                      {}
-func (discardWriter) WriteHeaderNow()                      {}
+func (a *answer) replaced() bool { return a.call.Action() == "fail_after" }
+
+// settle settles the status the handler set, once, dropping the headers it set when a rule replaces its answer.
+func (a *answer) settle() {
+	if a.settled {
+		return
+	}
+	a.settled = true
+	status := a.call.Answer(a.ResponseWriter.Status())
+	if a.replaced() {
+		clear(a.ResponseWriter.Header())
+		a.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (a *answer) WriteHeader(code int) {
+	if !a.replaced() {
+		a.ResponseWriter.WriteHeader(code)
+	}
+}
+
+func (a *answer) WriteHeaderNow() {
+	a.settle()
+	a.ResponseWriter.WriteHeaderNow()
+}
+
+func (a *answer) Write(body []byte) (int, error) {
+	a.WriteHeaderNow()
+	if a.replaced() {
+		return len(body), nil
+	}
+	return a.ResponseWriter.Write(body)
+}
+
+func (a *answer) WriteString(body string) (int, error) {
+	a.WriteHeaderNow()
+	if a.replaced() {
+		return len(body), nil
+	}
+	return a.ResponseWriter.WriteString(body)
+}
+
+func (a *answer) Flush() {
+	a.WriteHeaderNow()
+	a.ResponseWriter.Flush()
+}
 
 func serve(c *gin.Context) {
 	call := fphttp.Take(c.Request)
@@ -43,17 +90,17 @@ func serve(c *gin.Context) {
 			panic(recovered)
 		}
 	}()
-	switch call.Action() {
-	case "fail":
+	if call.Action() == "fail" {
 		c.AbortWithStatus(call.FailureStatus())
-	case "fail_after":
+	} else {
 		writer := c.Writer
-		c.Writer = discardWriter{ResponseWriter: writer}
+		answered := &answer{ResponseWriter: writer, call: call}
+		c.Writer = answered
 		c.Next()
+		// gin writes the header of a handler that wrote nothing after the middleware returns, so the status is settled
+		// here without writing it.
+		answered.settle()
 		c.Writer = writer
-		c.AbortWithStatus(call.FailureStatus())
-	default:
-		c.Next()
 	}
 	call.Finish(c.Writer.Status())
 }
