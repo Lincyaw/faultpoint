@@ -2,6 +2,7 @@ import atexit
 import functools
 import os
 import random
+import signal
 import sys
 import threading
 import time
@@ -10,6 +11,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from enum import StrEnum
 from importlib.metadata import entry_points
+from types import FrameType
 from typing import Annotated, Final, NoReturn, Union
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
@@ -25,6 +27,9 @@ from faultpoint.rules import FileRuleSource, Rule, RuleSet, RuleSource
 PLUGIN_GROUP: Final = "faultpoint.plugins"
 POLL_INTERVAL_S: Final = 0.5
 STOP_EXIT_CODE: Final = 70
+DEFAULT_DISPOSITIONS: Final = {signal.SIGTERM: signal.SIG_DFL, signal.SIGINT: signal.default_int_handler}
+"""The stopping signals with the dispositions Python starts with; the observations are flushed on a signal whose
+disposition the application has not changed by the time faultpoint starts."""
 
 
 def implemented_actions(*models: type[BaseModel]) -> object:
@@ -244,6 +249,17 @@ def stop(error: Exception) -> NoReturn:
     os._exit(STOP_EXIT_CODE)
 
 
+def flush_then_resignal(sink: ObservationSink, signum: int, frame: FrameType | None) -> None:
+    """Write the observations before a stopping signal has its default effect, which for SIGTERM ends the process
+    without its exit handlers, so that a process stopped gracefully loses none of them."""
+    # The main thread the signal interrupted may hold the sink's lock, so the flush waits for it at most an interval.
+    flushing = threading.Thread(target=sink.flush, name="faultpoint-final-flush", daemon=True)
+    flushing.start()
+    flushing.join(sink.interval)
+    signal.signal(signum, DEFAULT_DISPOSITIONS[signal.Signals(signum)])
+    signal.raise_signal(signum)
+
+
 def repeat(interval: float, step: Callable[[], None]) -> NoReturn:
     while True:
         time.sleep(interval)
@@ -279,5 +295,8 @@ def start() -> None:
             atexit.register(RUNTIME.sink.flush)
             threading.Thread(target=repeat, args=(RUNTIME.sink.interval, RUNTIME.sink.flush),
                              name="faultpoint-observations", daemon=True).start()
+            for signum, disposition in DEFAULT_DISPOSITIONS.items():
+                if signal.getsignal(signum) is disposition:
+                    signal.signal(signum, functools.partial(flush_then_resignal, RUNTIME.sink))
     except Exception as error:
         stop(error)

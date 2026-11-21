@@ -198,11 +198,26 @@ def serve_points(runtime: Runtime, options: HttpOptions, load: Callable[[], None
     config.loaded_app = ServerPoint(config.loaded_app, runtime, options)
 
 
+async def flush_after_shutdown(runtime: Runtime, shutdown: Callable[..., Awaitable[None]], server: Any,
+                               args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    """Write the observations once uvicorn has finished the requests it served, since uvicorn then ends the process
+    with the signal it stopped on, which skips the exit handlers where that signal has its default disposition, as
+    a gunicorn worker sets it."""
+    await shutdown(*args, **kwargs)
+    if runtime.sink is not None:
+        runtime.sink.flush()
+
+
+def patch_uvicorn(runtime: Runtime, options: HttpOptions, module: ModuleType) -> None:
+    wrapt.wrap_function_wrapper(module, "Config.load", functools.partial(serve_points, runtime, options))
+    wrapt.wrap_function_wrapper(module, "Server.shutdown", functools.partial(flush_after_shutdown, runtime))
+
+
 def install_asgi(runtime: Runtime, options: dict[str, JsonValue]) -> None:
-    """Wrap the application uvicorn serves, the one place every ASGI framework's requests pass through."""
-    wrapper = functools.partial(serve_points, runtime, HttpOptions.model_validate(options))
+    """Wrap the application uvicorn serves, the one place every ASGI framework's requests pass through, and the
+    shutdown after which uvicorn ends the process."""
     wrapt.register_post_import_hook(
-        lambda module: wrapt.wrap_function_wrapper(module, "Config.load", wrapper), UVICORN_MODULE)
+        functools.partial(patch_uvicorn, runtime, HttpOptions.model_validate(options)), UVICORN_MODULE)
 
 
 class ClientPoint:
