@@ -164,6 +164,13 @@ def control_executions(records: Iterable[ObservationRecord], repetitions: int, t
     return {point: count / (repetitions * tenants) for point, count in counts.items()}
 
 
+def service_languages(manifests: Path) -> dict[str, str]:
+    """The language of every service with a manifest; an upstream component has none."""
+    return {manifest.service: manifest.language
+            for manifest in (Manifest.model_validate_json(path.read_text(encoding="utf-8"))
+                             for path in sorted(manifests.glob("*.json")))}
+
+
 def build_catalog(manifests: Path, executions: dict[str, dict[str, float]], configured: list[str],
                   actions: ActionTable, kinds: KindTable, upstream: frozenset[str]) -> Catalog:
     """Every point the manifests list, a control observed or the deployment configures, times the actions its kind

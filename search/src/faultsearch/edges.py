@@ -59,8 +59,12 @@ class EffectRule(BaseModel):
     verdicts: tuple[Verdict, ...] = (Verdict.NEW, Verdict.INCREASE)
     layers: tuple[Layer, ...] = tuple(Layer)
     """The layers of the effect's point the rule covers."""
+    languages: tuple[str, ...] | None = None
+    """The languages, as manifests name them, of the services whose points the rule covers; every point when absent."""
     details: DetailValues = {}
     """The detail values the effect must show."""
+    excluded_details: DetailValues = {}
+    """The detail values the effect must not show."""
     parameters: dict[str, str] = {}
     """Action parameters the effect's detail gives, by the detail key that gives each; the rule covers only effects
     whose detail has those keys."""
@@ -68,12 +72,15 @@ class EffectRule(BaseModel):
     faults: tuple[Action, ...]
     reason: str
 
-    def covers(self, effect: EffectKey, verdicts: set[Verdict], layer: Layer, peer_effects: list[EffectKey]) -> bool:
-        """Whether the rule covers an effect that held with these verdicts, beside these effects of the called
-        server point."""
+    def covers(self, effect: EffectKey, verdicts: set[Verdict], layer: Layer, language: str | None,
+               peer_effects: list[EffectKey]) -> bool:
+        """Whether the rule covers an effect that held with these verdicts, at a point of a service in this language,
+        beside these effects of the called server point."""
         return (self.kind == point_kind(effect.point) and effect.outcome in self.outcomes
                 and self.metric == effect.metric and bool(verdicts & set(self.verdicts)) and layer in self.layers
-                and shows(effect.detail, self.details) and set(self.parameters.values()) <= effect.detail.keys()
+                and (self.languages is None or language in self.languages) and shows(effect.detail, self.details)
+                and not any(effect.detail.get(name) in values for name, values in self.excluded_details.items())
+                and set(self.parameters.values()) <= effect.detail.keys()
                 and (self.peer is None
                      or any(peer.outcome in self.peer.outcomes and shows(peer.detail, self.peer.details)
                             for peer in peer_effects)))
@@ -197,11 +204,12 @@ def peer_effects(effect: EffectKey, runs: list[dict[str, Effect]], services: dic
             if found.point == peer and all(key in run for run in runs)]
 
 
-def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, peer_effects: list[EffectKey],
-                 effects: EffectMap, catalog: Catalog, kinds: KindTable) -> tuple[Counterpart, tuple[Fault, ...]]:
+def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, language: str | None,
+                 peer_effects: list[EffectKey], effects: EffectMap, catalog: Catalog,
+                 kinds: KindTable) -> tuple[Counterpart, tuple[Fault, ...]]:
     """The faults that, injected at an effect's point, produce the effect: the catalog's instances of every action
     the effect map names for it, or the action itself where the catalog has none."""
-    rules = [rule for rule in effects.rules if rule.covers(effect, verdicts, layer, peer_effects)]
+    rules = [rule for rule in effects.rules if rule.covers(effect, verdicts, layer, language, peer_effects)]
     found = [([fault for fault in catalog.faults if fault.instance_of(effect.point, action)], action)
              for rule in rules for action in rule.actions(effect)]
     faults = {fault.key: fault for instances, action in found
@@ -217,7 +225,7 @@ def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, peer_e
 
 def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: EffectMap, catalog: Catalog,
                 kinds: KindTable, upstream: frozenset[str], targets: dict[str, str], services: dict[int, str],
-                min_count_increase: float) -> list[Edge]:
+                languages: dict[str, str], min_count_increase: float) -> list[Edge]:
     """Every (fault, effect) pair the exercised records show, over the scenarios each fault was tested in."""
     by_fault: dict[str, list[TreatmentRecord]] = defaultdict(list)
     for record in records:
@@ -234,6 +242,7 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
             held_in = [sighting.scenario for sighting in held]
             not_held = [run.workload for run in runs if run.workload not in held_in]
             counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, layer,
+                                               languages.get(point_service(effect.point)),
                                                peer_effects(effect, [shown[name] for name in held_in], services),
                                                effects, catalog, kinds)
             edges.append(Edge(cause=runs[0].fault, effect=effect, held=tuple(held), not_held=tuple(not_held),
