@@ -27,5 +27,9 @@
     "branch": [{"kind": "fail"}],
     "call": [{"kind": "fail"}],
     "check": [{"kind": "negate"}]
+  },
+  "functions": {
+    "lookupKey": [{"kind": "fail", "error": "NULL"}],
+    "pq_getbyte": [{"kind": "fail", "error": "EOF"}]
   }
 }

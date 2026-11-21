@@ -12,7 +12,8 @@ from pydantic import BaseModel, JsonValue
 from shop.workload import Scenarios
 
 from faultsearch.allocation import Assignment, Phase, Strategy
-from faultsearch.catalog import DATA, FROZEN, Catalog, Fault, Layer, point_kind, point_layer, point_service
+from faultsearch.catalog import (DATA, FROZEN, Catalog, Fault, Layer, point_kind, point_layer, point_scoped,
+                                 point_service)
 from faultsearch.counterfactual import EffectKey, TreatmentRecord
 
 EFFECTS_FILE: Final = DATA / "effects.json"
@@ -205,7 +206,7 @@ def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, peer_e
              for rule in rules for action in rule.actions(effect)]
     faults = {fault.key: fault for instances, action in found
               for fault in instances or [Fault(point=effect.point, action=action, layer=layer,
-                                               scoped=kinds.kinds[point_kind(effect.point)].scope)]}
+                                               scoped=point_scoped(effect.point, layer, kinds))]}
     if not rules:
         return Counterpart.UNMAPPED, ()
     if not found:

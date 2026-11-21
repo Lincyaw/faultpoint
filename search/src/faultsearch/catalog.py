@@ -17,6 +17,8 @@ DATA: Final = Path(__file__).resolve().parents[2] / "data"
 ACTIONS_FILE: Final = DATA / "actions.json"
 DELAY: Final = "delay"
 KERNEL_KINDS: Final = frozenset({"syscall", "packet"})
+FUNCTION_KINDS: Final = frozenset({"call", "check"})
+"""The kinds of the points the kernel agent places in an upstream component's functions."""
 LIBRARY_VERSION: Final = "@"
 """What a dependency library's point carries in its locator: the library's name and version."""
 CONFIGURED_EXECUTIONS: Final = 1.0
@@ -40,12 +42,23 @@ def point_service(point: str) -> str:
     return point.split(":", 1)[0]
 
 
+def point_symbol(point: str) -> str:
+    """The function a native function point is placed in, the end of its locator."""
+    return point.rpartition(":")[2]
+
+
 def point_layer(point: str, upstream: frozenset[str]) -> Layer:
     if point_service(point) in upstream:
         return Layer.UPSTREAM
     if point_kind(point) in KERNEL_KINDS:
         return Layer.KERNEL
     return Layer.LIBRARY if LIBRARY_VERSION in point.split(":", 2)[2] else Layer.BUSINESS
+
+
+def point_scoped(point: str, layer: Layer, kinds: KindTable) -> bool:
+    """Whether a rule can limit a point's fault to a tenant: its kind takes a scope and an SDK serves it, rather than
+    the kernel agent, which sees no request baggage in an upstream component."""
+    return kinds.kinds[point_kind(point)].scope and layer != Layer.UPSTREAM
 
 
 class Fault(BaseModel):
@@ -86,13 +99,18 @@ class ActionTable(BaseModel):
 
     kinds: dict[str, tuple[Action, ...]]
     library: dict[str, tuple[Action, ...]] = {}
+    functions: dict[str, tuple[Action, ...]] = {}
+    """The actions at the points the kernel agent places in an upstream component's functions, by function, since a
+    fail names one of the failures the agent's configuration defines for that function."""
 
     @classmethod
     def read(cls, path: Path = ACTIONS_FILE) -> Self:
         return cls.model_validate_json(path.read_text(encoding="utf-8"))
 
     def actions(self, point: str, layer: Layer) -> tuple[Action, ...] | None:
-        """The actions to try at a point, none when its kind has no list for its layer."""
+        """The actions to try at a point, none when its kind, or its function, has no list for its layer."""
+        if layer == Layer.UPSTREAM and point_kind(point) in FUNCTION_KINDS:
+            return self.functions.get(point_symbol(point))
         return (self.library if layer == Layer.LIBRARY else self.kinds).get(point_kind(point))
 
 
@@ -135,12 +153,13 @@ class Catalog(BaseModel):
 
 
 def control_executions(records: Iterable[ObservationRecord], repetitions: int, tenants: int,
-                       kinds: KindTable) -> dict[str, float]:
-    """The executions of every point the records show, per tenant and repetition: in a tenant's scope for the kinds a
+                       kinds: KindTable, upstream: frozenset[str]) -> dict[str, float]:
+    """The executions of every point the records show, per tenant and repetition: in a tenant's scope for the points a
     rule can scope, and outside any scope for those it cannot."""
     counts: dict[str, int] = defaultdict(int)
     for record in records:
-        reached = record.scope != "" if kinds.kinds[point_kind(record.point)].scope else record.scope == ""
+        reached = (record.scope != "" if point_scoped(record.point, point_layer(record.point, upstream), kinds)
+                   else record.scope == "")
         counts[record.point] += record.count if reached else 0
     return {point: count / (repetitions * tenants) for point, count in counts.items()}
 
@@ -163,7 +182,7 @@ def build_catalog(manifests: Path, executions: dict[str, dict[str, float]], conf
                  and actions.actions(use.point, point_layer(use.point, upstream)) is None]
     skipped = {exclusion.point for exclusion in excluded}
     faults = tuple(Fault(point=use.point, action=action, layer=point_layer(use.point, upstream),
-                         scoped=kinds.kinds[point_kind(use.point)].scope)
+                         scoped=point_scoped(use.point, point_layer(use.point, upstream), kinds))
                    for use in uses if use.point not in skipped
                    for action in actions.actions(use.point, point_layer(use.point, upstream)) or ())
     return Catalog(faults=faults, uses=uses, excluded=tuple(excluded))

@@ -17,6 +17,8 @@
     {"kind": "call", "outcomes": ["error"], "metric": "count", "layers": ["business"], "parameters": {"error": "error"},
      "faults": [{"kind": "fail"}],
      "reason": "An error of a type returned from a call is what fail raising that type substitutes there: the importable class at a Python call point, the registered sentinel at a Go one. Without the type, fail raises what the call site's first handler names, which may take another path."},
+    {"kind": "call", "outcomes": ["error"], "metric": "count", "layers": ["upstream"], "faults": [{"kind": "fail"}],
+     "reason": "A function of an upstream component returning its failure is what fail writing that failure returns, where the agent's configuration gives the value the function returns naturally: NULL from a read of Redis that finds no key, EOF from a PostgreSQL backend reading the end of its client's connection."},
     {"kind": "call", "outcomes": ["ok"], "metric": "count", "faults": [],
      "reason": "More successful calls only mean more executions."},
     {"kind": "check", "outcomes": ["true", "false"], "metric": "count", "verdicts": ["new"], "layers": ["business"],

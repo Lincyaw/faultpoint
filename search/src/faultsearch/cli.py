@@ -47,7 +47,7 @@ def scenario_catalog(store: Store, runner: Runner, scenarios: Scenarios) -> Cata
                                 for scenario in scenarios.scenarios])
     executions = {control.workload.name: control_executions(
         [record for label in control.labels for record in runner.observations(label)], len(control.labels),
-        control.workload.workload.tenants, runner.kinds) for control in controls}
+        control.workload.workload.tenants, runner.kinds, UPSTREAM_SERVICES) for control in controls}
     actions = store.record_input(ActionTable.read(), INPUTS, ACTIONS_INPUT)
     return store.record_input(build_catalog(MANIFESTS, executions, list(PACKET_POINTS), actions, runner.kinds,
                                             UPSTREAM_SERVICES), CATALOG)
