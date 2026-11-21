@@ -381,6 +381,11 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	request = request.Clone(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		WroteRequest: func(info httptrace.WroteRequestInfo) { wrote.Store(info.Err == nil) },
 	}))
+	// http.Client gives a request for a transport it does not know a Cancel channel closed at the deadline it also
+	// puts on the context; the base transport sees the deadline alone, as without faultpoint, and fails as a timeout.
+	if _, bounded := ctx.Deadline(); bounded {
+		request.Cancel = nil
+	}
 	propagator.Inject(ctx, propagation.HeaderCarrier(request.Header))
 	point := faultpoint.PointID(faultpoint.Service(), "rpc_client",
 		request.Method+" "+request.URL.Host+pathTemplate(request.URL.Path))
@@ -397,7 +402,7 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	if late {
 		action.SendLate(ctx, func(lateCtx context.Context) {
 			lateRequest := request.WithContext(lateCtx)
-			// http.Client gives a request for a transport it does not know a Cancel channel it closes at its timeout.
+			// Nor does a Cancel channel of the caller's own end it.
 			lateRequest.Cancel = nil
 			if answer, failed := base.RoundTrip(lateRequest); failed == nil {
 				io.Copy(io.Discard, answer.Body)
