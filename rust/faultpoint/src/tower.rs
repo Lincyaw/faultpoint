@@ -106,7 +106,7 @@ where
                              &format!("{} {}", request.method(), path_template(request.uri().path())));
         let rule = {
             let _attached = parent.clone().attach();
-            core.decide(&point)
+            core.decide_among(&point, |action| action != "fail_after")
         };
         let context = parent.clone();
         Box::pin(async move {
@@ -119,11 +119,23 @@ where
             if let (Some(rule), Some("crash")) = (&rule, kind) {
                 core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32);
             }
-            let status = rule.as_ref().and_then(|rule| rule.action.parameters.get("status"));
-            let response = match kind {
-                Some("fail") => Ok(failure(status)),
-                Some("fail_after") => inner.call(request).await.map(|_| failure(status)),
+            let response = match (&rule, kind) {
+                (Some(rule), Some("fail")) => Ok(failure(rule.action.parameters.get("status"))),
                 _ => inner.call(request).await,
+            };
+            // Only a 2xx or 3xx answer is one a fail_after rule replaces and counts.
+            let response = match response {
+                Ok(answer) if answer.status().is_success() || answer.status().is_redirection() => {
+                    match core.decide_among(&exchange.point, |action| action == "fail_after") {
+                        Some(replacing) => {
+                            let replaced = failure(replacing.action.parameters.get("status"));
+                            exchange.rule = Some(replacing);
+                            Ok(replaced)
+                        }
+                        None => Ok(answer),
+                    }
+                }
+                other => other,
             };
             exchange.answered = Some(match &response {
                 Ok(response) => (status_outcome(response.status()),
