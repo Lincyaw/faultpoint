@@ -215,7 +215,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 - `call`：故障点放在 Go 中类型为 `error` 的 `err != nil` 处，观测 err。
   - **能跳过的调用**：产生 err 的调用就在这个 `if` 的初始化语句里或紧挨在它前面，被调函数是标识符或标识符组成的选择器，且不是边界装配要改写的调用时，调用改为 `Call(ctx, id, f)(args)`。参数照常求值；`fail` 不调用 f，其余结果取零值，err 为注入的错误；`fail_after` 先调用 f，再替换 err。
   - **只能在检查处注入的调用**：其余情形把检查改为 `Failed(ctx, id, &err)`，只实现 `fail_after`。替换 err 而不是强制进入分支，是因为 err 为 nil 时强行进入分支，返回的仍是 nil 错误。
-  - 其他语言的 `call` 的 `fail` 都在被调函数运行之前生效：Python 在语句执行前抛出，Java 在调用指令前抛出（接收者和参数已经求值）。
+  - 其他语言的 `call` 的 `fail` 都在被调函数运行之前生效：Python 在语句执行前抛出，Java 在调用指令前抛出（接收者和参数已经求值）。Rust 把 `expr?` 改写为先判定规则的 `match`，只在执行分支中求值 `expr`，因此 `.await` 仍然合法；`fail_after` 在 `expr` 执行后替换结果。代价是 `expr` 中的临时值在分支结束时就被释放：`Ok` 值借用了这类临时值的调用（例如 `m.lock().unwrap().get(k).ok_or(e)?.clone()`）在副本中无法编译。
 - `check`：返回布尔值的函数，包装每个 `return`；所有返回值都是常量时跳过。有类型信息的语言按类型判断，Python 按返回注解判断，JS 按返回表达式的形状判断。
 - `loop`：在循环体开头插入 `loop(id)`；上界为常量的循环跳过。
 - `clock`：读当前时间的调用（缺省名单：Python 的 `time.time` `datetime.now` `datetime.utcnow`，Go 的 `time.Now`，JS 的 `Date.now` 和无参 `new Date`，Java 的 `System.currentTimeMillis` `Instant.now`，Rust 的 `SystemTime::now` `Instant::now`），包装为 `clock(id, 读数)`。
