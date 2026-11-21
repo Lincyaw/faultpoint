@@ -132,6 +132,9 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 - **范围**：`scope` 中的每一项都必须等于当前请求 baggage 中的同名项，规则才生效。不在任何请求中的后台工作没有 baggage，只匹配 `scope` 为空的规则。内核看不到请求的 baggage，所以 `syscall` 和 `packet` 的规则不能带 `scope`，作用范围就是故障点所属服务的所有容器。
 - **触发**：每个进程对每条规则单独计数：先跳过前 `skip` 次匹配，之后最多注入 `limit` 次，每次以 `probability` 的概率注入（随机数以 `FAULTPOINT_SEED` 和规则 id 为种子）。并发下“第 n 次”本身是不确定的，所以优先用 `scope` 限定到具体的租户或请求，少用计数。`syscall` 和 `packet` 的计数由 eBPF 代理在内核中进行，范围是一条规则在该服务所有容器上的匹配，而不是每个进程；它的随机序列与各语言 SDK 的不同。
 - **适用性**：动作必须属于该类别的可用动作（见 1.3）。边界类故障点的 `fail` 和 `fail_after` 用 `status` 指定合成的响应状态，或用 `error` 指定 `timeout` 或 `refused`。`call` 的 `error` 是已登记的错误名，Go 改写器会把包级的 `error` 变量自动登记为 `<包路径>.<变量名>`，这样注入的就是代码真实会返回的哨兵错误。`syscall` 的 `fail` 必须给出 errno 名，例如 `ECONNREFUSED`。存储和消息类的 `fail` `fail_after` 可以用 `code` 指定客户端库报告的错误码：SQL 存储是 SQLSTATE（例如 `23505`），Redis 是错误回复的前缀（例如 `WRONGTYPE`）。适配器抛出客户端库自己的、带这个码的错误类型，这样应用按错误码分支的处理照常执行，被注入的记录也带上同样的 `code`。
+  - **怎样构造**：尽量交给客户端库自己的工厂或解析器，例如 redis-py 的 `parse_error`、Lettuce 的 `ExceptionFactory`、redis-rs 的回复解析器；PostgreSQL 的错误按服务端发来的字段构造（Java 的 `PSQLException`、Go 的 `*pgconn.PgError`、psycopg 按 SQLSTATE 查到的类）。Rust 的这类错误由 SDK 导出的宏在应用的 crate 里展开，SDK 不依赖客户端库；Go 的 database/sql 由驱动插件登记各自的构造器。
+  - **拒绝**：码的格式不对（语句点上不是 SQLSTATE，Redis 点上不是大写单词）在加载时拒绝。驱动构造不出带码的错误时（例如 sqlite3 没有 SQLSTATE），Go 在驱动接上时拒绝该进程所有存储点上带码的规则，Python 在规则第一次在这个驱动上触发时拒绝；Java 对非 PostgreSQL 驱动给出带 SQLState 的普通 `SQLException`。
+  - **局限**：注入的错误不带约束名、表名这类字段；Redis 流水线里，带码的注入在发送前就让整个流水线失败，而真实的错误回复只让出错的那条命令失败。
 - **原子更新**：控制方先写临时文件再改名替换。缺省的文件规则来源每 0.5 秒检查一次修改时间。核心在换上新规则集之前，先让观测输出写出当前的计数，因此每条观测记录只属于一个实验。规则集无效时，核心终止进程，以免实验在无效的规则下继续运行。
 
 ## 4. 观测
