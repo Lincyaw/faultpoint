@@ -128,6 +128,11 @@ public final class HttpClients {
         return new Call(point, core.decide(point, Core.ACTS_BEFORE), builder.build(), System.nanoTime(), written, Context.current());
     }
 
+    /** Whether an answer is the success of an exchange, 2xx or 3xx, which is the only one fail_after replaces. */
+    static boolean succeeded(int status) {
+        return status >= 200 && status < 400;
+    }
+
     /** A failed request's error type and, when known, whether the request was sent whole: never after a failed
      * connect, and otherwise as the client's taking of the body tells, which is null for a request without one. */
     static Map<String, String> failureDetail(Throwable failure, Boolean written) {
@@ -165,11 +170,11 @@ public final class HttpClients {
         throw error;
     }
 
-    /** A request that got a response: a fail_after rule decided now, which only an answered request counts against
+    /** A request that got a response: a fail_after rule decided now, which only a 2xx or 3xx answer counts against
      * its trigger, answers with its failure instead; otherwise the response is observed and returned. */
     private static <T> HttpResponse<T> answered(Call call, HttpResponse<T> response) throws IOException {
         Core core = Core.current();
-        Rule replacing = core.decide(call.point(), Core.ACTS_AFTER);
+        Rule replacing = succeeded(response.statusCode()) ? core.decide(call.point(), Core.ACTS_AFTER) : null;
         if (replacing != null) {
             return failure(call, replacing);
         }

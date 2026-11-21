@@ -78,47 +78,55 @@ public final class ServletBoundary {
         Context context = PROPAGATOR.extract(Context.root(), headers, HEADERS);
         Scope scope = context.makeCurrent();
         String point = RuleSet.pointId(core.settings.service(), "rpc_server", method + " " + pathTemplate(uri));
-        Rule rule = core.decide(point);
-        int forced = 0;
+        Rule rule = core.decide(point, Core.ACTS_BEFORE);
         if (rule != null) {
             Points.hold(core, rule);
-            if (rule.kind().equals("fail") || rule.kind().equals("fail_after")) {
-                Integer status = rule.integer("status");
-                forced = status == null ? DEFAULT_FAILURE_STATUS : status;
-            }
         }
-        return new Entry(point, rule, context, scope, System.nanoTime(), forced);
+        return new Entry(point, rule, context, scope, System.nanoTime(), rule != null && rule.kind().equals("fail") ? failureStatus(rule) : 0);
+    }
+
+    public static int failureStatus(Rule rule) {
+        Integer status = rule.integer("status");
+        return status == null ? DEFAULT_FAILURE_STATUS : status;
+    }
+
+    /** The fail_after rule that replaces a response, decided once the servlet returned without a failure and with the
+     * response unwritten and its status known, which only a 2xx or 3xx answer counts against the rule's trigger; a
+     * response already written, or written later by an asynchronous request, is past replacing. */
+    public static Rule replacing(Entry entry, int status, Throwable thrown, boolean written) {
+        return entry == null || thrown != null || written || !HttpClients.succeeded(status) ? null
+                : Core.current().decide(entry.point(), Core.ACTS_AFTER);
     }
 
     /** Leave a request's service call; the request is observed now, unless it went asynchronous, when its
-     * listener observes it on completion. Resolved is the exception a framework handled without failing the call. */
-    public static void exit(Entry entry, int status, Throwable thrown, Object resolved, boolean asynchronous) {
+     * listener observes it on completion. Resolved is the exception a framework handled without failing the call,
+     * and replacing the fail_after rule whose failure took the answer's place, or null. */
+    public static void exit(Entry entry, int status, Throwable thrown, Object resolved, boolean asynchronous, Rule replacing) {
         DEPTH.set(DEPTH.get() - 1);
         if (entry == null) {
             return;
         }
         try {
             if (!asynchronous) {
-                observe(entry, status, thrown, clientAborted(thrown) || clientAborted(resolved));
+                observe(entry, status, thrown, clientAborted(thrown) || clientAborted(resolved), replacing == null ? entry.rule() : replacing);
             }
         } finally {
             entry.scope().close();
         }
     }
 
-    /** Observe a request's status, or its error when it threw without a forced status. The servlet API tells that
-     * a response was abandoned only when the container failed to write it because the client had gone, or the
-     * async context timed out; a response the container writes after the servlet returns tells nothing, so the
-     * detail says abandoned only when it is true. */
-    static void observe(Entry entry, int status, Throwable thrown, boolean abandoned) {
-        boolean failed = thrown != null && entry.forcedStatus() == 0;
+    /** Observe a request's status, or its error when it threw. The servlet API tells that a response was abandoned
+     * only when the container failed to write it because the client had gone, or the async context timed out; a
+     * response the container writes after the servlet returns tells nothing, so the detail says abandoned only when
+     * it is true. */
+    static void observe(Entry entry, int status, Throwable thrown, boolean abandoned, Rule rule) {
         var detail = new HashMap<String, String>();
-        detail.put(failed ? "error" : "status", failed ? thrown.getClass().getName() : String.valueOf(status));
+        detail.put(thrown != null ? "error" : "status", thrown != null ? thrown.getClass().getName() : String.valueOf(status));
         if (abandoned) {
             detail.put("abandoned", "true");
         }
-        Core.current().observe(entry.point(), failed ? "error" : (status / 100) + "xx",
-                (System.nanoTime() - entry.started()) / 1e6, entry.rule(), detail);
+        Core.current().observe(entry.point(), thrown != null ? "error" : (status / 100) + "xx",
+                (System.nanoTime() - entry.started()) / 1e6, rule, detail);
     }
 
     /** Whether a failure is, or is caused by, the container's report that the client went away during a write. */
@@ -151,7 +159,7 @@ public final class ServletBoundary {
                 case "onComplete" -> {
                     try (Scope ignored = entry.context().makeCurrent()) {
                         observe(entry, (Integer) getStatus.invoke(response), failure[0], timedOut[0]
-                                || clientAborted(failure[0]) || clientAborted(getAttribute.invoke(request, RESOLVED_EXCEPTION)));
+                                || clientAborted(failure[0]) || clientAborted(getAttribute.invoke(request, RESOLVED_EXCEPTION)), entry.rule());
                     }
                 }
                 case "hashCode" -> {

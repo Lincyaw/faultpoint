@@ -36,8 +36,8 @@ final class ServletAdvice {
         return false;
     }
 
-    /** A fail_after request ran; its answer is replaced unless it already left, and the status observed is the one
-     * the response carries. A request that went asynchronous is observed when it completes. */
+    /** The request ran; a fail_after rule decided now replaces its answer with the rule's failure, headers and body
+     * included, while the answer is not yet written. A request that went asynchronous is observed when it completes. */
     @Advice.OnMethodExit(onThrowable = Throwable.class)
     static void exit(@Advice.Argument(0) ServletRequest request, @Advice.Argument(1) ServletResponse response,
                      @Advice.Local("entry") ServletBoundary.Entry entry, @Advice.Thrown Throwable thrown)
@@ -45,14 +45,16 @@ final class ServletAdvice {
         if (!(response instanceof HttpServletResponse answer)) {
             return;
         }
-        if (entry != null && entry.forcedStatus() != 0 && !answer.isCommitted()) {
-            answer.resetBuffer();
-            answer.setStatus(entry.forcedStatus());
-        }
         boolean asynchronous = entry != null && request.isAsyncStarted();
+        RuleSet.Rule replacing = ServletBoundary.replacing(entry, answer.getStatus(), thrown, answer.isCommitted() || asynchronous);
+        if (replacing != null) {
+            answer.reset();
+            answer.setStatus(ServletBoundary.failureStatus(replacing));
+        }
         if (asynchronous) {
             request.getAsyncContext().addListener((AsyncListener) ServletBoundary.listener(entry, AsyncListener.class, request, answer));
         }
-        ServletBoundary.exit(entry, answer.getStatus(), thrown, request.getAttribute(ServletBoundary.RESOLVED_EXCEPTION), asynchronous);
+        ServletBoundary.exit(entry, answer.getStatus(), thrown, request.getAttribute(ServletBoundary.RESOLVED_EXCEPTION), asynchronous,
+                replacing);
     }
 }

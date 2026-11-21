@@ -154,7 +154,7 @@ public final class SpringHttp {
                     HttpClients.failureDetail(thrown, running.written().get()));
             return null;
         }
-        Rule replacing = core.decide(running.point(), Core.ACTS_AFTER);
+        Rule replacing = HttpClients.succeeded(status) ? core.decide(running.point(), Core.ACTS_AFTER) : null;
         if (replacing == null) {
             core.observe(running.point(), (status / 100) + "xx", running.elapsed(), running.rule(),
                     Map.of("status", String.valueOf(status)));
