@@ -74,7 +74,8 @@ def branch(point: str, taken: bool) -> bool:
 
 class CallSite:
     """A statement with a call inside a try block: a fail rule raises an exception the try's handlers catch before
-    the statement runs, a fail_after rule once it completed, and whatever exception leaves it is an error."""
+    the statement runs, a fail_after rule once it completed without one, and whatever exception leaves it is an
+    error."""
 
     def __init__(self, runtime: Runtime, point: str, candidates: Callable[[], tuple[type[BaseException], ...]]) -> None:
         self.runtime = runtime
@@ -96,6 +97,8 @@ class CallSite:
 
     def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
                  trace: TracebackType | None) -> None:
+        if kind is None and self.decision is None:
+            self.decision = self.runtime.decide_completed(self.point)
         match kind, self.decision:
             case None, Decision(action=RaiseFailAfter() as raising):
                 raise self.raised(raising)

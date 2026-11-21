@@ -34,6 +34,11 @@ class Fail(BaseModel):
     """The registered error a call point returns."""
 
 
+class OnCompletion(BaseModel):
+    """An action decided once its point's operation completed normally, so that an operation that failed by itself
+    keeps its failure as a natural outcome, without counting toward the rule's trigger."""
+
+
 class Raising(BaseModel):
     """Raising an exception at a call site, constructed with an empty message: the class an importable dotted name
     gives, or else the first class the handlers around the call site name."""
@@ -49,8 +54,8 @@ class RaiseFail(Raising):
     kind: Literal[ActionKind.FAIL]
 
 
-class RaiseFailAfter(Raising):
-    """Raising once the call site's statement completed, which keeps the exception the statement raised itself."""
+class RaiseFailAfter(Raising, OnCompletion):
+    """Raising once the call site's statement completed."""
 
     kind: Literal[ActionKind.FAIL_AFTER]
 
@@ -101,8 +106,8 @@ class StoreFail[Code: str](StoreFailure[Code]):
     kind: Literal[ActionKind.FAIL]
 
 
-class StoreFailAfter[Code: str](StoreFailure[Code]):
-    """A failure the caller sees after the write or the message took place."""
+class StoreFailAfter[Code: str](StoreFailure[Code], OnCompletion):
+    """A failure the caller sees after the statement, the command or the message completed."""
 
     kind: Literal[ActionKind.FAIL_AFTER]
 

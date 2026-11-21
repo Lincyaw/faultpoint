@@ -15,6 +15,7 @@ from typing import Annotated, Final, NoReturn, Union
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 from pydantic_core import ErrorDetails
 
+from faultpoint.actions import OnCompletion
 from faultpoint.config import Config, Settings
 from faultpoint.context import ContextProvider, OtelContext
 from faultpoint.observations import (JSONL_OPTIONS, NO_DETAIL, JsonlOptions, JsonlSink, Observation,
@@ -41,18 +42,21 @@ class Decision(BaseModel):
 
 
 class RulesInForce:
-    """The rule set a process obeys, its rules by point, and how often each rule matched and injected."""
+    """The rule set a process obeys, its rules by point, those decided before the point's operation runs apart from
+    those decided once it completed, and how often each rule matched and injected."""
 
     def __init__(self, experiment: str, decisions: Iterable[Decision], seed: int) -> None:
         self.experiment = experiment
-        self.by_point: dict[str, tuple[Decision, ...]] = {}
-        for decision in decisions:
-            self.by_point[decision.rule.point] = (*self.by_point.get(decision.rule.point, ()), decision)
+        self.before: dict[str, tuple[Decision, ...]] = {}
+        self.on_completion: dict[str, tuple[Decision, ...]] = {}
+        rules = tuple(decisions)
+        for decision in rules:
+            by_point = self.on_completion if isinstance(decision.action, OnCompletion) else self.before
+            by_point[decision.rule.point] = (*by_point.get(decision.rule.point, ()), decision)
         self.lock = threading.Lock()
         self.matches: Counter[str] = Counter()
         self.injections: Counter[str] = Counter()
-        self.randoms = {decision.rule.id: random.Random(f"{seed}:{decision.rule.id}")
-                        for decisions in self.by_point.values() for decision in decisions}
+        self.randoms = {decision.rule.id: random.Random(f"{seed}:{decision.rule.id}") for decision in rules}
 
     def fires(self, rule: Rule) -> bool:
         """Count a matching execution, and whether the rule's trigger injects at it."""
@@ -149,11 +153,21 @@ class Runtime:
             self.load(ruleset)
 
     def decide(self, point: str) -> Decision | None:
-        """The first rule of a point whose scope matches the current request and whose trigger fires now."""
+        """The first rule of a point decided before its operation runs whose scope matches the current request and
+        whose trigger fires now."""
         rules = self.rules
-        return next((decision for decision in rules.by_point.get(point, ())
-                     if all(self.context.baggage(key) == value
-                            for key, value in decision.rule.scope.items())
+        return self.fired(rules, rules.before.get(point, ()))
+
+    def decide_completed(self, point: str) -> Decision | None:
+        """The first rule of a point decided once its operation completed normally, such as a fail_after, whose
+        scope matches the current request and whose trigger fires now; an operation that failed by itself is never
+        decided this way."""
+        rules = self.rules
+        return self.fired(rules, rules.on_completion.get(point, ()))
+
+    def fired(self, rules: RulesInForce, decisions: Iterable[Decision]) -> Decision | None:
+        return next((decision for decision in decisions
+                     if all(self.context.baggage(key) == value for key, value in decision.rule.scope.items())
                      and rules.fires(decision.rule)), None)
 
     def observe(self, point: str, outcome: str, quantity: float, decision: Decision | None,

@@ -274,16 +274,29 @@ class CommandPoints:
 
     def settle(self, client: Any, queue: list[Queued], decisions: list[Decided | None],
                replies: list[Any]) -> list[Any]:
-        """Each command's reply out of the replies of what was sent, observed, and a failure after the effect."""
+        """Each command's reply out of the replies of what was sent, observed, and a failure after the effect of
+        a command that completed."""
         sent = iter(replies)
         settled = [self.reply(client, queued, decided, [next(sent) for _ in range(copies(decided))])
                    for queued, decided in zip(queue, decisions, strict=True)]
-        failures = [decided.decision for decided in decisions
+        completed = [self.completed(decided, reply) for decided, reply in zip(decisions, settled, strict=True)]
+        for decided, reply in zip(completed, settled, strict=True):
+            if decided is not None:
+                self.observe_reply(decided, reply)
+        failures = [decided.decision for decided in completed
                     if decided is not None and decided.decision is not None
                     and isinstance(decided.decision.action, StoreFailAfter)]
         if failures:
             raise self.failure(failures[0])
         return settled
+
+    def completed(self, decided: Decided | None, reply: Any) -> Decided | None:
+        """A command with the decision made before it was sent, or else, when its reply is no error, a fail_after
+        rule's."""
+        match decided, reply:
+            case Decided(decision=None), _ if not isinstance(reply, Exception):
+                return decided.model_copy(update={"decision": self.runtime.decide_completed(decided.point)})
+        return decided
 
     def reply(self, client: Any, queued: Queued, decided: Decided | None, sent: list[Any]) -> Any:
         match decided, sent:
@@ -297,8 +310,6 @@ class CommandPoints:
                 reply = delivered_twice(decided.command, last)
             case _:
                 reply = sent[-1]
-        if decided is not None:
-            self.observe_reply(decided, reply)
         return reply
 
     def observe_reply(self, decided: Decided, reply: Any) -> None:

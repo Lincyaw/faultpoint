@@ -155,6 +155,17 @@ class Store:
             rows = 1 if statement.dropped else max(cursor.rowcount, 0)
             self.runtime.observe(point, StoreOutcome.OK, rows, decision)
 
+    def completed(self, point: str, decision: Decision | None) -> Decision | None:
+        """The decision of a statement that completed: the one made before it ran, or else a fail_after rule's,
+        whose error is raised in place of the result."""
+        if decision is None:
+            decision = self.runtime.decide_completed(point)
+        if decision is not None and isinstance(decision.action, StoreFailAfter):
+            error = self.failure(decision)
+            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, error_detail(error))
+            raise error
+        return decision
+
     def run(self, statement: CursorStatement, sql: str, execute: Callable[[], Any], cursor: Any) -> Any:
         """Execute a statement at its point; the driver's result, or none for a dropped statement."""
         kind, point, decision = self.decide(statement, sql)
@@ -163,7 +174,7 @@ class Store:
         except Exception as error:
             self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, error_detail(error))
             raise
-        self.finish(statement, kind, point, decision, cursor)
+        self.finish(statement, kind, point, self.completed(point, decision), cursor)
         return result
 
     def perform(self, execute: Callable[[], Any], decision: Decision | None) -> Any:
@@ -180,10 +191,6 @@ class Store:
             case Decision(action=Duplicate()):
                 execute()
                 return execute()
-            case Decision(action=StoreFailAfter()):
-                error = self.failure(decision)
-                execute()
-                raise error
         return execute()
 
     async def run_async(self, statement: CursorStatement, sql: str, execute: Callable[[], Awaitable[Any]],
@@ -194,7 +201,7 @@ class Store:
         except Exception as error:
             self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, error_detail(error))
             raise
-        self.finish(statement, kind, point, decision, cursor)
+        self.finish(statement, kind, point, self.completed(point, decision), cursor)
         return result
 
     async def perform_async(self, execute: Callable[[], Awaitable[Any]], decision: Decision | None) -> Any:
@@ -211,8 +218,4 @@ class Store:
             case Decision(action=Duplicate()):
                 await execute()
                 return await execute()
-            case Decision(action=StoreFailAfter()):
-                error = self.failure(decision)
-                await execute()
-                raise error
         return await execute()
