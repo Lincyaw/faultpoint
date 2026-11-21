@@ -32,23 +32,40 @@ const STATEMENTS = new Map<string, Statement>();
 const STATEMENT_LOCATOR = /^[^ ]+#[0-9a-f]{8}$/;
 const SQLSTATE = /^[0-9A-Z]{5}$/;
 
-/** The tables of a parse tree: every range variable, which is the node that carries a relname. */
-function relations(tree: unknown, found: Set<string>): Set<string> {
+/** The nodes that write wherever they sit in a parse tree, a WITH item included. */
+const WRITES = ["InsertStmt", "UpdateStmt", "DeleteStmt", "MergeStmt"];
+
+/** What a parse tree touches: the range variables, which are the nodes that carry a relname, with and without a
+ * schema; the names of its WITH items; and whether a node of it writes, as a statement of WRITES or a query INTO a
+ * table does. */
+interface Touched {
+  qualified: Set<string>;
+  unqualified: Set<string>;
+  named: Set<string>;
+  writes: boolean;
+}
+
+function touched(tree: unknown, found: Touched): Touched {
   if (Array.isArray(tree)) {
-    tree.forEach((item) => relations(item, found));
+    tree.forEach((item) => touched(item, found));
   } else if (tree !== null && typeof tree === "object") {
-    const relname = (tree as { relname?: unknown }).relname;
-    if (typeof relname === "string") {
-      found.add(relname);
+    const node = tree as { relname?: unknown; schemaname?: unknown; ctename?: unknown };
+    if (typeof node.relname === "string") {
+      (node.schemaname === undefined ? found.unqualified : found.qualified).add(node.relname);
     }
-    Object.values(tree).forEach((value) => relations(value, found));
+    if (typeof node.ctename === "string") {
+      found.named.add(node.ctename);
+    }
+    found.writes ||= "intoClause" in node || WRITES.some((name) => name in node);
+    Object.values(tree).forEach((value) => touched(value, found));
   }
   return found;
 }
 
-/** The kind and locator of a statement, by PostgreSQL's own parser: a query is read and anything else written,
- * the tables it touches and its fingerprint, which ignores literals. Text PostgreSQL cannot parse is written,
- * since the server rejects it as no query. */
+/** The kind and locator of a statement, by PostgreSQL's own parser: a query that writes through neither a WITH item
+ * nor INTO is read and anything else written, the tables it touches, a table without a schema named as a WITH item
+ * being that item, and its fingerprint, which ignores literals. Text PostgreSQL cannot parse is written, since the
+ * server rejects it as no query. */
 export function statementPoint(sql: string): Statement {
   const known = STATEMENTS.get(sql);
   if (known !== undefined) {
@@ -58,8 +75,9 @@ export function statementPoint(sql: string): Statement {
   try {
     const tree = parseSync(sql);
     const parsed = tree.stmts ?? [];
-    const reads = parsed.length > 0 && parsed.every((entry) => entry.stmt !== undefined && "SelectStmt" in entry.stmt);
-    const tables = [...relations(tree, new Set())].sort();
+    const found = touched(tree, { qualified: new Set(), unqualified: new Set(), named: new Set(), writes: false });
+    const reads = parsed.length > 0 && !found.writes && parsed.every((entry) => entry.stmt !== undefined && "SelectStmt" in entry.stmt);
+    const tables = [...new Set([...found.qualified, ...[...found.unqualified].filter((name) => !found.named.has(name))])].sort();
     statement = { kind: reads ? "store_read" : "store_write", locator: `${tables.join("+") || "-"}#${fingerprintSync(sql).slice(0, 8)}` };
   } catch (error) {
     if (!hasSqlDetails(error)) {
