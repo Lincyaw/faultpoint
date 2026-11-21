@@ -143,7 +143,7 @@ orders 的超时由环境变量 `RESERVE_TIMEOUT_S` 给出，作用于它的整�
 | `rpc_client` timeout，请求已发出，服务端在调用方离开后答复 4xx 或 5xx | `fail` timeout：对端没有完成工作，`fail_after` 会让它完成 |
 | `rpc_client` timeout，请求已发出，没有这样的服务端效果 | 无：不知道对端是否完成了工作 |
 | `rpc_client`/`rpc_server` 4xx、5xx | `fail`，状态码取细节中的精确值：调用方按具体状态码分支（orders 只把 409 当作缺货） |
-| `rpc_server` 在调用方离开之后答复（`abandoned=true`）的任何结果，次数或均值 | 无：这是服务端注意到调用方已超时，是调用方的结果；`abandoned` 不在细节中时是未知，按前两行对应 |
+| `rpc_server` 在调用方离开之后答复（`abandoned=true`）的任何结果，次数或均值 | 无：这是服务端注意到调用方已超时，是调用方的结果；`abandoned` 不在细节中时是未知，按状态码和均值的那两行对应 |
 | `rpc_client` refused | `fail` refused（不在目录中） |
 | `rpc_client`/`rpc_server` 均值增加 | `delay` |
 | `store_read` empty / error | `empty` / `fail` |
