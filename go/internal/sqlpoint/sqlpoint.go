@@ -1,5 +1,5 @@
-// Package sqlpoint classifies SQL statements into the store points of the SQL adapter plugins, builds the errors their
-// fail rules inject and describes their failures.
+// Package sqlpoint classifies SQL statements into the store points of the SQL adapter plugins, holds how drivers build
+// the errors their fail rules inject and describes their failures.
 package sqlpoint
 
 import (
@@ -12,11 +12,14 @@ import (
 	"sync"
 
 	"faultpoint"
-	"faultpoint/internal/action"
 
 	"github.com/DataDog/go-sqllexer"
-	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// CodedErrors build, by the package of a database/sql driver, the error the driver returns for a statement refused
+// with a code; the adapter plugin of the driver's client library adds its builder from its init, so that the SQL
+// adapter depends on no driver.
+var CodedErrors = map[string]func(code string) error{}
 
 // Point is where a statement is a store point: its kind, its locator, and its first command, upper case.
 type Point struct {
@@ -67,11 +70,6 @@ func (c *Classifier) Classify(query string) Point {
 	point.Locator = tables + "#" + hex.EncodeToString(digest[:])[:8]
 	c.points.Store(query, point)
 	return point
-}
-
-// PostgresError is the error pgx gives for a statement PostgreSQL refused with a SQLSTATE, as a fail rule injects it.
-func PostgresError(code string) error {
-	return &pgconn.PgError{Severity: "ERROR", Code: code, Message: action.ErrInjected.Error()}
 }
 
 // ErrorDetail is the detail of a failed statement: the error's name and, when the driver reports one, its code: the

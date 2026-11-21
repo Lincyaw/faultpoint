@@ -212,6 +212,9 @@ func instrument(arguments []string) {
 	if len(libraries) > 0 {
 		used[pointsPackage] = true
 	}
+	if slices.Contains(config.Plugins, sqlPlugin) && slices.ContainsFunc(graph, func(pkg *packages.Package) bool { return pkg.PkgPath == pgxDriver }) {
+		used[pgxPackage] = true
+	}
 	plugins := slices.Sorted(maps.Keys(used))
 	sentinels := packageErrors(sourceDir, config.Placement.ErrorPackages)
 	for _, pkg := range written {

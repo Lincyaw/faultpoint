@@ -21,20 +21,13 @@ import (
 	"github.com/ngrok/sqlmw"
 )
 
-const (
-	instrumentedPrefix = "faultpoint:"
-	// pgxDriver is the package of the database/sql driver of pgx, which returns the errors of pgconn unchanged.
-	pgxDriver = "github.com/jackc/pgx/v5/stdlib"
-)
-
-// codedErrors build the error a driver returns for a statement refused with a code, by the package of the driver.
-var codedErrors = map[string]func(code string) error{pgxDriver: sqlpoint.PostgresError}
+const instrumentedPrefix = "faultpoint:"
 
 var (
 	enabled    bool
 	classifier *sqlpoint.Classifier
 	drivers    sync.Mutex
-	// uncoded are the wrapped drivers outside codedErrors, by package and type name.
+	// uncoded are the wrapped drivers without a builder in sqlpoint.CodedErrors, by package and type name.
 	uncoded sync.Map
 )
 
@@ -76,8 +69,8 @@ func refuse(rule *faultpoint.Rule) error {
 }
 
 // DriverName is the name of a driver whose statements are store points, wrapping the driver registered under
-// name; it returns name unchanged when the plugin is not enabled. A driver outside codedErrors makes the rules in
-// force, and those installed later, refuse a code.
+// name; it returns name unchanged when the plugin is not enabled. A driver without a builder in
+// sqlpoint.CodedErrors makes the rules in force, and those installed later, refuse a code.
 func DriverName(name string) string {
 	if !enabled {
 		return name
@@ -99,7 +92,7 @@ func DriverName(name string) string {
 	if driverType.Kind() == reflect.Pointer {
 		driverType = driverType.Elem()
 	}
-	coded, known := codedErrors[driverType.PkgPath()]
+	coded, known := sqlpoint.CodedErrors[driverType.PkgPath()]
 	if !known {
 		uncoded.Store(driverType.PkgPath()+"."+driverType.Name(), true)
 		faultpoint.Recheck()
@@ -177,7 +170,7 @@ func (i interceptor) read(ctx context.Context, sql string, run func() (driver.Ro
 }
 
 // interceptor makes the statements of one wrapped driver store points; coded builds that driver's error with a code,
-// nil for a driver outside codedErrors.
+// nil for a driver without a builder in sqlpoint.CodedErrors.
 type interceptor struct {
 	sqlmw.NullInterceptor
 	coded func(code string) error

@@ -1,5 +1,6 @@
 // Package fppgx is the adapter plugin of pgx: store_read and store_write points on the statements that rewritten
-// call sites send through a pgx pool, connection or transaction, or through any interface with their methods.
+// call sites send through a pgx pool, connection or transaction, or through any interface with their methods; it
+// also gives the SQL adapter the errors of pgx's database/sql driver.
 package fppgx
 
 import (
@@ -16,6 +17,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// pgxDriver is the package of pgx's database/sql driver, which returns the errors of pgconn unchanged.
+const pgxDriver = "github.com/jackc/pgx/v5/stdlib"
+
 var (
 	enabled    bool
 	classifier *sqlpoint.Classifier
@@ -30,6 +34,12 @@ func init() {
 		"store_write": {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
 	}})
 	classifier = sqlpoint.NewClassifier(options.ReadCommands)
+	sqlpoint.CodedErrors[pgxDriver] = postgresError
+}
+
+// postgresError is the error pgx gives for a statement PostgreSQL refused with a SQLSTATE, as a fail rule injects it.
+func postgresError(code string) error {
+	return &pgconn.PgError{Severity: "ERROR", Code: code, Message: action.ErrInjected.Error()}
 }
 
 type ownerKey struct{}
@@ -105,7 +115,7 @@ func Exec(db execer, ctx context.Context, sql string, arguments ...any) (pgconn.
 	var err error
 	switch s.action {
 	case "fail":
-		err = action.Failure(s.rule, sqlpoint.PostgresError)
+		err = action.Failure(s.rule, postgresError)
 	case "drop":
 		tag = pgconn.NewCommandTag(s.command + " 1")
 	default:
@@ -115,7 +125,7 @@ func Exec(db execer, ctx context.Context, sql string, arguments ...any) (pgconn.
 		tag, err = run()
 	}
 	if err == nil && s.action == "fail_after" {
-		tag, err = pgconn.CommandTag{}, action.Failure(s.rule, sqlpoint.PostgresError)
+		tag, err = pgconn.CommandTag{}, action.Failure(s.rule, postgresError)
 	}
 	if err == nil && s.action == "empty" {
 		tag = pgconn.NewCommandTag(s.command + " 0")
@@ -136,7 +146,7 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 	s := decide(ctx, sql)
 	s.refuse("Query", "drop")
 	if s.action == "fail" {
-		err := action.Failure(s.rule, sqlpoint.PostgresError)
+		err := action.Failure(s.rule, postgresError)
 		s.observe(0, err)
 		return failedRows{err: err}, err
 	}
@@ -149,7 +159,7 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 		rows, err = db.Query(s.inner, sql, arguments...)
 	}
 	if err == nil && s.action == "fail_after" {
-		err = action.Failure(s.rule, sqlpoint.PostgresError)
+		err = action.Failure(s.rule, postgresError)
 		rows = failedRows{err: err}
 	}
 	if err != nil {
@@ -225,7 +235,7 @@ func (r *observedRow) Scan(dest ...any) error {
 	s := r.statement
 	var err error
 	if s.action == "fail" {
-		err = action.Failure(s.rule, sqlpoint.PostgresError)
+		err = action.Failure(s.rule, postgresError)
 	} else {
 		err = r.row.Scan(dest...)
 	}
@@ -233,7 +243,7 @@ func (r *observedRow) Scan(dest ...any) error {
 		err = r.query().Scan(dest...)
 	}
 	if err == nil && s.action == "fail_after" {
-		err = action.Failure(s.rule, sqlpoint.PostgresError)
+		err = action.Failure(s.rule, postgresError)
 	}
 	if err == nil && s.action == "empty" {
 		err = pgx.ErrNoRows
@@ -268,7 +278,7 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 	var err error
 	var results pgx.BatchResults
 	if s.action == "fail" {
-		err = action.Failure(s.rule, sqlpoint.PostgresError)
+		err = action.Failure(s.rule, postgresError)
 	} else {
 		results = db.SendBatch(s.inner, batch)
 	}
@@ -279,7 +289,7 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 		results = db.SendBatch(s.inner, batch)
 	}
 	if err == nil && s.action == "fail_after" {
-		err = action.Failure(s.rule, sqlpoint.PostgresError)
+		err = action.Failure(s.rule, postgresError)
 	}
 	if err != nil {
 		s.observe(0, err)
@@ -331,7 +341,7 @@ func begin(ctx context.Context, run func(context.Context) (pgx.Tx, error)) (pgx.
 	var tx pgx.Tx
 	var err error
 	if s.action == "fail" {
-		err = action.Failure(s.rule, sqlpoint.PostgresError)
+		err = action.Failure(s.rule, postgresError)
 	} else {
 		tx, err = run(s.inner)
 	}

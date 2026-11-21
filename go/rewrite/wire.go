@@ -33,6 +33,8 @@ const (
 	redisModule    = "github.com/redis/go-redis/v9"
 	pgxModule      = "github.com/jackc/pgx/v5"
 	ginPath        = "github.com/gin-gonic/gin"
+	// pgxDriver is pgx's database/sql driver, whose errors the SQL adapter builds through the pgx adapter.
+	pgxDriver = pgxModule + "/stdlib"
 )
 
 // pluginPackages are the packages of the plugins a configuration can enable.
