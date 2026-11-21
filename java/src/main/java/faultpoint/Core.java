@@ -19,9 +19,10 @@ public final class Core {
 
     static final int INVALID_RULES_EXIT = 70;
 
-    /** One execution of a point, as the core hands it to the observation sink. */
+    /** One execution of a point, as the core hands it to the observation sink; the detail tells executions of one
+     * outcome apart by bounded values under the keys spec/kinds.json gives the kind. */
     public record Observation(String experiment, String point, String outcome, String scope, String rule,
-                              double quantity, String traceId) {}
+                              double quantity, String traceId, Map<String, String> detail) {}
 
     public interface RuleSource {
         /** Deliver the first rule set before returning, then every change; a failure is an unusable rule set. */
@@ -165,13 +166,13 @@ public final class Core {
         return null;
     }
 
-    public void observe(String point, String outcome, double quantity, Rule rule) {
+    public void observe(String point, String outcome, double quantity, Rule rule, Map<String, String> detail) {
         if (sink == null) {
             return;
         }
         String scope = baggage(settings.scopeKey());
         sink.add(new Observation(state.experiment(), point, outcome, scope == null ? "" : scope,
-                rule == null ? null : rule.id(), quantity, context == null ? null : context.traceId()));
+                rule == null ? null : rule.id(), quantity, context == null ? null : context.traceId(), detail));
     }
 
     private String baggage(String key) {

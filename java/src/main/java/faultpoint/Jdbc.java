@@ -101,11 +101,19 @@ public final class Jdbc {
         }
         Execution execution = new Execution(point, kind.kind(), rule, System.nanoTime());
         if (execution.action().equals("fail")) {
-            core.observe(point, "error", 0, rule);
+            SQLException injected = new SQLException("faultpoint: injected store failure", "08006");
+            core.observe(point, "error", 0, rule, failureDetail(injected));
             depth[0] -= 1;
-            throw new SQLException("faultpoint: injected store failure", "08006");
+            throw injected;
         }
         return execution;
+    }
+
+    /** A failed statement's exception type and, for an SQLException, its SQLSTATE. */
+    static Map<String, String> failureDetail(Throwable failure) {
+        return failure instanceof SQLException sql && sql.getSQLState() != null
+                ? Map.of("error", failure.getClass().getName(), "code", sql.getSQLState())
+                : Map.of("error", failure.getClass().getName());
     }
 
     private static String requireSql(Core core, String sql) {
@@ -141,7 +149,7 @@ public final class Jdbc {
         }
         Core core = Core.current();
         if (dropped != null) {
-            core.observe(running.point(), "ok", 1, running.rule());
+            core.observe(running.point(), "ok", 1, running.rule(), Map.of());
             return new Outcome(droppedResult(method.getReturnType()), null);
         }
         if (thrown == null && running.action().equals("duplicate")) {
@@ -157,20 +165,21 @@ public final class Jdbc {
             }
         }
         if (thrown != null) {
-            core.observe(running.point(), "error", running.elapsed(), running.rule());
+            core.observe(running.point(), "error", running.elapsed(), running.rule(), failureDetail(thrown));
             return new Outcome(returned, thrown);
         }
         if (running.action().equals("fail_after")) {
-            core.observe(running.point(), "error", running.elapsed(), running.rule());
-            return new Outcome(returned, new SQLException("faultpoint: store failed after the statement ran", "08006"));
+            SQLException injected = new SQLException("faultpoint: store failed after the statement ran", "08006");
+            core.observe(running.point(), "error", running.elapsed(), running.rule(), failureDetail(injected));
+            return new Outcome(returned, injected);
         }
         if (returned instanceof ResultSet rows) {
             return new Outcome(observed(rows, running), null);
         }
         if (running.kind().equals("store_read")) {
-            core.observe(running.point(), Boolean.TRUE.equals(returned) ? "rows" : "empty", 0, running.rule());
+            core.observe(running.point(), Boolean.TRUE.equals(returned) ? "rows" : "empty", 0, running.rule(), Map.of());
         } else {
-            core.observe(running.point(), "ok", affected(returned), running.rule());
+            core.observe(running.point(), "ok", affected(returned), running.rule(), Map.of());
         }
         return new Outcome(returned, null);
     }
@@ -220,7 +229,7 @@ public final class Jdbc {
             void record() {
                 if (!recorded) {
                     recorded = true;
-                    Core.current().observe(execution.point(), seen > 0 ? "rows" : "empty", seen, execution.rule());
+                    Core.current().observe(execution.point(), seen > 0 ? "rows" : "empty", seen, execution.rule(), Map.of());
                 }
             }
         };

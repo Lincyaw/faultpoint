@@ -4,12 +4,14 @@ import faultpoint.RuleSet.Rule;
 import io.opentelemetry.context.Context;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.net.ConnectException;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import net.bytebuddy.matcher.ElementMatchers;
 
 /** The rpc_client point of every request Spring's ClientHttpRequest executes, which is how RestClient and
@@ -20,10 +22,13 @@ public final class SpringHttp {
     static final int DEFAULT_FAILURE_STATUS = 503;
     /** An intercepting request executes its delegate; only the outermost execution is a point. */
     private static final ThreadLocal<int[]> DEPTH = ThreadLocal.withInitial(() -> new int[1]);
+    /** The outermost request this thread executes, whose body the request implementation writes. */
+    private static final ThreadLocal<Call> CURRENT = new ThreadLocal<>();
 
     private SpringHttp() {}
 
-    public record Call(String point, Rule rule, long started) {
+    /** A request under its rule; written tells whether its body was written whole, and holds null without a body. */
+    public record Call(String point, Rule rule, long started, AtomicReference<Boolean> written) {
         String action() {
             return rule == null ? "" : rule.kind();
         }
@@ -46,21 +51,43 @@ public final class SpringHttp {
         String point = RuleSet.pointId(core.settings.service(), "rpc_client",
                 method + " " + peer + ServletBoundary.pathTemplate(uri.getPath()));
         Rule rule = core.decide(point);
-        Call call = new Call(point, rule, System.nanoTime());
-        if (rule == null) {
-            return call;
+        Call call = new Call(point, rule, System.nanoTime(), new AtomicReference<>());
+        if (rule != null) {
+            Points.hold(core, rule);
         }
-        Points.hold(core, rule);
         if (call.action().equals("duplicate")) {
             core.abort("rule " + rule.id() + ": duplicate at " + point + " cannot resend a Spring request, whose body is written once");
         }
         if (call.action().equals("fail") && rule.integer("status") == null) {
             IOException error = boundaryError(rule);
-            core.observe(point, outcome(error), 0, rule);
+            core.observe(point, outcome(error), 0, rule, Map.of("error", error.getClass().getName(), "sent", "false"));
             depth[0] -= 1;
             throw error;
         }
+        CURRENT.set(call);
         return call;
+    }
+
+    /** The body of the request this thread executes, made to record when its writing finished, as a proxy of the
+     * application's Body type; the writing may run on a thread of the client. */
+    public static Object watched(Object body, Class<?> bodyType) {
+        Call call = CURRENT.get();
+        if (body == null || call == null) {
+            return body;
+        }
+        call.written().set(false);
+        return Proxy.newProxyInstance(bodyType.getClassLoader(), new Class<?>[] {bodyType}, (proxy, method, arguments) -> {
+            Object result;
+            try {
+                result = method.invoke(body, arguments);
+            } catch (InvocationTargetException failure) {
+                throw failure.getCause();
+            }
+            if (method.getName().equals("writeTo")) {
+                call.written().set(true);
+            }
+            return result;
+        });
     }
 
     private static IOException boundaryError(Rule rule) {
@@ -107,33 +134,40 @@ public final class SpringHttp {
             return null;
         }
         int status = running.rule().integer("status");
-        Core.current().observe(running.point(), (status / 100) + "xx", 0, running.rule());
+        Core.current().observe(running.point(), (status / 100) + "xx", 0, running.rule(),
+                Map.of("status", String.valueOf(status), "sent", "false"));
         return synthetic(responseType, status);
     }
 
     /** End a request. The result is what replaces the real response under fail_after: a synthetic response,
      * or the Throwable to throw; null keeps the real outcome. */
     public static Object exit(Object call, Class<?> responseType, Object answered, int status, Throwable thrown) {
-        DEPTH.get()[0] -= 1;
+        if (--DEPTH.get()[0] == 0) {
+            CURRENT.remove();
+        }
         if (!(call instanceof Call running) || answered != null) {
             return null;
         }
         Core core = Core.current();
         if (thrown != null) {
-            core.observe(running.point(), outcome(thrown), running.elapsed(), running.rule());
+            core.observe(running.point(), outcome(thrown), running.elapsed(), running.rule(),
+                    HttpClients.failureDetail(thrown, running.written().get()));
             return null;
         }
         if (!running.action().equals("fail_after")) {
-            core.observe(running.point(), (status / 100) + "xx", running.elapsed(), running.rule());
+            core.observe(running.point(), (status / 100) + "xx", running.elapsed(), running.rule(),
+                    Map.of("status", String.valueOf(status)));
             return null;
         }
         Integer forced = running.rule().integer("status");
         if (forced != null) {
-            core.observe(running.point(), (forced / 100) + "xx", running.elapsed(), running.rule());
+            core.observe(running.point(), (forced / 100) + "xx", running.elapsed(), running.rule(),
+                    Map.of("status", forced.toString(), "sent", "true"));
             return synthetic(responseType, forced);
         }
         IOException error = boundaryError(running.rule());
-        core.observe(running.point(), outcome(error), running.elapsed(), running.rule());
+        core.observe(running.point(), outcome(error), running.elapsed(), running.rule(),
+                Map.of("error", error.getClass().getName(), "sent", "true"));
         return error;
     }
 
@@ -152,6 +186,12 @@ public final class SpringHttp {
                     ElementMatchers.named("execute").and(ElementMatchers.takesArguments(0))
                             .and(ElementMatchers.not(ElementMatchers.isAbstract())),
                     "faultpoint.SpringHttpAdvice");
+            Advices.install(installation.instrumentation(),
+                    ElementMatchers.hasSuperType(ElementMatchers.named("org.springframework.http.client.AbstractStreamingClientHttpRequest")),
+                    ElementMatchers.named("executeInternal").and(ElementMatchers.takesArguments(2))
+                            .and(ElementMatchers.takesArgument(1, ElementMatchers.named("org.springframework.http.StreamingHttpOutputMessage$Body")))
+                            .and(ElementMatchers.not(ElementMatchers.isAbstract())),
+                    "faultpoint.SpringHttpAdvice$Streaming");
         }
     }
 }

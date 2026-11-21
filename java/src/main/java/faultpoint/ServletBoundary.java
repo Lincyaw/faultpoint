@@ -7,6 +7,9 @@ import io.opentelemetry.context.Context;
 import io.opentelemetry.context.Scope;
 import io.opentelemetry.context.propagation.TextMapGetter;
 import io.opentelemetry.context.propagation.TextMapPropagator;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -25,6 +28,11 @@ public final class ServletBoundary {
     static volatile Pattern identifierSegment = Pattern.compile(DEFAULT_IDENTIFIER_SEGMENT);
     /** Forwards and includes enter service again; only the outermost entry is the request. */
     static final ThreadLocal<Integer> DEPTH = ThreadLocal.withInitial(() -> 0);
+    /** Tomcat's exception for a response write that failed because the client had gone. */
+    static final String CLIENT_ABORT = "org.apache.catalina.connector.ClientAbortException";
+    /** The request attribute in which Spring's DispatcherServlet keeps an exception it resolved without a view,
+     * such as a write that failed because the client had gone. */
+    public static final String RESOLVED_EXCEPTION = "org.springframework.web.servlet.DispatcherServlet.EXCEPTION";
 
     private static final TextMapGetter<Map<String, String>> HEADERS = new TextMapGetter<>() {
         @Override
@@ -52,21 +60,23 @@ public final class ServletBoundary {
     }
 
     /** What the entry advice hands to the exit advice; the forced status is 0 without a failure rule. */
-    public record Entry(String point, Rule rule, Scope scope, long started, int forcedStatus) {
+    public record Entry(String point, Rule rule, Context context, Scope scope, long started, int forcedStatus) {
         public boolean skips() {
             return rule != null && rule.kind().equals("fail");
         }
     }
 
-    /** Begin a request, or return null when it is nested or faultpoint is off. */
-    public static Entry enter(String method, String uri, Map<String, String> headers) {
+    /** Begin a request, or return null when it is nested, a dispatch the container makes itself, such as an async
+     * or error dispatch, or faultpoint is off. */
+    public static Entry enter(String method, String uri, Map<String, String> headers, boolean clientRequest) {
         Core core = Core.current();
         int depth = DEPTH.get();
         DEPTH.set(depth + 1);
-        if (depth > 0 || !core.enabled()) {
+        if (depth > 0 || !clientRequest || !core.enabled()) {
             return null;
         }
-        Scope scope = PROPAGATOR.extract(Context.root(), headers, HEADERS).makeCurrent();
+        Context context = PROPAGATOR.extract(Context.root(), headers, HEADERS);
+        Scope scope = context.makeCurrent();
         String point = RuleSet.pointId(core.settings.service(), "rpc_server", method + " " + pathTemplate(uri));
         Rule rule = core.decide(point);
         int forced = 0;
@@ -77,20 +87,86 @@ public final class ServletBoundary {
                 forced = status == null ? DEFAULT_FAILURE_STATUS : status;
             }
         }
-        return new Entry(point, rule, scope, System.nanoTime(), forced);
+        return new Entry(point, rule, context, scope, System.nanoTime(), forced);
     }
 
-    public static void exit(Entry entry, int status, boolean thrown) {
+    /** Leave a request's service call; the request is observed now, unless it went asynchronous, when its
+     * listener observes it on completion. Resolved is the exception a framework handled without failing the call. */
+    public static void exit(Entry entry, int status, Throwable thrown, Object resolved, boolean asynchronous) {
         DEPTH.set(DEPTH.get() - 1);
         if (entry == null) {
             return;
         }
         try {
-            String outcome = thrown && entry.forcedStatus() == 0 ? "error" : (status / 100) + "xx";
-            Core.current().observe(entry.point(), outcome, (System.nanoTime() - entry.started()) / 1e6, entry.rule());
+            if (!asynchronous) {
+                observe(entry, status, thrown, clientAborted(thrown) || clientAborted(resolved));
+            }
         } finally {
             entry.scope().close();
         }
+    }
+
+    /** Observe a request's status, or its error when it threw without a forced status. The servlet API tells that
+     * a response was abandoned only when the container failed to write it because the client had gone, or the
+     * async context timed out; a response the container writes after the servlet returns tells nothing, so the
+     * detail says abandoned only when it is true. */
+    static void observe(Entry entry, int status, Throwable thrown, boolean abandoned) {
+        boolean failed = thrown != null && entry.forcedStatus() == 0;
+        var detail = new HashMap<String, String>();
+        detail.put(failed ? "error" : "status", failed ? thrown.getClass().getName() : String.valueOf(status));
+        if (abandoned) {
+            detail.put("abandoned", "true");
+        }
+        Core.current().observe(entry.point(), failed ? "error" : (status / 100) + "xx",
+                (System.nanoTime() - entry.started()) / 1e6, entry.rule(), detail);
+    }
+
+    /** Whether a failure is, or is caused by, the container's report that the client went away during a write. */
+    static boolean clientAborted(Object failure) {
+        for (Throwable cause = failure instanceof Throwable thrown ? thrown : null; cause != null; cause = cause.getCause()) {
+            if (cause.getClass().getName().equals(CLIENT_ABORT)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** A jakarta AsyncListener, made through the servlet's class loader, that observes an asynchronous request when
+     * it completes, in the request's context. */
+    public static Object listener(Entry entry, Class<?> listenerType, Object request, Object response) throws ReflectiveOperationException {
+        ClassLoader servlet = listenerType.getClassLoader();
+        Method getAttribute = Class.forName("jakarta.servlet.ServletRequest", false, servlet).getMethod("getAttribute", String.class);
+        Method getStatus = Class.forName("jakarta.servlet.http.HttpServletResponse", false, servlet).getMethod("getStatus");
+        boolean[] timedOut = {false};
+        Throwable[] failure = {null};
+        return Proxy.newProxyInstance(servlet, new Class<?>[] {listenerType}, (proxy, method, arguments) -> {
+            switch (method.getName()) {
+                case "onTimeout" -> timedOut[0] = true;
+                case "onError" -> failure[0] = (Throwable) arguments[0].getClass().getMethod("getThrowable").invoke(arguments[0]);
+                case "onStartAsync" -> {
+                    Method getAsyncContext = arguments[0].getClass().getMethod("getAsyncContext");
+                    getAsyncContext.getReturnType().getMethod("addListener", listenerType)
+                            .invoke(getAsyncContext.invoke(arguments[0]), proxy);
+                }
+                case "onComplete" -> {
+                    try (Scope ignored = entry.context().makeCurrent()) {
+                        observe(entry, (Integer) getStatus.invoke(response), failure[0], timedOut[0]
+                                || clientAborted(failure[0]) || clientAborted(getAttribute.invoke(request, RESOLVED_EXCEPTION)));
+                    }
+                }
+                case "hashCode" -> {
+                    return System.identityHashCode(proxy);
+                }
+                case "equals" -> {
+                    return proxy == arguments[0];
+                }
+                case "toString" -> {
+                    return "faultpoint async listener";
+                }
+                default -> throw new UnsupportedOperationException("faultpoint async listener: " + method.getName());
+            }
+            return null;
+        });
     }
 
     public static final class ServletPlugin implements Plugin {

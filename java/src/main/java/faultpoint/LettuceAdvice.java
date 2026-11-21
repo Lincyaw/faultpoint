@@ -14,7 +14,7 @@ final class LettuceAdvice {
     @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class)
     static Object enter(@Advice.Argument(0) RedisCommand<?, ?, ?> command, @Advice.Local("call") Object call) {
         call = Lettuce.enter(new String(command.getType().getBytes(), StandardCharsets.US_ASCII),
-                command.getArgs() == null ? null : command.getArgs().getFirstEncodedKey());
+                command.getArgs() == null ? null : command.getArgs().getFirstEncodedKey(), RedisCommandExecutionException.class);
         String answer = Lettuce.answer(call);
         if ("fail".equals(answer)) {
             command.completeExceptionally(new RedisCommandExecutionException("faultpoint: injected Redis failure"));

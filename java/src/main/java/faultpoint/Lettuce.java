@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletionStage;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import net.bytebuddy.matcher.ElementMatchers;
 
@@ -18,20 +19,30 @@ import net.bytebuddy.matcher.ElementMatchers;
 public final class Lettuce {
 
     private static final List<String> ANSWERS = List.of("fail", "empty", "drop");
+    /** The prefix of an error reply, which Redis writes as an upper-case word. */
+    private static final Pattern REPLY_PREFIX = Pattern.compile("([A-Z][A-Z0-9_]*)(?: |$)");
     private static volatile Pattern identifier = Pattern.compile(RedisCommands.TABLE.key_identifier());
 
     private Lettuce() {}
 
     /** A dispatched command, with the request context it was dispatched in: its reply completes on an I/O
-     * thread, which has none. */
-    public record Call(String point, Command command, Rule rule, long started, Context context) {
+     * thread, which has none. The reply error is Lettuce's exception type for an error reply of Redis. */
+    public record Call(String point, Command command, Rule rule, long started, Context context, Class<?> replyError) {
         String action() {
             return rule == null ? "" : rule.kind();
+        }
+
+        /** A failed command's exception type and, for an error reply, its prefix. */
+        Map<String, String> failureDetail(Throwable failure) {
+            Matcher prefix = REPLY_PREFIX.matcher(String.valueOf(failure.getMessage()));
+            return replyError.isInstance(failure) && prefix.lookingAt()
+                    ? Map.of("error", failure.getClass().getName(), "code", prefix.group(1))
+                    : Map.of("error", failure.getClass().getName());
         }
     }
 
     /** Begin a command, or return null when it is not a point. */
-    public static Object enter(String name, ByteBuffer firstKey) {
+    public static Object enter(String name, ByteBuffer firstKey, Class<?> replyError) {
         Core core = Core.current();
         Command command = RedisCommands.TABLE.commands().get(name);
         if (!core.enabled() || command == null) {
@@ -46,7 +57,7 @@ public final class Lettuce {
                 core.abort("rule " + rule.id() + ": " + rule.kind() + " at " + point + " cannot resend a Lettuce command");
             }
         }
-        return new Call(point, command, rule, System.nanoTime(), Context.current());
+        return new Call(point, command, rule, System.nanoTime(), Context.current(), replyError);
     }
 
     private static boolean answered(Call call) {
@@ -63,7 +74,8 @@ public final class Lettuce {
             case "empty" -> "empty";
             default -> "ok";
         };
-        Core.current().observe(running.point(), outcome, 0, running.rule());
+        Core.current().observe(running.point(), outcome, 0, running.rule(),
+                outcome.equals("error") ? Map.of("error", running.replyError().getName()) : Map.of());
         return running.action();
     }
 
@@ -82,7 +94,8 @@ public final class Lettuce {
                 outcome = RedisCommands.empty(running.command(), value) ? "empty" : "rows";
             }
             try (Scope ignored = running.context().makeCurrent()) {
-                Core.current().observe(running.point(), outcome, (System.nanoTime() - running.started()) / 1e6, running.rule());
+                Core.current().observe(running.point(), outcome, (System.nanoTime() - running.started()) / 1e6, running.rule(),
+                        error == null ? Map.of() : running.failureDetail(error));
             }
         });
     }

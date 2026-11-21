@@ -1,5 +1,7 @@
 package faultpoint;
 
+import jakarta.servlet.AsyncListener;
+import jakarta.servlet.DispatcherType;
 import jakarta.servlet.ServletRequest;
 import jakarta.servlet.ServletResponse;
 import jakarta.servlet.http.HttpServletRequest;
@@ -25,7 +27,8 @@ final class ServletAdvice {
         for (String name : Collections.list(http.getHeaderNames())) {
             headers.put(name.toLowerCase(), http.getHeader(name));
         }
-        entry = ServletBoundary.enter(http.getMethod(), http.getRequestURI(), headers);
+        entry = ServletBoundary.enter(http.getMethod(), http.getRequestURI(), headers,
+                http.getDispatcherType() == DispatcherType.REQUEST);
         if (entry != null && entry.skips()) {
             answer.setStatus(entry.forcedStatus());
             return true;
@@ -33,10 +36,12 @@ final class ServletAdvice {
         return false;
     }
 
-    /** A fail_after request ran; its answer is replaced unless it already left. */
+    /** A fail_after request ran; its answer is replaced unless it already left, and the status observed is the one
+     * the response carries. A request that went asynchronous is observed when it completes. */
     @Advice.OnMethodExit(onThrowable = Throwable.class)
-    static void exit(@Advice.Argument(1) ServletResponse response, @Advice.Local("entry") ServletBoundary.Entry entry,
-                     @Advice.Thrown Throwable thrown) {
+    static void exit(@Advice.Argument(0) ServletRequest request, @Advice.Argument(1) ServletResponse response,
+                     @Advice.Local("entry") ServletBoundary.Entry entry, @Advice.Thrown Throwable thrown)
+            throws ReflectiveOperationException {
         if (!(response instanceof HttpServletResponse answer)) {
             return;
         }
@@ -44,7 +49,10 @@ final class ServletAdvice {
             answer.resetBuffer();
             answer.setStatus(entry.forcedStatus());
         }
-        ServletBoundary.exit(entry, entry != null && entry.forcedStatus() != 0 ? entry.forcedStatus() : answer.getStatus(),
-                thrown != null);
+        boolean asynchronous = entry != null && request.isAsyncStarted();
+        if (asynchronous) {
+            request.getAsyncContext().addListener((AsyncListener) ServletBoundary.listener(entry, AsyncListener.class, request, answer));
+        }
+        ServletBoundary.exit(entry, answer.getStatus(), thrown, request.getAttribute(ServletBoundary.RESOLVED_EXCEPTION), asynchronous);
     }
 }

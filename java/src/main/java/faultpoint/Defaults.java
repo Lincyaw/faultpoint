@@ -18,6 +18,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.function.Consumer;
 
 /** The default rule source, observation sink and context provider. */
@@ -64,7 +66,9 @@ final class Defaults {
 
     /** Observations aggregated per window and appended as JSON Lines, as spec/observation.schema.json defines. */
     static final class JsonlSink implements ObservationSink {
-        private record Key(String experiment, String point, String outcome, String scope, String rule) {}
+        /** The detail is a sorted copy, so that one detail is one key and its record lists the keys in order. */
+        private record Key(String experiment, String point, String outcome, String scope, String rule,
+                           SortedMap<String, String> detail) {}
 
         private static final class Tally {
             long count;
@@ -108,7 +112,8 @@ final class Defaults {
         @Override
         public synchronized void add(Observation observation) {
             Tally entry = tally.computeIfAbsent(new Key(observation.experiment(), observation.point(),
-                    observation.outcome(), observation.scope(), observation.rule()), ignored -> new Tally());
+                    observation.outcome(), observation.scope(), observation.rule(), new TreeMap<>(observation.detail())),
+                    ignored -> new Tally());
             entry.count += 1;
             entry.total += observation.quantity();
             if (observation.traceId() != null && entry.exemplars.size() < exemplars && sampled(observation.traceId())) {
@@ -145,6 +150,7 @@ final class Defaults {
                 record.put("count", entry.count);
                 record.put("total", entry.total);
                 record.put("exemplars", entry.exemplars);
+                record.put("detail", key.detail());
                 try {
                     lines.append(Settings.JSON.writeValueAsString(record)).append('\n');
                 } catch (IOException unserialisable) {

@@ -5,6 +5,7 @@ import java.util.HashMap;
 import java.util.Map;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.implementation.bytecode.assign.Assigner;
+import org.springframework.http.StreamingHttpOutputMessage;
 import org.springframework.http.client.ClientHttpRequest;
 import org.springframework.http.client.ClientHttpResponse;
 
@@ -40,6 +41,17 @@ final class SpringHttpAdvice {
             response = null;
         } else if (replacement != null) {
             response = replacement;
+        }
+    }
+
+    /** Inlined into executeInternal(HttpHeaders, Body) of the streaming ClientHttpRequest implementations, which
+     * every request factory of Spring 6.1 and later uses to write a body. */
+    static final class Streaming {
+        private Streaming() {}
+
+        @Advice.OnMethodEnter
+        static void enter(@Advice.Argument(value = 1, readOnly = false) StreamingHttpOutputMessage.Body body) {
+            body = (StreamingHttpOutputMessage.Body) SpringHttp.watched(body, StreamingHttpOutputMessage.Body.class);
         }
     }
 }

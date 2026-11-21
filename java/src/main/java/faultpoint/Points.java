@@ -36,7 +36,7 @@ public final class Points {
             hold(core, rule);
             taken = taken || rule.kind().equals("fail");
         }
-        core.observe(point, taken ? "taken" : "not_taken", 0, rule);
+        core.observe(point, taken ? "taken" : "not_taken", 0, rule, Map.of());
         return taken;
     }
 
@@ -51,7 +51,7 @@ public final class Points {
             hold(core, rule);
             result = result != rule.kind().equals("negate");
         }
-        core.observe(point, result ? "true" : "false", 0, rule);
+        core.observe(point, result ? "true" : "false", 0, rule, Map.of());
         return result;
     }
 
@@ -65,7 +65,7 @@ public final class Points {
         if (rule != null) {
             hold(core, rule);
         }
-        core.observe(point, "iteration", 0, rule);
+        core.observe(point, "iteration", 0, rule, Map.of());
     }
 
     /** A business value, replaced by a set rule or offset by a shift rule. */
@@ -84,7 +84,7 @@ public final class Points {
                 default -> observed;
             };
         }
-        core.observe(point, "observed", result, rule);
+        core.observe(point, "observed", result, rule, Map.of());
         return result;
     }
 
@@ -94,7 +94,7 @@ public final class Points {
         if (rule != null) {
             hold(core, rule);
         }
-        core.observe(point, "read", 0, rule);
+        core.observe(point, "read", 0, rule, Map.of());
         return rule != null && rule.kind().equals("shift") ? rule : null;
     }
 
@@ -127,7 +127,7 @@ public final class Points {
             hold(core, rule);
             acquired = acquired && !rule.kind().equals("fail");
         }
-        core.observe(point, acquired ? "acquired" : "rejected", 0, rule);
+        core.observe(point, acquired ? "acquired" : "rejected", 0, rule, Map.of());
         return acquired;
     }
 
@@ -147,8 +147,9 @@ public final class Points {
             hold(core, rule);
         }
         if (rule != null && rule.kind().equals("fail")) {
-            core.observe(point, "error", 0, rule);
-            throw declaredException(declared, point);
+            Exception injected = declaredException(declared, point);
+            core.observe(point, "error", 0, rule, Map.of("error", injected.getClass().getName()));
+            throw injected;
         }
         CALLS.get().push(rule == null ? NO_RULE : rule);
     }
@@ -171,14 +172,14 @@ public final class Points {
     public static void returned(String point) {
         Core core = Core.current();
         if (core.enabled()) {
-            core.observe(point, "ok", 0, poppedRule());
+            core.observe(point, "ok", 0, poppedRule(), Map.of());
         }
     }
 
     public static void raised(Throwable error, String point) {
         Core core = Core.current();
         if (core.enabled()) {
-            core.observe(point, "error", 0, poppedRule());
+            core.observe(point, "error", 0, poppedRule(), Map.of("error", error.getClass().getName()));
         }
     }
 
