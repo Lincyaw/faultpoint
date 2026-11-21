@@ -49,6 +49,10 @@ points, whose ids carry the peer's address, keep one id."""
 HOST_ROUTE_DEADLINE_S: Final = 10
 REFUSAL: Final = re.compile(r"faultpoint: rule \S+: [^\n]*")
 """How every SDK says it stops because a rule names an action the plugins serving its point do not all implement."""
+STOP_EXIT_CODE: Final = 70
+"""The exit code with which faultpoint stops a process whose rule set it cannot apply, whatever it says before."""
+REFUSAL_LINES: Final = 3
+"""The last lines of a service's log that record why it stopped at start, when it says so in no form REFUSAL knows."""
 LOAD_DEADLINE_S: Final = 120
 """The longest a repetition sends checkouts, so that a fault that hangs a service every tenant shares ends its
 repetition too; a control sends all of them in about ten seconds."""
@@ -169,8 +173,10 @@ def orders_config() -> dict[str, JsonValue]:
 
 def services(directory: Path, sdk: Path, workload: Workload, upstream: Upstream) -> list[Service]:
     urls = {f"{name.upper()}_URL": f"http://127.0.0.1:{port}" for name, port in PORTS.items()}
-    # The Python SDK attaches at start through the sitecustomize of its bootstrap directory.
-    orders_attachment = {"PYTHONPATH": str(sdk / "python" / "src" / "faultpoint" / "bootstrap"),
+    # The Python SDK attaches at start through the sitecustomize of its bootstrap directory; orders' own directory
+    # lets a rule name an exception class of the orders module, which the SDK imports when it loads the rules.
+    orders_attachment = {"PYTHONPATH": os.pathsep.join([str(sdk / "python" / "src" / "faultpoint" / "bootstrap"),
+                                                        str(SHOP / "orders")]),
                          "FAULTPOINT_SOURCE_ROOT": str(SHOP / "orders")}
     routes = {"identifier_segment": IDENTIFIER_SEGMENT}
     return [
@@ -220,16 +226,23 @@ def start(directory: Path, service: Service) -> subprocess.Popen[bytes]:
                                 stderr=subprocess.STDOUT)
 
 
-def wait_for_port(port: int, process: subprocess.Popen[bytes], deadline_s: float = 60) -> None:
+def wait_for_port(directory: Path, service: Service, process: subprocess.Popen[bytes], deadline_s: float = 60) -> None:
+    """Wait until a service listens; one that stops first with faultpoint's stop code refused the rule set, which the
+    repetition's directory records with the end of the service's log."""
     started = time.monotonic()
     while time.monotonic() - started < deadline_s:
         if process.poll() is not None:
-            raise RuntimeError(f"a service on port {port} exited with {process.returncode}")
+            if process.returncode == STOP_EXIT_CODE:
+                lines = [line for line in (directory / f"{service.name}.log").read_text(errors="replace").splitlines()
+                         if line.strip()]
+                (directory / REFUSAL_FILE).write_text(f"{service.name} stopped at start: "
+                                                      + " | ".join(lines[-REFUSAL_LINES:]))
+            raise RuntimeError(f"a service on port {service.port} exited with {process.returncode}")
         with socket.socket() as probe:
-            if probe.connect_ex(("127.0.0.1", port)) == 0:
+            if probe.connect_ex(("127.0.0.1", service.port)) == 0:
                 return
         time.sleep(0.1)
-    raise TimeoutError(f"no service listens on port {port}")
+    raise TimeoutError(f"no service listens on port {service.port}")
 
 
 def wait_for_host_route() -> None:
@@ -284,7 +297,7 @@ def serve_and_load(directory: Path, sdk: Path) -> Statuses:
         for service in shop:
             processes.append(start(directory, service))
         for service, process in zip(shop, processes, strict=True):
-            wait_for_port(service.port, process)
+            wait_for_port(directory, service, process)
         statuses = load(workload)
         time.sleep(3 * FLUSH_SECONDS)
     finally:
@@ -320,10 +333,13 @@ def namespaced_run(directory: Path, sdk: Path) -> None:
 
 
 def refusal(directory: Path) -> str | None:
-    """What a service said when it stopped at a rule it cannot apply, none when no service did."""
+    """What a service said when it stopped at a rule it cannot apply, or the end of the log of one that stopped at
+    start with faultpoint's stop code; none when no service did."""
     found = [match.group(0) for log in sorted(directory.glob("*.log"))
              if (match := REFUSAL.search(log.read_text(errors="replace")))]
-    return found[0] if found else None
+    if found:
+        return found[0]
+    return (directory / REFUSAL_FILE).read_text() if (directory / REFUSAL_FILE).exists() else None
 
 
 def repetition(directory: Path, workload: Workload, rules: dict[str, Any], sdk: Path) -> Statuses:
