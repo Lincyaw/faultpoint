@@ -308,7 +308,7 @@ eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能
 - **目录是数据**：每条记录对应一个（目标，机制），给出 id、类别、层、注入和观测的机制、目标（文件、build-id、符号、入口和返回指令的地址、克隆）、签名（来自 DWARF 或 BTF）、允许的动作和取值、开销等级、陷入范围（内核点是整台主机，uprobe 是 inode）和安全说明。`spec/kinds.json` 仍是动作的上界，每条记录只列出其机制允许的子集，规则加载时代理按记录检查。
 - **取值带来源**：错误注入名单的类型（ERRNO 为负 errno，NULL 为 0）；LSM 的返回范围；对照运行中观测到的自然结果，这是首选（见第 6.5 节 Redis 断言的教训）；静态分析得到的常量，置信度较低。`bpf_override_return` 和 fmod_ret 都不检查取值（返回 1、-5000、0x7fffffff 的 fmod_ret 程序都能加载），由代理按类型限定。`security_*` 的自然结果总是 0，所以它的取值来自 LSM 的惯例（EACCES、EPERM），或来自调用方的操作本身可能产生的 errno，例如连接的 ECONNREFUSED。
 - **类别**：复用 `call`（整型、errno、指针返回）、`check`（布尔返回）、`branch`（用 ip 写强制条件跳转）、`syscall`、`packet`。非系统调用的内核名单函数和 `security_*` 记为内核层的 `call`。另加一个只观测的类别 `event`（outcome 为 `fired`，没有动作），用于 USDT 和 tracepoint，把上游组件内部的事件作为效果观测，例如 postgres 的 57 个 USDT 名字中有 `transaction__abort` `deadlock__found` `lock__wait__start`。
-- **生成**：eBPF 代理新增只读的 `scan`。它读服务进程映射的可执行文件（ELF 符号、DWARF、`.gopclntab`、`.note.stapsdt`，以及反汇编得到的返回指令和条件跳转）和宿主内核的清单（kallsyms、ftrace 函数表、错误注入名单、BTF），可选地按 build-id 在容器内匹配调试文件，包括它的 dwz 补充文件。选择哪些记录由配置 `ebpf.hooks` 给出，形式与 `placement.scope`（第 6.4 节）相同。
+- **生成**：eBPF 代理新增只读的 `scan`。它读服务进程映射的可执行文件（ELF 符号、DWARF、`.gopclntab`、`.note.stapsdt`，以及反汇编得到的返回指令和条件跳转）和宿主内核的清单（kallsyms、ftrace 函数表、错误注入名单、BTF），可选地按 build-id 在容器内匹配调试文件，包括它的 dwz 补充文件。错误注入名单只在 debugfs 中，所以运行 `scan` 的容器要挂载 `/sys/kernel/debug`。选择哪些记录由配置 `ebpf.hooks` 给出，形式与 `placement.scope`（第 6.4 节）相同；`include` 按记录的键写，键是去掉 `@<build-id>` 的定位符，例如 `postgres:postgresql:transaction__abort`。
 - **身份**：在第 6.5 节的形式上，保证每个定义只有一个 id。
   - **符号版本**：隐藏的符号版本跟在 `@` 后面，例如 `libc.so.6@<build-id>:realpath@GLIBC_2.2.5`；缺省版本仍用裸名。
   - **同名局部符号**：几个定义同名时，全局的那个保留名字，局部的各加 `#<链接地址>`，例如 redis-server 里 hiredis 的 `dictFind#207360`。
