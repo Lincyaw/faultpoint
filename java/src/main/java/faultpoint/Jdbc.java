@@ -99,7 +99,7 @@ public final class Jdbc {
         Kind kind = sql == null && !(statement instanceof java.sql.PreparedStatement) ? new Kind("store_write", BATCH)
                 : statementPoint(requireSql(core, sql));
         String point = RuleSet.pointId(core.settings.service(), kind.kind(), kind.locator());
-        Rule rule = core.decide(point);
+        Rule rule = core.decide(point, Core.ACTS_BEFORE);
         if (rule != null) {
             Points.hold(core, rule);
         }
@@ -214,9 +214,10 @@ public final class Jdbc {
             core.observe(running.point(), "error", running.elapsed(), running.rule(), failureDetail(thrown));
             return new Outcome(returned, thrown);
         }
-        if (running.action().equals("fail_after")) {
-            SQLException injected = injectedError(statement, running.rule(), "faultpoint: store failed after the statement ran");
-            core.observe(running.point(), "error", running.elapsed(), running.rule(), failureDetail(injected));
+        Rule replacing = core.decide(running.point(), Core.ACTS_AFTER);
+        if (replacing != null) {
+            SQLException injected = injectedError(statement, replacing, "faultpoint: store failed after the statement ran");
+            core.observe(running.point(), "error", running.elapsed(), replacing, failureDetail(injected));
             return new Outcome(returned, injected);
         }
         if (returned instanceof ResultSet rows) {

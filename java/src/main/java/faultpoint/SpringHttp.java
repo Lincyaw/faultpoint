@@ -50,7 +50,7 @@ public final class SpringHttp {
         String peer = uri.getPort() == -1 ? uri.getHost() : uri.getHost() + ":" + uri.getPort();
         String point = RuleSet.pointId(core.settings.service(), "rpc_client",
                 method + " " + peer + ServletBoundary.pathTemplate(uri.getPath()));
-        Rule rule = core.decide(point);
+        Rule rule = core.decide(point, Core.ACTS_BEFORE);
         Call call = new Call(point, rule, System.nanoTime(), new AtomicReference<>());
         if (rule != null) {
             Points.hold(core, rule);
@@ -154,19 +154,20 @@ public final class SpringHttp {
                     HttpClients.failureDetail(thrown, running.written().get()));
             return null;
         }
-        if (!running.action().equals("fail_after")) {
+        Rule replacing = core.decide(running.point(), Core.ACTS_AFTER);
+        if (replacing == null) {
             core.observe(running.point(), (status / 100) + "xx", running.elapsed(), running.rule(),
                     Map.of("status", String.valueOf(status)));
             return null;
         }
-        Integer forced = running.rule().integer("status");
+        Integer forced = replacing.integer("status");
         if (forced != null) {
-            core.observe(running.point(), (forced / 100) + "xx", running.elapsed(), running.rule(),
+            core.observe(running.point(), (forced / 100) + "xx", running.elapsed(), replacing,
                     Map.of("status", forced.toString(), "sent", "true"));
             return synthetic(responseType, forced);
         }
-        IOException error = boundaryError(running.rule());
-        core.observe(running.point(), outcome(error), running.elapsed(), running.rule(),
+        IOException error = boundaryError(replacing);
+        core.observe(running.point(), outcome(error), running.elapsed(), replacing,
                 Map.of("error", error.getClass().getName(), "sent", "true"));
         return error;
     }

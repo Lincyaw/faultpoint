@@ -55,6 +55,10 @@ public final class Core {
     /** The locators of every point of a kind, for a plugin that serves them all. */
     public static final Predicate<String> EVERY_LOCATOR = locator -> true;
     private static final Predicate<String> EVERY_ACTION = action -> true;
+    /** fail_after acts only on an operation that completed normally, so a point decides and counts it only then;
+     * every other action acts before the operation. */
+    public static final Predicate<String> ACTS_AFTER = "fail_after"::equals;
+    public static final Predicate<String> ACTS_BEFORE = ACTS_AFTER.negate();
 
     /** The kinds one plugin serves with the actions it implements there, at the points whose locators it serves. */
     private record Declaration(Map<String, List<String>> kinds, Predicate<String> locators) {}

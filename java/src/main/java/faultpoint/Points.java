@@ -137,10 +137,6 @@ public final class Points {
     /** The calls in progress on this thread, innermost last, so that a call's outcome is attributed to the rule
      * decided before it even when the callee holds call points of its own. */
     private static final ThreadLocal<java.util.ArrayDeque<Pending>> CALLS = ThreadLocal.withInitial(java.util.ArrayDeque::new);
-    /** A fail_after rule acts on a call that returned, so it is decided and counted only then; the other rules
-     * act before the call. */
-    private static final java.util.function.Predicate<String> AFTER_CALL = "fail_after"::equals;
-    private static final java.util.function.Predicate<String> BEFORE_CALL = AFTER_CALL.negate();
 
     /** Before a call whose callee declares a checked exception: a fail rule throws that exception here, so the
      * callee does not run. */
@@ -149,7 +145,7 @@ public final class Points {
         if (!core.enabled()) {
             return;
         }
-        Rule rule = core.decide(point, BEFORE_CALL);
+        Rule rule = core.decide(point, Core.ACTS_BEFORE);
         if (rule != null) {
             hold(core, rule);
         }
@@ -179,7 +175,7 @@ public final class Points {
             return;
         }
         Pending pending = CALLS.get().pop();
-        Rule replacing = core.decide(point, AFTER_CALL);
+        Rule replacing = core.decide(point, Core.ACTS_AFTER);
         if (replacing != null) {
             Exception injected = declaredException(pending.declared(), point);
             core.observe(point, "error", 0, replacing, Map.of("error", injected.getClass().getName()));

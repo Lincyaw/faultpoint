@@ -2,6 +2,7 @@ package faultpoint;
 
 import faultpoint.RuleSet.Rule;
 import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
 import java.io.IOException;
 import java.net.ConnectException;
 import java.net.URI;
@@ -64,8 +65,9 @@ public final class HttpClients {
         }
     }
 
-    /** A request under its rule; written tells whether the client took the whole body, and is null without a body. */
-    private record Call(String point, Rule rule, HttpRequest request, long started, AtomicBoolean written) {
+    /** A request under the rule decided before it; written tells whether the client took the whole body, and is null
+     * without a body. An asynchronous request completes on a thread of the client, which has not its context. */
+    private record Call(String point, Rule rule, HttpRequest request, long started, AtomicBoolean written, Context context) {
         double elapsed() {
             return (System.nanoTime() - started) / 1e6;
         }
@@ -123,7 +125,7 @@ public final class HttpClients {
         Core core = Core.current();
         String point = RuleSet.pointId(core.settings.service(), "rpc_client",
                 request.method() + " " + peer + ServletBoundary.pathTemplate(uri.getPath()));
-        return new Call(point, core.decide(point), builder.build(), System.nanoTime(), written);
+        return new Call(point, core.decide(point, Core.ACTS_BEFORE), builder.build(), System.nanoTime(), written, Context.current());
     }
 
     /** A failed request's error type and, when known, whether the request was sent whole: never after a failed
@@ -149,18 +151,31 @@ public final class HttpClients {
 
     /** The failure a fail or fail_after rule answers with: a synthetic status, or the error to throw; only a
      * fail_after has sent the request. */
-    private static <T> HttpResponse<T> failure(Call call) throws IOException {
-        Integer status = call.rule().integer("status");
-        String sent = String.valueOf(call.rule().kind().equals("fail_after"));
+    private static <T> HttpResponse<T> failure(Call call, Rule rule) throws IOException {
+        Integer status = rule.integer("status");
+        String sent = String.valueOf(rule.kind().equals("fail_after"));
         if (status != null) {
-            Core.current().observe(call.point(), (status / 100) + "xx", call.elapsed(), call.rule(),
+            Core.current().observe(call.point(), (status / 100) + "xx", call.elapsed(), rule,
                     Map.of("status", status.toString(), "sent", sent));
             return new SyntheticResponse<>(status, call.request());
         }
-        IOException error = boundaryError(call.rule());
-        Core.current().observe(call.point(), outcome(error), call.elapsed(), call.rule(),
+        IOException error = boundaryError(rule);
+        Core.current().observe(call.point(), outcome(error), call.elapsed(), rule,
                 Map.of("error", error.getClass().getName(), "sent", sent));
         throw error;
+    }
+
+    /** A request that got a response: a fail_after rule decided now, which only an answered request counts against
+     * its trigger, answers with its failure instead; otherwise the response is observed and returned. */
+    private static <T> HttpResponse<T> answered(Call call, HttpResponse<T> response) throws IOException {
+        Core core = Core.current();
+        Rule replacing = core.decide(call.point(), Core.ACTS_AFTER);
+        if (replacing != null) {
+            return failure(call, replacing);
+        }
+        core.observe(call.point(), (response.statusCode() / 100) + "xx", call.elapsed(), call.rule(),
+                Map.of("status", String.valueOf(response.statusCode())));
+        return response;
     }
 
     public static <T> HttpResponse<T> send(HttpClient client, HttpRequest request, HttpResponse.BodyHandler<T> handler)
@@ -175,7 +190,7 @@ public final class HttpClients {
             Points.hold(core, call.rule());
         }
         if (kind.equals("fail")) {
-            return failure(call);
+            return failure(call, call.rule());
         }
         HttpResponse<T> response;
         try {
@@ -187,12 +202,7 @@ public final class HttpClients {
             core.observe(call.point(), outcome(failure), call.elapsed(), call.rule(), failureDetail(failure, call.sent()));
             throw failure;
         }
-        if (kind.equals("fail_after")) {
-            return failure(call);
-        }
-        core.observe(call.point(), (response.statusCode() / 100) + "xx", call.elapsed(), call.rule(),
-                Map.of("status", String.valueOf(response.statusCode())));
-        return response;
+        return answered(call, response);
     }
 
     public static <T> CompletableFuture<HttpResponse<T>> sendAsync(HttpClient client, HttpRequest request,
@@ -212,24 +222,25 @@ public final class HttpClients {
                 : CompletableFuture.completedFuture(null);
         return ready.thenCompose(ignored -> {
             if (kind.equals("fail")) {
-                return CompletableFuture.supplyAsync(() -> null).thenApply(nothing -> unchecked(() -> HttpClients.<T>failure(call)));
+                return CompletableFuture.supplyAsync(() -> null).thenApply(nothing -> {
+                    try (Scope scope = call.context().makeCurrent()) {
+                        return unchecked(() -> HttpClients.<T>failure(call, rule));
+                    }
+                });
             }
             CompletableFuture<HttpResponse<T>> sent = client.sendAsync(call.request(), handler);
             if (kind.equals("duplicate")) {
                 sent = sent.thenCompose(first -> client.sendAsync(call.request(), handler));
             }
             return sent.handle((response, failure) -> {
-                if (failure != null) {
-                    Throwable cause = failure.getCause() == null ? failure : failure.getCause();
-                    core.observe(call.point(), outcome(cause), call.elapsed(), rule, failureDetail(cause, call.sent()));
-                    throw new java.util.concurrent.CompletionException(failure);
+                try (Scope scope = call.context().makeCurrent()) {
+                    if (failure != null) {
+                        Throwable cause = failure.getCause() == null ? failure : failure.getCause();
+                        core.observe(call.point(), outcome(cause), call.elapsed(), rule, failureDetail(cause, call.sent()));
+                        throw new java.util.concurrent.CompletionException(failure);
+                    }
+                    return unchecked(() -> answered(call, response));
                 }
-                if (kind.equals("fail_after")) {
-                    return unchecked(() -> HttpClients.<T>failure(call));
-                }
-                core.observe(call.point(), (response.statusCode() / 100) + "xx", call.elapsed(), rule,
-                        Map.of("status", String.valueOf(response.statusCode())));
-                return response;
             });
         });
     }
