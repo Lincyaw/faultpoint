@@ -10,13 +10,12 @@ from pydantic import BaseModel
 
 from faultsearch.catalog import FROZEN, Layer
 from faultsearch.chains import Chain, Group, confidence
-from faultsearch.counterfactual import (EffectKey, NamedWorkload, Runner, Scenarios, TreatmentRecord,
+from faultsearch.counterfactual import (UNSCOPED, EffectKey, NamedWorkload, Runner, Scenarios, TreatmentRecord,
                                         tenant_names)
 from faultsearch.edges import Condition, Edge, holds
 from faultsearch.evidence import ClassChecks, MappingCheck, step_classes
 
 VALIDATION_PREFIX: Final = "validate."
-UNSCOPED: Final = ""
 
 type ObservationTallies = dict[tuple[str, str, DetailItems], tuple[int, float]]
 type RunKey = tuple[str, str]

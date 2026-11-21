@@ -6,6 +6,7 @@ from statistics import fmean
 from typing import Final, Self
 from urllib.parse import urlsplit
 
+from faultpoint.actions import ActionKind
 from faultpoint.placement import Manifest
 from faultpoint.rules import Action
 from faultpoint.tools.analysis import Effect, Metric, Verdict
@@ -13,13 +14,18 @@ from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, JsonValue
 
 from faultsearch.allocation import Assignment, Phase, Strategy
-from faultsearch.catalog import (DATA, FROZEN, Catalog, Fault, Layer, implements, point_kind, point_layer,
-                                 point_scoped, point_service, point_symbol)
-from faultsearch.counterfactual import EffectKey, Scenarios, TreatmentRecord
+from faultsearch.catalog import (DATA, FROZEN, RPC_CLIENT, RPC_SERVER, Catalog, Fault, Layer, implements, point_kind,
+                                 point_layer, point_scoped, point_service, point_symbol)
+from faultsearch.counterfactual import EffectKey, Load, Scenarios, TreatmentRecord
 
 EFFECTS_FILE: Final = DATA / "effects.json"
-RPC_CLIENT: Final = "rpc_client"
-RPC_SERVER: Final = "rpc_server"
+WAIT: Final = "ms"
+"""The action parameter of how long a fail waits or a delay lasts."""
+WAIT_DIGITS: Final = 2
+"""The significant digits of a counterpart's time, so that near times share one fault."""
+COUNT_SLACK: Final = 1.0
+"""The executions per repetition two runs may differ by however few there are, below which a fraction says nothing."""
+ABSENT: Final = Load(count=0, mean=0)
 STATUS: Final = "status"
 """The action parameter of an exact status code: a number in a rule, a string in a detail."""
 ERROR: Final = "error"
@@ -203,6 +209,9 @@ class Edge(BaseModel):
     injected: bool = False
     """Whether the effect names an error only an injection gives, so that the edge can start a chain but not continue
     one: a counterpart stands in for a natural effect, which never names that error."""
+    mismatched: tuple[str, ...] = ()
+    """The counterparts whose substitute runs behaved unlike this edge's natural run where callers see the effect's
+    service, in every scenario both ran in, which no chain continues the edge with."""
 
     @property
     def held_in(self) -> frozenset[str]:
@@ -258,17 +267,30 @@ def peer_effects(effect: EffectKey, runs: list[dict[str, Effect]], services: dic
             if found.point == peer and all(key in run for run in runs)]
 
 
+def timed(action: Action, effect: EffectKey, layer: Layer, elapsed: float, increase: float) -> Action:
+    """A counterpart's action with the time of the effect it stands for, so that its timing is faithful too: a fail
+    waits as long as the natural failure took, and a delay for a slower mean adds the increase seen; a kernel point
+    keeps the action as it is, since kernel points carry no elapsed time."""
+    wait = (elapsed if action.kind == ActionKind.FAIL and effect.metric == Metric.COUNT
+            else increase if action.kind == ActionKind.DELAY and effect.metric == Metric.MEAN else 0.0)
+    if layer == Layer.UPSTREAM or wait < 1:
+        return action
+    return Action.model_validate({**action.model_dump(), WAIT: int(float(f"{wait:.{WAIT_DIGITS}g}"))})
+
+
 def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, manifest: Manifest | None,
-                 peer_effects: list[EffectKey], effects: EffectMap, catalog: Catalog,
-                 kinds: KindTable) -> tuple[Counterpart, tuple[Fault, ...]]:
+                 peer_effects: list[EffectKey], effects: EffectMap, catalog: Catalog, kinds: KindTable,
+                 elapsed: float, increase: float) -> tuple[Counterpart, tuple[Fault, ...]]:
     """The faults that, injected at an effect's point, produce the effect: the catalog's instances of every action
-    the effect map names for it and the point implements, or the action itself where the catalog has none; none for
-    an effect of a caller leaving."""
+    the effect map names for it, timed as the effect, and the point implements, or the action itself where the
+    catalog has none; none for an effect of a caller leaving."""
     if effects.caller_left(effect):
         return Counterpart.NONE, ()
     rules = [rule for rule in effects.rules if rule.covers(effect, verdicts, layer, manifest, peer_effects)]
     found = [([fault for fault in catalog.faults if fault.instance_of(effect.point, action)], action)
-             for rule in rules for action in rule.actions(effect) if implements(catalog.narrower, effect.point, action)]
+             for rule in rules for action in (timed(template, effect, layer, elapsed, increase)
+                                              for template in rule.actions(effect))
+             if implements(catalog.narrower, effect.point, action)]
     faults = {fault.key: fault for instances, action in found
               for fault in instances or [Fault(point=effect.point, action=action, layer=layer,
                                                scoped=point_scoped(effect.point, layer, kinds))]}
@@ -280,14 +302,51 @@ def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, manife
             tuple(faults.values()))
 
 
+def effect_time(held_runs: list[TreatmentRecord], held: list[Sighting], key: str,
+                effect: EffectKey) -> tuple[float, float]:
+    """How long the natural executions behind an effect took where it held, and for a slower mean how much it grew."""
+    times = [run.elapsed[key] for run in held_runs if key in run.elapsed]
+    increase = fmean(fmean(sighting.effect.treatment) - fmean(sighting.effect.control) for sighting in held) \
+        if effect.metric == Metric.MEAN else 0.0
+    return (fmean(times) if times else 0.0), increase
+
+
+def behaves_alike(natural: TreatmentRecord, substitute: TreatmentRecord, service: str, services: dict[int, str],
+                  min_count_increase: float, min_mean_increase: float) -> bool:
+    """Whether a substitute run behaves as the natural run it stands for where callers see it: at the server points of
+    the effect's service and at the client points that call them, every outcome within the smallest change that
+    counts as an effect, in executions per repetition and in their mean."""
+    points = {point for point in (*natural.boundary, *substitute.boundary)
+              if (point_kind(point) == RPC_SERVER and point_service(point) == service)
+              or (point_kind(point) == RPC_CLIENT and point_service(peer_point(point, services)) == service)}
+    seen_points = {point: (natural.boundary.get(point, {}), substitute.boundary.get(point, {})) for point in points}
+    loads = [(seen.get(outcome, ABSENT), stand.get(outcome, ABSENT))
+             for seen, stand in seen_points.values() for outcome in {*seen, *stand}]
+    return all(abs(seen.count - stand.count) <= max(COUNT_SLACK, min_count_increase * seen.count)
+               and (not seen.count or not stand.count or abs(seen.mean - stand.mean) <= min_mean_increase * seen.mean)
+               for seen, stand in loads)
+
+
+def mismatched_counterparts(cause: Fault, effect: EffectKey, held_in: list[str], faults: tuple[Fault, ...],
+                            runs: dict[tuple[str, str], TreatmentRecord], services: dict[int, str],
+                            min_count_increase: float, min_mean_increase: float) -> tuple[str, ...]:
+    """The counterparts whose substitute runs behaved unlike the natural run in every scenario where the edge held and
+    both ran, which no chain continues the edge with; a counterpart no such scenario ran is not judged."""
+    return tuple(fault.key for fault in faults if (checks := [
+        behaves_alike(runs[(cause.key, scenario)], runs[(fault.key, scenario)], point_service(effect.point), services,
+                      min_count_increase, min_mean_increase)
+        for scenario in held_in if (fault.key, scenario) in runs]) and not any(checks))
+
+
 def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: EffectMap, catalog: Catalog,
                 kinds: KindTable, upstream: frozenset[str], targets: dict[str, str], services: dict[int, str],
-                manifests: dict[str, Manifest], min_count_increase: float) -> list[Edge]:
+                manifests: dict[str, Manifest], min_count_increase: float, min_mean_increase: float) -> list[Edge]:
     """Every (fault, effect) pair the exercised records show, over the scenarios each fault was tested in."""
     by_fault: dict[str, list[TreatmentRecord]] = defaultdict(list)
     for record in records:
         if record.exercised:
             by_fault[record.fault.key].append(record)
+    by_run = {(record.fault.key, record.workload): record for runs in by_fault.values() for record in runs}
     edges = []
     for runs in by_fault.values():
         shown = {run.workload: {EffectKey.of(effect).key: effect for effect in run.effects
@@ -298,14 +357,17 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
             layer = point_layer(effect.point, upstream)
             held_in = [sighting.scenario for sighting in held]
             not_held = [run.workload for run in runs if run.workload not in held_in]
+            elapsed, increase = effect_time([run for run in runs if run.workload in held_in], held, key, effect)
             counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, layer,
                                                manifests.get(effect.point),
                                                peer_effects(effect, [shown[name] for name in held_in], services),
-                                               effects, catalog, kinds)
+                                               effects, catalog, kinds, elapsed, increase)
             edges.append(Edge(cause=runs[0].fault, effect=effect, held=tuple(held), not_held=tuple(not_held),
                               conditions=learn_conditions(held_in, not_held, scenarios), counterpart=counterpart,
                               counterparts=faults, terminal=effects.terminal(effect), effect_layer=layer,
                               injected=effects.injected(effect),
+                              mismatched=mismatched_counterparts(runs[0].fault, effect, held_in, faults, by_run,
+                                                                 services, min_count_increase, min_mean_increase),
                               acts_on=None if runs[0].fault.scoped else targets[point_service(runs[0].fault.point)]))
     return edges
 

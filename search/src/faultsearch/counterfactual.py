@@ -13,7 +13,7 @@ from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, Field, JsonValue
 from shop.deployment import REFUSAL_FILE, SCOPE_KEY, STATUSES_FILE, Instrumentation, Statuses, System, refusal
 
-from faultsearch.catalog import FROZEN, Fault
+from faultsearch.catalog import BOUNDARY_KINDS, FROZEN, Fault, point_kind
 from faultsearch.store import CONTROLS, LEAKS, TREATMENTS, Store
 
 UNSCOPED: Final = ""
@@ -92,6 +92,48 @@ class ControlRecord(BaseModel):
     statuses: tuple[Statuses, ...]
 
 
+class Load(BaseModel):
+    """What one point and outcome did in a set of repetitions."""
+
+    model_config = FROZEN
+
+    count: float
+    """The executions per repetition."""
+    mean: float
+    """The mean of the executions' totals, the response time at a boundary point."""
+
+
+def effects_elapsed(records: list[ObservationRecord], labels: list[str], scopes: set[str],
+                    effects: tuple[Effect, ...]) -> dict[str, float]:
+    """The mean elapsed time of the natural executions behind each count effect, in the repetitions and scopes the
+    effect was compared in."""
+    sums: dict[tuple[str, str, tuple[tuple[str, str], ...]], list[float]] = defaultdict(lambda: [0.0, 0.0])
+    for record in records:
+        if record.rule is None and record.experiment in labels and record.scope in scopes:
+            totals = sums[(record.point, record.outcome, tuple(sorted(record.detail.items())))]
+            totals[0] += record.elapsed
+            totals[1] += record.count
+    elapsed = {}
+    for effect in effects:
+        totals = sums.get((effect.point, effect.outcome, tuple(sorted(effect.detail.items()))))
+        if effect.metric == Metric.COUNT and totals is not None and totals[1]:
+            elapsed[EffectKey.of(effect).key] = totals[0] / totals[1]
+    return elapsed
+
+
+def boundary_loads(records: list[ObservationRecord], labels: list[str], scope: str) -> dict[str, dict[str, Load]]:
+    """Every rpc_server and rpc_client point of a scope, by outcome, with its executions per repetition and the mean
+    of their totals, injected executions included, since the boundary is what callers see."""
+    sums: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
+    for record in records:
+        if record.experiment in labels and record.scope == scope and point_kind(record.point) in BOUNDARY_KINDS:
+            totals = sums[record.point][record.outcome]
+            totals[0] += record.count
+            totals[1] += record.total
+    return {point: {outcome: Load(count=count / len(labels), mean=total / count)
+                    for outcome, (count, total) in outcomes.items() if count} for point, outcomes in sums.items()}
+
+
 class TreatmentRecord(BaseModel):
     """One fault injected in one tenant of a workload, compared with that tenant in the workload's controls."""
 
@@ -110,6 +152,12 @@ class TreatmentRecord(BaseModel):
     """The effects the untreated tenants of the same repetitions showed, by tenant."""
     refusal: str | None = None
     """What a service said when it refused the fault's rule, which then never ran."""
+    elapsed: dict[str, float] = {}
+    """The mean time, in ms, the natural executions behind each count effect took in the treatment repetitions;
+    records from before observations carried it have none."""
+    boundary: dict[str, dict[str, Load]] = {}
+    """How the treated tenant's service boundaries behaved, by rpc_server or rpc_client point and outcome, which tells
+    whether a substitute run behaves as the natural run it stands for; records from before have none."""
 
     @property
     def exercised(self) -> bool:
@@ -289,6 +337,7 @@ class Runner:
         leakage = {tenant: effects for tenant in group.untreated()
                    if (effects := self.comparison(control, labels, tenant).effects)}
         unscoped = self.comparison(control, labels, UNSCOPED)
+        observed = [record for label in labels for record in self.observations(label)]
         records = []
         for fault, tenant in zip(group.faults, group.tenants(), strict=True):
             comparison = self.comparison(control, labels, tenant)
@@ -297,11 +346,13 @@ class Runner:
             shown = {(effect.point, effect.outcome, effect.metric) for effect in comparison.effects}
             beyond = tuple(effect for effect in unscoped.effects if len(group.faults) == 1
                            and (effect.point, effect.outcome, effect.metric) not in shown)
+            effects = (*comparison.effects, *beyond)
             records.append(TreatmentRecord(
                 fault=fault, workload=group.workload.name, tenant=tenant, labels=tuple(labels),
                 packed_with=tuple(other.key for other in group.faults if other != fault), injected=tuple(injected),
-                statuses=tuple(self.statuses(label).tenants[tenant] for label in labels),
-                effects=(*comparison.effects, *beyond), leakage=leakage))
+                statuses=tuple(self.statuses(label).tenants[tenant] for label in labels), effects=effects,
+                leakage=leakage, elapsed=effects_elapsed(observed, labels, {tenant, UNSCOPED}, effects),
+                boundary=boundary_loads(observed, labels, tenant)))
         return records
 
     def run_groups(self, groups: list[Group]) -> list[Group]:

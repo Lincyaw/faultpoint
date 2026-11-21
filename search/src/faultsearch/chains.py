@@ -248,7 +248,8 @@ def beam_search(edges: list[Edge], allocation: Allocation, width: int, max_hops:
         extended = []
         for trail in beam:
             causes = [edge.cause.key for edge in trail.edges]
-            for following in sorted({fault.key for fault in trail.edges[-1].counterparts}):
+            for following in sorted({fault.key for fault in trail.edges[-1].counterparts}
+                                    - set(trail.edges[-1].mismatched)):
                 if following == causes[0] and len(causes) > 1:
                     cycles.append(trail)
                 extended += [Trail(edges=(*trail.edges, edge), conditions=conditions) for edge in by_cause[following]

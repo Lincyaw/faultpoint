@@ -34,6 +34,12 @@ class Layer(StrEnum):
     """The kernel under a business service: its system calls and packets."""
 
 
+RPC_CLIENT: Final = "rpc_client"
+RPC_SERVER: Final = "rpc_server"
+BOUNDARY_KINDS: Final = frozenset({RPC_CLIENT, RPC_SERVER})
+"""The kinds of the points where one service meets another."""
+
+
 def point_kind(point: str) -> str:
     return point.split(":", 2)[1]
 

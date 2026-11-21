@@ -151,7 +151,8 @@ def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
     edges = build_edges(records, recorded_scenarios(store, system),
                         store.record_input(EffectMap.read(system.entry_service), INPUTS, EFFECTS_INPUT),
                         store.load(Catalog, CATALOG), KindTable.installed(), UPSTREAM_SERVICES, UNSCOPED_TARGETS,
-                        services_by_port(system), point_manifests(system.manifests), min_count_increase)
+                        services_by_port(system), point_manifests(system.manifests), min_count_increase,
+                        store.load(RunSettings, RUN_SETTINGS).min_mean_increase)
     store.save(EdgeSet(strategy=strategy, edges=tuple(edges)), edges_file(strategy))
     feedback = store.load(MappingFeedback, MAPPING_FEEDBACK) if store.has(MAPPING_FEEDBACK) \
         else MappingFeedback(checks=())
