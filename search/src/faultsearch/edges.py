@@ -119,8 +119,8 @@ class EffectRule(BaseModel):
         return [Action.model_validate({**template.model_dump(), **given}) for template in self.faults]
 
 
-class InjectedError(BaseModel):
-    """The name of an error type only an SDK's injection gives, under which an observation reports it."""
+class NamedError(BaseModel):
+    """An error as an observation names it, with why the effect map treats it apart."""
 
     model_config = FROZEN
 
@@ -134,8 +134,11 @@ class EffectMap(BaseModel):
     entry_service: str
     """The service whose responses the user sees, which the explored system names."""
     terminal_outcomes: tuple[str, ...]
-    injected_errors: tuple[InjectedError, ...] = ()
-    """Recorded maps from before these names were listed list none."""
+    injected_errors: tuple[NamedError, ...] = ()
+    """Errors only an SDK's injection gives. Recorded maps from before these names were listed list none."""
+    caller_left_errors: tuple[NamedError, ...] = ()
+    """Errors a service's work gets because its caller left, which no fault reproduces. Recorded maps from before
+    these names were listed list none."""
     rules: tuple[EffectRule, ...]
 
     @classmethod
@@ -152,6 +155,10 @@ class EffectMap(BaseModel):
         """Whether an effect names an error only an injection gives, so that only a run injecting the fault behind it
         shows it."""
         return effect.detail.get(ERROR) in {error.name for error in self.injected_errors}
+
+    def caller_left(self, effect: EffectKey) -> bool:
+        """Whether an effect names an error a service's work gets because its caller left."""
+        return effect.detail.get(ERROR) in {error.name for error in self.caller_left_errors}
 
 
 class Counterpart(StrEnum):
@@ -255,7 +262,10 @@ def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, manife
                  peer_effects: list[EffectKey], effects: EffectMap, catalog: Catalog,
                  kinds: KindTable) -> tuple[Counterpart, tuple[Fault, ...]]:
     """The faults that, injected at an effect's point, produce the effect: the catalog's instances of every action
-    the effect map names for it and the point implements, or the action itself where the catalog has none."""
+    the effect map names for it and the point implements, or the action itself where the catalog has none; none for
+    an effect of a caller leaving."""
+    if effects.caller_left(effect):
+        return Counterpart.NONE, ()
     rules = [rule for rule in effects.rules if rule.covers(effect, verdicts, layer, manifest, peer_effects)]
     found = [([fault for fault in catalog.faults if fault.instance_of(effect.point, action)], action)
              for rule in rules for action in rule.actions(effect) if implements(catalog.narrower, effect.point, action)]

@@ -6,6 +6,10 @@
     {"name": "*fppoints.injectedError",
      "reason": "What the Go SDK returns at a call point for a fail rule naming no registered error; a natural call never returns this type."}
   ],
+  "caller_left_errors": [
+    {"name": "context.Canceled",
+     "reason": "What Go work gets when the context of the request it serves is cancelled because the caller left, a consequence of the caller, whose own failure the chain reaches anyway; injecting it does not make the caller leave."}
+  ],
   "rules": [
     {"kind": "branch", "outcomes": ["taken"], "metric": "count", "layers": ["business"], "faults": [],
      "reason": "fail at a branch forces it also in executions the natural cause never reaches, such as requests that succeeded; a chain continues through the boundary effects of the cause behind it."},
