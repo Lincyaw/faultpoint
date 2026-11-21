@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"go/types"
 	"log"
+	"os"
 	"path"
 	"slices"
 	"strconv"
@@ -52,6 +53,9 @@ type Placement struct {
 	Errors  bool         `json:"errors"`
 	Scope   []ScopeEntry `json:"scope"`
 	Exclude []string     `json:"exclude"`
+	// ErrorPackages are packages, such as context or io, whose exported error variables the build registers, so that
+	// an observation names context.Canceled rather than its type.
+	ErrorPackages []string `json:"error_packages"`
 }
 
 // ScopeEntry names a dependency package path, which includes the packages under it, limited to some kinds when
@@ -439,7 +443,34 @@ func (p *placer) placeLoop(node ast.Node, body *ast.BlockStmt) {
 // registeredError is an error variable of a package with the name a registry registers it under.
 type registeredError struct {
 	Name     string
+	Package  string
 	Variable string
+}
+
+// packageErrors are the exported error variables of the packages a placement's error_packages names, loaded as the
+// go command resolves them from a directory.
+func packageErrors(dir string, paths []string) []registeredError {
+	if len(paths) == 0 {
+		return nil
+	}
+	loaded, err := packages.Load(&packages.Config{Dir: dir, Mode: packages.NeedName | packages.NeedTypes}, paths...)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if packages.PrintErrors(loaded) > 0 {
+		os.Exit(1)
+	}
+	var errors []registeredError
+	for _, pkg := range loaded {
+		scope := pkg.Types.Scope()
+		for _, variable := range scope.Names() {
+			found, ok := scope.Lookup(variable).(*types.Var)
+			if ok && token.IsExported(variable) && types.Identical(found.Type(), errorType) {
+				errors = append(errors, registeredError{Name: pkg.PkgPath + "." + variable, Package: pkg.PkgPath, Variable: variable})
+			}
+		}
+	}
+	return errors
 }
 
 // errorRegistry is the source of a file that registers a package's error variables by name in the core, which a

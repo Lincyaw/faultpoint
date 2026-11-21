@@ -211,8 +211,12 @@ func instrument(arguments []string) {
 		used[pointsPackage] = true
 	}
 	plugins := slices.Sorted(maps.Keys(used))
+	sentinels := packageErrors(sourceDir, config.Placement.ErrorPackages)
 	for _, pkg := range written {
-		writeFile(filepath.Join(pkg.dir, initFile), packageInit(pkg.name, plugins, slices.Contains(config.Plugins, httpPlugin)))
+		writeFile(filepath.Join(pkg.dir, initFile), packageInit(pkg.name, plugins, slices.Contains(config.Plugins, httpPlugin), sentinels))
+	}
+	for _, sentinel := range sentinels {
+		manifest.Errors = append(manifest.Errors, sentinel.Name)
 	}
 	builds := filepath.Join(copies[0], "go.mod")
 	if workspace := workspaceFile(sourceDir); workspace != "" {
@@ -258,6 +262,9 @@ func scan(arguments []string) {
 	}
 	if libraries := scopedLibraries(graph, config.Placement); len(libraries) > 0 {
 		scanLibraries(*service, sourceDir, config.Placement, libraries, &manifest)
+	}
+	for _, sentinel := range packageErrors(sourceDir, config.Placement.ErrorPackages) {
+		manifest.Errors = append(manifest.Errors, sentinel.Name)
 	}
 	writeManifest(*manifestPath, manifest)
 	fmt.Printf("%d points listed in %s\n", len(manifest.Points), *manifestPath)

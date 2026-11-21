@@ -119,6 +119,9 @@ import (
 )
 
 func init() {
+{{- range .Errors}}
+	faultpoint.RegisterError({{printf "%q" .Name}}, {{.Variable}})
+{{- end}}
 {{- if .HTTP}}
 	http.DefaultClient.Transport = fphttp.Transport(http.DefaultClient.Transport)
 {{- end}}
@@ -278,9 +281,10 @@ func (w *wirer) wireAssignment(assignment *ast.AssignStmt) {
 }
 
 // packageInit is the source of the file every rewritten package gets: it imports the plugin packages the build uses,
-// so that all of them register before any package starts the core, instruments http.DefaultClient and starts the
-// core, which happens once, in whichever rewritten package initializes first, also in a test binary.
-func packageInit(name string, plugins []string, wiresHTTP bool) []byte {
+// so that all of them register before any package starts the core, registers the error variables of the
+// placement's error packages, instruments http.DefaultClient and starts the core, which happens once, in whichever
+// rewritten package initializes first, also in a test binary.
+func packageInit(name string, plugins []string, wiresHTTP bool, errors []registeredError) []byte {
 	imports := []string{strconv.Quote(corePackage), "_ " + strconv.Quote(contextPackage)}
 	for _, plugin := range plugins {
 		if plugin != httpPackage {
@@ -290,8 +294,18 @@ func packageInit(name string, plugins []string, wiresHTTP bool) []byte {
 	if wiresHTTP {
 		imports = append(imports, strconv.Quote("net/http"), strconv.Quote(httpPackage))
 	}
+	// Each package of error variables is imported under its own alias, so that two packages of one name do not clash.
+	aliases := map[string]string{}
+	registered := make([]registeredError, len(errors))
+	for index, known := range errors {
+		if _, imported := aliases[known.Package]; !imported {
+			aliases[known.Package] = "fperrors" + strconv.Itoa(len(aliases))
+			imports = append(imports, aliases[known.Package]+" "+strconv.Quote(known.Package))
+		}
+		registered[index] = registeredError{Name: known.Name, Variable: aliases[known.Package] + "." + known.Variable}
+	}
 	var source bytes.Buffer
-	err := initTemplate.Execute(&source, map[string]any{"Name": name, "Imports": imports, "HTTP": wiresHTTP})
+	err := initTemplate.Execute(&source, map[string]any{"Name": name, "Imports": imports, "HTTP": wiresHTTP, "Errors": registered})
 	if err != nil {
 		log.Fatal(err)
 	}
