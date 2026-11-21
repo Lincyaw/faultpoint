@@ -27,6 +27,8 @@ DIGEST_LENGTH: Final = 8
 STATEMENT_LOCATOR: Final = re.compile(rf"^[^ ]+#[0-9a-f]{{{DIGEST_LENGTH}}}$")
 """The shape of a statement point's locator, its tables and its hash, which no Redis command point has."""
 CLASSIFYING: Final = contextvars.ContextVar("faultpoint_classifying", default=False)
+WRITING_NODES: Final = (exp.Insert, exp.Update, exp.Delete, exp.Merge, exp.Into)
+"""The nodes that make a query write: a data-modifying CTE, or SELECT INTO a new table."""
 ERROR_CODE_ATTRIBUTES: Final = ("sqlstate", "sqlite_errorname")
 SqlState = Annotated[str, StringConstraints(pattern=r"^[0-9A-Z]{5}$")]
 STATEMENT_ACTIONS: Final[dict[str, object]] = {StoreKind.READ: read_actions(SqlState),
@@ -63,14 +65,15 @@ def error_detail(error: Exception) -> dict[str, str]:
 @functools.lru_cache(maxsize=STATEMENT_CACHE_SIZE)
 def statement_point(sql: str, dialect: str | None) -> tuple[StoreKind, str]:
     """The kind and locator of a statement or script: the tables it touches and the hash of its shape without
-    literals; it reads only when every statement is a query."""
+    literals; it reads only when every statement is a query that writes nowhere in its tree."""
     token = CLASSIFYING.set(True)
     try:
         # The lenient level classifies a statement sqlglot only partly understands, which the database accepts.
         statements = [statement for statement in sqlglot.parse(sql, read=dialect, error_level=ErrorLevel.IGNORE)
                       if statement is not None]
-        kind = StoreKind.READ if statements and all(isinstance(statement, exp.Query) for statement in statements) \
-            else StoreKind.WRITE
+        kind = StoreKind.READ if statements and all(
+            isinstance(statement, exp.Query) and statement.find(*WRITING_NODES) is None
+            for statement in statements) else StoreKind.WRITE
         tables = sorted({table.name for statement in statements for table in statement.find_all(exp.Table)})
         shape = ";".join(statement.transform(
             lambda node: exp.Placeholder() if isinstance(node, exp.Literal) else node).sql(dialect=dialect)
