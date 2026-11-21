@@ -11,7 +11,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from enum import StrEnum
 from importlib.metadata import entry_points
-from types import FrameType
+from types import FrameType, TracebackType
 from typing import Annotated, Final, NoReturn, Union
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
@@ -126,6 +126,7 @@ class Runtime:
         self.context = provided((plugin.context for plugin in plugins.values()), otel_context)(config)
         self.sink = provided((plugin.sink for plugin in plugins.values()), jsonl_sink)(settings, config)
         self.rules = RulesInForce("", (), settings.seed)
+        self.own = OwnWork(self)
 
     def load(self, ruleset: RuleSet) -> None:
         """Obey a rule set once every plugin here that serves the point of one of its rules parses its action."""
@@ -171,18 +172,20 @@ class Runtime:
         return self.fired(rules, rules.on_completion.get(point, ()))
 
     def fired(self, rules: RulesInForce, decisions: Iterable[Decision]) -> Decision | None:
-        return next((decision for decision in decisions
-                     if all(self.context.baggage(key) == value for key, value in decision.rule.scope.items())
-                     and rules.fires(decision.rule)), None)
+        with self.own:
+            return next((decision for decision in decisions
+                         if all(self.context.baggage(key) == value for key, value in decision.rule.scope.items())
+                         and rules.fires(decision.rule)), None)
 
     def observe(self, point: str, outcome: str, quantity: float, decision: Decision | None,
                 detail: Mapping[str, str] = NO_DETAIL) -> None:
-        if self.sink is not None:
-            self.sink.add(Observation(
-                experiment=self.rules.experiment, point=point, outcome=outcome,
-                scope=self.context.baggage(self.settings.scope_key) or "",
-                rule=None if decision is None else decision.rule.id, quantity=quantity,
-                trace_id=self.context.trace_id(), detail=dict(detail)))
+        with self.own:
+            if self.sink is not None:
+                self.sink.add(Observation(
+                    experiment=self.rules.experiment, point=point, outcome=outcome,
+                    scope=self.context.baggage(self.settings.scope_key) or "",
+                    rule=None if decision is None else decision.rule.id, quantity=quantity,
+                    trace_id=self.context.trace_id(), detail=dict(detail)))
 
     def crash(self, code: int) -> NoReturn:
         if self.sink is not None:
@@ -191,11 +194,37 @@ class Runtime:
 
     def refuse(self, decision: Decision, problem: str) -> NoReturn:
         """Stop the process at a rule the point it fires at cannot obey, which loading could not tell, since the id
-        of a point that several plugins serve does not say which of them reaches it; the observations so far are
-        kept."""
+        of a point that several plugins serve does not say which of them reaches it."""
+        self.abort(RuleRefused(f"rule {decision.rule.id}: {problem}"))
+
+    def internal_error(self, error: Exception) -> NoReturn:
+        """Stop the process at an unexpected error of the SDK's own code, which the application must never handle:
+        its error handling or logging would hide that the point stopped working, and change what it does."""
+        print(f"faultpoint: internal error: {error!r}", file=sys.stderr)
+        self.abort(error)
+
+    def abort(self, error: Exception) -> NoReturn:
+        """Stop the process for an error, after writing the observations."""
         if self.sink is not None:
-            self.sink.flush()
-        stop(RuleRefused(f"rule {decision.rule.id}: {problem}"))
+            final_flush(self.sink)
+        stop(error)
+
+
+class OwnWork:
+    """The SDK's own work where the application's code runs, in a point function, an adapter or the SDK's threads:
+    an exception it raises is the SDK's error, which stops the process; injected exceptions, the application's and
+    those of the wrapped call are raised outside it."""
+
+    def __init__(self, runtime: Runtime) -> None:
+        self.runtime = runtime
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
+                 trace: TracebackType | None) -> None:
+        if isinstance(error, Exception):
+            self.runtime.internal_error(error)
 
 
 class Plugin(BaseModel):
@@ -249,24 +278,33 @@ def stop(error: Exception) -> NoReturn:
     os._exit(STOP_EXIT_CODE)
 
 
-def flush_then_resignal(sink: ObservationSink, signum: int, frame: FrameType | None) -> None:
-    """Write the observations before a stopping signal has its default effect, which for SIGTERM ends the process
-    without its exit handlers, so that a process stopped gracefully loses none of them."""
-    # The main thread the signal interrupted may hold the sink's lock, so the flush waits for it at most an interval.
+def final_flush(sink: ObservationSink) -> None:
+    """Write the observations before the process ends."""
+    # The thread that ends the process may hold the sink's lock, so the flush runs apart and is waited for an interval.
     flushing = threading.Thread(target=sink.flush, name="faultpoint-final-flush", daemon=True)
     flushing.start()
     flushing.join(sink.interval)
-    signal.signal(signum, DEFAULT_DISPOSITIONS[signal.Signals(signum)])
+
+
+def flush_then_resignal(runtime: Runtime, sink: ObservationSink, signum: int, frame: FrameType | None) -> None:
+    """Write the observations before a stopping signal has its default effect, which for SIGTERM ends the process
+    without its exit handlers, so that a process stopped gracefully loses none of them."""
+    with runtime.own:
+        final_flush(sink)
+        signal.signal(signum, DEFAULT_DISPOSITIONS[signal.Signals(signum)])
     signal.raise_signal(signum)
 
 
-def repeat(interval: float, step: Callable[[], None]) -> NoReturn:
+def repeat(runtime: Runtime, interval: float, step: Callable[[], None]) -> NoReturn:
     while True:
         time.sleep(interval)
         try:
             step()
+        except (RuleRefused, ValidationError, OSError) as error:
+            # A rule set the process cannot obey or parse, or a file it cannot read or write.
+            runtime.abort(error)
         except Exception as error:
-            stop(error)
+            runtime.internal_error(error)
 
 
 RUNTIME: Runtime
@@ -301,21 +339,22 @@ def serve_in_background(runtime: Runtime, source: RuleSource | None) -> None:
     """Poll the rules and write the observations from threads of their own, and write them on a stopping signal
     whose disposition is still the default."""
     if source is not None:
-        threading.Thread(target=repeat, args=(POLL_INTERVAL_S, functools.partial(runtime.reload, source)),
+        threading.Thread(target=repeat, args=(runtime, POLL_INTERVAL_S, functools.partial(runtime.reload, source)),
                          name="faultpoint-rules", daemon=True).start()
     if runtime.sink is not None:
-        threading.Thread(target=repeat, args=(runtime.sink.interval, runtime.sink.flush),
+        threading.Thread(target=repeat, args=(runtime, runtime.sink.interval, runtime.sink.flush),
                          name="faultpoint-observations", daemon=True).start()
         for signum, disposition in DEFAULT_DISPOSITIONS.items():
             if signal.getsignal(signum) is disposition:
-                signal.signal(signum, functools.partial(flush_then_resignal, runtime.sink))
+                signal.signal(signum, functools.partial(flush_then_resignal, runtime, runtime.sink))
 
 
 def restart_in_child(runtime: Runtime, source: RuleSource | None) -> None:
     """Continue in a child forked from this process, as a gunicorn worker is, which has none of the parent's
     threads: with locks no parent thread holds, the sink as a process of its own, and the background work
     started again."""
-    runtime.rules.lock = threading.Lock()
-    if runtime.sink is not None:
-        runtime.sink.forked()
-    serve_in_background(runtime, source)
+    with runtime.own:
+        runtime.rules.lock = threading.Lock()
+        if runtime.sink is not None:
+            runtime.sink.forked()
+        serve_in_background(runtime, source)

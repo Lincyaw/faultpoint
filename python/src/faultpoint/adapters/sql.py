@@ -133,12 +133,14 @@ class Store:
         self.dialect = dialect
 
     def failure(self, decision: Decision) -> Exception:
-        match decision.action:
-            case StoreFailure(code=str() as code):
-                return self.coded_error(decision, code)
-            case StoreFailure(error=BoundaryError.REFUSED):
-                return self.driver.OperationalError("connection refused")
-        return self.driver.OperationalError("timed out")
+        """The error a failure rule raises, which the caller raises outside the SDK's own work."""
+        with self.runtime.own:
+            match decision.action:
+                case StoreFailure(code=str() as code):
+                    return self.coded_error(decision, code)
+                case StoreFailure(error=BoundaryError.REFUSED):
+                    return self.driver.OperationalError("connection refused")
+            return self.driver.OperationalError("timed out")
 
     def coded_error(self, decision: Decision, code: str) -> Exception:
         """The driver's error with a code, which faultpoint cannot build for a DB-API driver, since DB-API defines
@@ -147,18 +149,24 @@ class Store:
                                       f"with the code {code}")
 
     def decide(self, statement: CursorStatement, sql: str) -> tuple[StoreKind, str, Decision | None]:
-        statement.end()
-        kind, locator = statement_point(sql, self.dialect)
-        point = point_id(self.runtime.settings.service, kind, locator)
-        return kind, point, self.runtime.decide(point)
+        with self.runtime.own:
+            statement.end()
+            kind, locator = statement_point(sql, self.dialect)
+            point = point_id(self.runtime.settings.service, kind, locator)
+            return kind, point, self.runtime.decide(point)
 
     def finish(self, statement: CursorStatement, kind: StoreKind, point: str, decision: Decision | None,
                cursor: Any) -> None:
         """Record what the statement did: a write at once, a read when its fetching ends."""
-        statement.start(kind, point, decision)
-        if kind is StoreKind.WRITE:
-            rows = 1 if statement.dropped else max(cursor.rowcount, 0)
-            self.runtime.observe(point, StoreOutcome.OK, rows, decision)
+        with self.runtime.own:
+            statement.start(kind, point, decision)
+            if kind is StoreKind.WRITE:
+                rows = 1 if statement.dropped else max(cursor.rowcount, 0)
+                self.runtime.observe(point, StoreOutcome.OK, rows, decision)
+
+    def failed(self, point: str, decision: Decision | None, error: Exception) -> None:
+        with self.runtime.own:
+            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, error_detail(error))
 
     def completed(self, point: str, decision: Decision | None) -> Decision | None:
         """The decision of a statement that completed: the one made before it ran, or else a fail_after rule's,
@@ -167,7 +175,7 @@ class Store:
             decision = self.runtime.decide_completed(point)
         if decision is not None and isinstance(decision.action, StoreFailAfter):
             error = self.failure(decision)
-            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, error_detail(error))
+            self.failed(point, decision, error)
             raise error
         return decision
 
@@ -177,7 +185,7 @@ class Store:
         try:
             result = self.perform(execute, decision)
         except Exception as error:
-            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, error_detail(error))
+            self.failed(point, decision, error)
             raise
         self.finish(statement, kind, point, self.completed(point, decision), cursor)
         return result
@@ -204,7 +212,7 @@ class Store:
         try:
             result = await self.perform_async(execute, decision)
         except Exception as error:
-            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, error_detail(error))
+            self.failed(point, decision, error)
             raise
         self.finish(statement, kind, point, self.completed(point, decision), cursor)
         return result

@@ -59,20 +59,25 @@ class CursorPoints:
         self.statements: weakref.WeakKeyDictionary[Any, CursorStatement] = weakref.WeakKeyDictionary()
 
     def statement(self, cursor: Any) -> CursorStatement:
-        statement = self.statements.get(cursor)
-        if statement is None:
-            statement = self.statements[cursor] = CursorStatement(self.store.runtime)
-            weakref.finalize(cursor, statement.end)
-        return statement
+        with self.store.runtime.own:
+            statement = self.statements.get(cursor)
+            if statement is None:
+                statement = self.statements[cursor] = CursorStatement(self.store.runtime)
+                weakref.finalize(cursor, statement.end)
+            return statement
+
+    def prepared(self, cursor: Any, args: Arguments, kwargs: Keywords) -> tuple[CursorStatement, str]:
+        """The cursor's statement and the text of the query its method received, as the SDK's own work."""
+        with self.store.runtime.own:
+            return self.statement(cursor), statement_text(args, kwargs, cursor)
 
     def execute(self, execute: Any, cursor: Any, args: Arguments, kwargs: Keywords) -> Any:
-        self.store.run(self.statement(cursor), statement_text(args, kwargs, cursor),
-                       functools.partial(execute, *args, **kwargs), cursor)
+        self.store.run(*self.prepared(cursor, args, kwargs), functools.partial(execute, *args, **kwargs), cursor)
         return cursor
 
     def executemany(self, executemany: Any, cursor: Any, args: Arguments, kwargs: Keywords) -> Any:
-        return self.store.run(self.statement(cursor), statement_text(args, kwargs, cursor),
-                              functools.partial(executemany, *args, **kwargs), cursor)
+        return self.store.run(*self.prepared(cursor, args, kwargs), functools.partial(executemany, *args, **kwargs),
+                              cursor)
 
     def fetchone(self, fetchone: Any, cursor: Any, args: Arguments, kwargs: Keywords) -> Any:
         statement = self.statement(cursor)
@@ -100,12 +105,12 @@ class CursorPoints:
         return row
 
     async def execute_async(self, execute: Any, cursor: Any, args: Arguments, kwargs: Keywords) -> Any:
-        await self.store.run_async(self.statement(cursor), statement_text(args, kwargs, cursor),
-                                   functools.partial(execute, *args, **kwargs), cursor)
+        await self.store.run_async(*self.prepared(cursor, args, kwargs), functools.partial(execute, *args, **kwargs),
+                                   cursor)
         return cursor
 
     async def executemany_async(self, executemany: Any, cursor: Any, args: Arguments, kwargs: Keywords) -> Any:
-        return await self.store.run_async(self.statement(cursor), statement_text(args, kwargs, cursor),
+        return await self.store.run_async(*self.prepared(cursor, args, kwargs),
                                           functools.partial(executemany, *args, **kwargs), cursor)
 
     async def fetchone_async(self, fetchone: Any, cursor: Any, args: Arguments, kwargs: Keywords) -> Any:

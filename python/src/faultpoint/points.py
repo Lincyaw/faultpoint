@@ -51,7 +51,8 @@ PLUGIN: Final = Plugin(actions={
 
 
 def decide_in_process(runtime: Runtime, point: str) -> Decision | None:
-    """The decision of an in-process point, whose delay blocks the thread as contention does."""
+    """The decision of an in-process point, whose delay blocks the thread as contention does; the point functions
+    run it as the SDK's own work."""
     decision = runtime.decide(point)
     match decision:
         case Decision(action=Delay(ms=ms)):
@@ -64,11 +65,12 @@ def decide_in_process(runtime: Runtime, point: str) -> Decision | None:
 def branch(point: str, taken: bool) -> bool:
     """Whether a guarded error path runs: its natural condition, or forced by a fail rule."""
     runtime = faultpoint.runtime.RUNTIME
-    decision = decide_in_process(runtime, point)
-    match decision:
-        case Decision(action=Fail()):
-            taken = True
-    runtime.observe(point, PointOutcome.TAKEN if taken else PointOutcome.NOT_TAKEN, 0.0, decision)
+    with runtime.own:
+        decision = decide_in_process(runtime, point)
+        match decision:
+            case Decision(action=Fail()):
+                taken = True
+        runtime.observe(point, PointOutcome.TAKEN if taken else PointOutcome.NOT_TAKEN, 0.0, decision)
     return taken
 
 
@@ -90,23 +92,31 @@ class CallSite:
         return raised(INJECTED_MESSAGE)
 
     def __enter__(self) -> None:
-        self.decision = decide_in_process(self.runtime, self.point)
-        match self.decision:
-            case Decision(action=RaiseFail() as raising):
-                raise self.raised(raising)
+        raised = None
+        with self.runtime.own:
+            self.decision = decide_in_process(self.runtime, self.point)
+            match self.decision:
+                case Decision(action=RaiseFail() as raising):
+                    raised = self.raised(raising)
+        if raised is not None:
+            raise raised
 
     def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
                  trace: TracebackType | None) -> None:
-        if kind is None and self.decision is None:
-            self.decision = self.runtime.decide_completed(self.point)
-        match kind, self.decision:
-            case None, Decision(action=RaiseFailAfter() as raising):
-                raise self.raised(raising)
-            case None, _:
-                self.runtime.observe(self.point, PointOutcome.OK, 0.0, self.decision)
-            case _:
-                self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision,
-                                     {DetailKey.ERROR: error_type(kind)})
+        raised = None
+        with self.runtime.own:
+            if kind is None and self.decision is None:
+                self.decision = self.runtime.decide_completed(self.point)
+            match kind, self.decision:
+                case None, Decision(action=RaiseFailAfter() as raising):
+                    raised = self.raised(raising)
+                case None, _:
+                    self.runtime.observe(self.point, PointOutcome.OK, 0.0, self.decision)
+                case _:
+                    self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision,
+                                         {DetailKey.ERROR: error_type(kind)})
+        if raised is not None:
+            raise raised
 
 
 def call(point: str, candidates: Callable[[], tuple[type[BaseException], ...]]) -> CallSite:
@@ -116,50 +126,55 @@ def call(point: str, candidates: Callable[[], tuple[type[BaseException], ...]]) 
 def check(point: str, result: bool) -> bool:
     """The result of a detector, negated by a negate rule."""
     runtime = faultpoint.runtime.RUNTIME
-    decision = decide_in_process(runtime, point)
-    match decision:
-        case Decision(action=Negate()):
-            result = not result
-    runtime.observe(point, PointOutcome.TRUE if result else PointOutcome.FALSE, 0.0, decision)
+    with runtime.own:
+        decision = decide_in_process(runtime, point)
+        match decision:
+            case Decision(action=Negate()):
+                result = not result
+        runtime.observe(point, PointOutcome.TRUE if result else PointOutcome.FALSE, 0.0, decision)
     return result
 
 
 def loop(point: str) -> None:
     runtime = faultpoint.runtime.RUNTIME
-    runtime.observe(point, PointOutcome.ITERATION, 0.0, decide_in_process(runtime, point))
+    with runtime.own:
+        runtime.observe(point, PointOutcome.ITERATION, 0.0, decide_in_process(runtime, point))
 
 
 def value(point: str, observed: Any) -> Any:
     """A business value, replaced by a set rule or offset by a shift rule."""
     runtime = faultpoint.runtime.RUNTIME
-    decision = decide_in_process(runtime, point)
-    match decision:
-        case Decision(action=SetValue(value=replacement)):
-            observed = replacement
-        case Decision(action=Shift(amount=amount)):
-            observed = observed + amount
-    runtime.observe(point, PointOutcome.OBSERVED,
-                    float(observed) if isinstance(observed, int | float) else 0.0, decision)
+    with runtime.own:
+        decision = decide_in_process(runtime, point)
+        match decision:
+            case Decision(action=SetValue(value=replacement)):
+                observed = replacement
+            case Decision(action=Shift(amount=amount)):
+                observed = observed + amount
+        runtime.observe(point, PointOutcome.OBSERVED,
+                        float(observed) if isinstance(observed, int | float) else 0.0, decision)
     return observed
 
 
 def clock(point: str, reading: Any) -> Any:
     """A clock reading, epoch seconds or a date, moved by a shift rule of seconds."""
     runtime = faultpoint.runtime.RUNTIME
-    decision = decide_in_process(runtime, point)
-    match decision:
-        case Decision(action=Shift(amount=amount)):
-            reading = reading + (timedelta(seconds=amount) if isinstance(reading, date) else amount)
-    runtime.observe(point, PointOutcome.READ, 0.0, decision)
+    with runtime.own:
+        decision = decide_in_process(runtime, point)
+        match decision:
+            case Decision(action=Shift(amount=amount)):
+                reading = reading + (timedelta(seconds=amount) if isinstance(reading, date) else amount)
+        runtime.observe(point, PointOutcome.READ, 0.0, decision)
     return reading
 
 
 def acquire(point: str, acquired: bool) -> bool:
     """Whether a resource was acquired: its natural outcome, or rejected by a fail rule."""
     runtime = faultpoint.runtime.RUNTIME
-    decision = decide_in_process(runtime, point)
-    match decision:
-        case Decision(action=Fail()):
-            acquired = False
-    runtime.observe(point, PointOutcome.ACQUIRED if acquired else PointOutcome.REJECTED, 0.0, decision)
+    with runtime.own:
+        decision = decide_in_process(runtime, point)
+        match decision:
+            case Decision(action=Fail()):
+                acquired = False
+        runtime.observe(point, PointOutcome.ACQUIRED if acquired else PointOutcome.REJECTED, 0.0, decision)
     return acquired

@@ -214,23 +214,26 @@ class CommandPoints:
 
     def decide(self, args: tuple[Any, ...]) -> Decided | None:
         """The point and decision of a command; none for a command that is not a point."""
-        words = argument_text(args[0]).split()
-        name, arguments = words[0].upper(), [*words[1:], *(argument_text(argument) for argument in args[1:])]
-        command = self.commands.get(name)
-        if command is None:
-            return None
-        key = command_key(arguments, command.key)
-        locator = name if key is None else f"{name} {self.key_identifier.sub('{}', key)}"
-        point = point_id(self.runtime.settings.service, command.kind, locator)
-        return Decided(command=command, point=point, decision=self.runtime.decide(point))
+        with self.runtime.own:
+            words = argument_text(args[0]).split()
+            name, arguments = words[0].upper(), [*words[1:], *(argument_text(argument) for argument in args[1:])]
+            command = self.commands.get(name)
+            if command is None:
+                return None
+            key = command_key(arguments, command.key)
+            locator = name if key is None else f"{name} {self.key_identifier.sub('{}', key)}"
+            point = point_id(self.runtime.settings.service, command.kind, locator)
+            return Decided(command=command, point=point, decision=self.runtime.decide(point))
 
     def failure(self, decision: Decision) -> Exception:
-        match decision.action:
-            case StoreFailure(code=str() as code):
-                return self.coded_error(decision, code)
-            case StoreFailure(error=BoundaryError.REFUSED):
-                return self.exceptions.ConnectionError("Connection refused.")
-        return self.exceptions.TimeoutError("Timeout reading from socket")
+        """The error a failure rule raises, which the caller raises outside the SDK's own work."""
+        with self.runtime.own:
+            match decision.action:
+                case StoreFailure(code=str() as code):
+                    return self.coded_error(decision, code)
+                case StoreFailure(error=BoundaryError.REFUSED):
+                    return self.exceptions.ConnectionError("Connection refused.")
+            return self.exceptions.TimeoutError("Timeout reading from socket")
 
     def coded_error(self, decision: Decision, code: str) -> Exception:
         """The error redis-py raises for an error reply that starts with the code, from redis-py's own parsing of
@@ -245,14 +248,15 @@ class CommandPoints:
     def error_detail(self, error: BaseException) -> dict[str, str]:
         """The error type, and the code of an error reply: the prefix redis-py parsed off, or else the leading
         word of a reply it kept whole."""
-        match error:
-            case self.exceptions.RedisError(status_code=str() as code):
-                codes = [code]
-            case self.exceptions.ResponseError():
-                codes = ERROR_CODE.findall(str(error))
-            case _:
-                codes = []
-        return {DetailKey.ERROR: error_type(error), **({DetailKey.CODE: codes[0]} if codes else {})}
+        with self.runtime.own:
+            match error:
+                case self.exceptions.RedisError(status_code=str() as code):
+                    codes = [code]
+                case self.exceptions.ResponseError():
+                    codes = ERROR_CODE.findall(str(error))
+                case _:
+                    codes = []
+            return {DetailKey.ERROR: error_type(error), **({DetailKey.CODE: codes[0]} if codes else {})}
 
     def prepare(self, decisions: list[Decided | None]) -> float:
         """Crash or fail before anything is sent, and the seconds to wait before sending."""
@@ -276,16 +280,17 @@ class CommandPoints:
                replies: list[Any]) -> list[Any]:
         """Each command's reply out of the replies of what was sent, observed, and a failure after the effect of
         a command that completed."""
-        sent = iter(replies)
-        settled = [self.reply(client, queued, decided, [next(sent) for _ in range(copies(decided))])
-                   for queued, decided in zip(queue, decisions, strict=True)]
-        completed = [self.completed(decided, reply) for decided, reply in zip(decisions, settled, strict=True)]
-        for decided, reply in zip(completed, settled, strict=True):
-            if decided is not None:
-                self.observe_reply(decided, reply)
-        failures = [decided.decision for decided in completed
-                    if decided is not None and decided.decision is not None
-                    and isinstance(decided.decision.action, StoreFailAfter)]
+        with self.runtime.own:
+            sent = iter(replies)
+            settled = [self.reply(client, queued, decided, [next(sent) for _ in range(copies(decided))])
+                       for queued, decided in zip(queue, decisions, strict=True)]
+            completed = [self.completed(decided, reply) for decided, reply in zip(decisions, settled, strict=True)]
+            for decided, reply in zip(completed, settled, strict=True):
+                if decided is not None:
+                    self.observe_reply(decided, reply)
+            failures = [decided.decision for decided in completed
+                        if decided is not None and decided.decision is not None
+                        and isinstance(decided.decision.action, StoreFailAfter)]
         if failures:
             raise self.failure(failures[0])
         return settled

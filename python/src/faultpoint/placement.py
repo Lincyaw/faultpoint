@@ -374,9 +374,10 @@ def import_position(module: ast.Module) -> int:
     return position
 
 
-def place_points(source: str, service: str, path: str, placement: Placement) -> tuple[ast.Module, list[PointEntry]]:
-    """A module's syntax tree with its points placed, and the points; `path` is what the scope locates it as."""
-    module = ast.parse(source)
+def place_points(module: ast.Module, source: str, service: str, path: str,
+                 placement: Placement) -> tuple[ast.Module, list[PointEntry]]:
+    """A module's syntax tree, parsed from its source, with its points placed, and the points; `path` is what the
+    scope locates it as."""
     placer = PointPlacer(service, path, source, placement)
     placer.visit(module)
     if placer.points:
@@ -403,5 +404,5 @@ def scan_tree(root: Path, service: str, placement: Placement) -> Manifest:
             located = scope.locate(".".join((*package, *module_parts(path.relative_to(base)))), path)
             if located is not None:
                 source = importlib.util.decode_source(path.read_bytes())
-                points.extend(place_points(source, service, *located)[1])
+                points.extend(place_points(ast.parse(source), source, service, *located)[1])
     return Manifest(service=service, language="python", points=tuple(points))

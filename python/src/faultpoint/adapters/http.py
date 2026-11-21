@@ -146,29 +146,34 @@ class ServerPoint:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
-            headers = {key.decode("latin-1"): value.decode("latin-1") for key, value in scope["headers"]}
+            with self.runtime.own:
+                headers = {key.decode("latin-1"): value.decode("latin-1") for key, value in scope["headers"]}
             with self.runtime.context.attach(headers):
                 await self.serve(scope, receive, send)
         else:
             await self.app(scope, receive, send)
 
     async def serve(self, scope: Scope, receive: Receive, send: Send) -> None:
-        point = point_id(self.runtime.settings.service, RpcKind.SERVER,
-                         f"{scope['method']} {path_template(scope['path'], self.options.identifier_segment)}")
-        decision = self.runtime.decide(point)
-        exchange = ServerExchange(receive, send)
-        started = time.monotonic()
+        with self.runtime.own:
+            point = point_id(self.runtime.settings.service, RpcKind.SERVER,
+                             f"{scope['method']} {path_template(scope['path'], self.options.identifier_segment)}")
+            decision = self.runtime.decide(point)
+            exchange = ServerExchange(receive, send)
+            started = time.monotonic()
         try:
             if decision is None:
                 decision = await self.respond_undecided(scope, exchange, point)
             else:
                 await self.respond(scope, exchange.receive, exchange.send, decision)
         except BaseException as error:
-            self.runtime.observe(point, RpcOutcome.ERROR, elapsed_ms(started), decision,
-                                 {**exchange.detail(), DetailKey.ERROR: error_type(error)})
+            with self.runtime.own:
+                self.runtime.observe(point, RpcOutcome.ERROR, elapsed_ms(started), decision,
+                                     {**exchange.detail(), DetailKey.ERROR: error_type(error)})
             raise
-        self.runtime.observe(point, RpcOutcome.ERROR if exchange.status is None else status_outcome(exchange.status),
-                             elapsed_ms(started), decision, exchange.detail())
+        with self.runtime.own:
+            self.runtime.observe(point,
+                                 RpcOutcome.ERROR if exchange.status is None else status_outcome(exchange.status),
+                                 elapsed_ms(started), decision, exchange.detail())
 
     async def respond(self, scope: Scope, receive: Receive, send: Send, decision: Decision) -> None:
         match decision:
@@ -204,8 +209,9 @@ async def flush_after_shutdown(runtime: Runtime, shutdown: Callable[..., Awaitab
     with the signal it stopped on, which skips the exit handlers where that signal has its default disposition, as
     a gunicorn worker sets it."""
     await shutdown(*args, **kwargs)
-    if runtime.sink is not None:
-        runtime.sink.flush()
+    with runtime.own:
+        if runtime.sink is not None:
+            runtime.sink.flush()
 
 
 def patch_uvicorn(runtime: Runtime, options: HttpOptions, module: ModuleType) -> None:
@@ -230,12 +236,13 @@ class ClientPoint:
         self.library = library
 
     def decide(self, request: Any) -> tuple[str, Decision | None]:
-        self.runtime.context.inject(request.headers)
-        url = request.url
-        peer = url.host if url.port is None else f"{url.host}:{url.port}"
-        point = point_id(self.runtime.settings.service, RpcKind.CLIENT,
-                         f"{request.method} {peer}{path_template(url.path, self.options.identifier_segment)}")
-        return point, self.runtime.decide(point)
+        with self.runtime.own:
+            self.runtime.context.inject(request.headers)
+            url = request.url
+            peer = url.host if url.port is None else f"{url.host}:{url.port}"
+            point = point_id(self.runtime.settings.service, RpcKind.CLIENT,
+                             f"{request.method} {peer}{path_template(url.path, self.options.identifier_segment)}")
+            return point, self.runtime.decide(point)
 
     def error_outcome(self, error: Exception) -> RpcOutcome:
         match error:
@@ -265,12 +272,14 @@ class ClientPoint:
         return {} if error is None else {DetailKey.SENT: flag(isinstance(error, reading))}
 
     def observe(self, point: str, started: float, decision: Decision | None, response: Any) -> None:
-        self.runtime.observe(point, status_outcome(response.status_code), elapsed_ms(started), decision,
-                             {DetailKey.STATUS: str(response.status_code), **self.sent(decision, None)})
+        with self.runtime.own:
+            self.runtime.observe(point, status_outcome(response.status_code), elapsed_ms(started), decision,
+                                 {DetailKey.STATUS: str(response.status_code), **self.sent(decision, None)})
 
     def observe_error(self, point: str, started: float, decision: Decision | None, error: Exception) -> None:
-        self.runtime.observe(point, self.error_outcome(error), elapsed_ms(started), decision,
-                             {DetailKey.ERROR: error_type(error), **self.sent(decision, error)})
+        with self.runtime.own:
+            self.runtime.observe(point, self.error_outcome(error), elapsed_ms(started), decision,
+                                 {DetailKey.ERROR: error_type(error), **self.sent(decision, error)})
 
     def completed(self, point: str, decision: Decision | None, response: Any) -> Decision | None:
         """The decision of an exchange that got a response: the one made before it was sent, or else, for a 2xx
