@@ -7,8 +7,11 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLTimeoutException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -149,15 +152,34 @@ public final class Jdbc {
                 : statementPoint(requireSql(core, sql));
         String point = RuleSet.pointId(core.settings.service(), kind.kind(), kind.locator());
         Rule rule = core.decide(point, Core.ACTS_BEFORE);
-        if (rule != null) {
-            Points.hold(core, rule);
-        }
-        SQLException injected = rule != null && rule.kind().equals("fail")
+        // The query timeout cuts a rule's wait short as it cuts a slow server: the driver cancels the statement at the
+        // server, so that it does not run, and fails as it does then.
+        boolean cut = rule != null && Points.holdWithin(core, rule, queryTimeout(statement));
+        SQLException injected = cut ? queryTimedOut(statement) : rule != null && rule.kind().equals("fail")
                 ? injectedError(statement, rule, "faultpoint: injected store failure") : null;
         if (injected != null) {
-            core.observe(point, "error", 0, Points.since(started), rule, failureDetail(injected));
+            Map<String, String> detail = new HashMap<>(failureDetail(injected));
+            detail.put("sent", "false");
+            core.observe(point, "error", 0, Points.since(started), rule, detail);
         }
         return new Execution(point, kind.kind(), rule, started, injected);
+    }
+
+    /** A statement's query timeout, which the driver counts from sending it; none when the statement cannot tell, as a
+     * closed one, whose execution then fails on its own. */
+    private static Duration queryTimeout(Object statement) {
+        try {
+            return Duration.ofSeconds(((java.sql.Statement) statement).getQueryTimeout());
+        } catch (SQLException unknown) {
+            return null;
+        }
+    }
+
+    /** The error of a statement its query timeout cancelled: PostgreSQL's 57014 for its driver, which cancels the
+     * statement at the server, and SQLTimeoutException, which JDBC names for it, otherwise. */
+    static SQLException queryTimedOut(Object statement) throws SQLException {
+        SQLException postgres = postgresError(statement, "57014", "canceling statement due to user request");
+        return postgres != null ? postgres : new SQLTimeoutException("faultpoint: query timed out");
     }
 
     /** The error a fail or fail_after rule raises. With a code it is the driver's own error for a server error of that
@@ -168,15 +190,22 @@ public final class Jdbc {
         if (code == null) {
             return new SQLException(message, "08006");
         }
+        SQLException postgres = postgresError(statement, code, message);
+        return postgres != null ? postgres : new SQLException(message, code);
+    }
+
+    /** PostgreSQL's driver error for a server error of a SQLSTATE and message, made from the fields PostgreSQL sends, or
+     * null when the statement is another driver's. */
+    static SQLException postgresError(Object statement, String code, String message) throws SQLException {
         ClassLoader driver = statement.getClass().getClassLoader();
         Class<?> postgresStatement;
         try {
             postgresStatement = Class.forName("org.postgresql.PGStatement", false, driver);
         } catch (ClassNotFoundException absent) {
-            return new SQLException(message, code);
+            return null;
         }
         if (!((java.sql.Statement) statement).isWrapperFor(postgresStatement)) {
-            return new SQLException(message, code);
+            return null;
         }
         try {
             Object fields = Class.forName("org.postgresql.util.ServerErrorMessage", true, driver).getConstructor(String.class)

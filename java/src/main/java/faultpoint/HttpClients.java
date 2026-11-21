@@ -159,16 +159,22 @@ public final class HttpClients {
 
     /** How long a delay, or a fail with ms, keeps the client waiting as a slow peer would; null without either. */
     private static Duration waiting(Rule rule) {
-        return rule != null && (rule.kind().equals("delay") || (rule.kind().equals("fail") && rule.integer("ms") != null))
+        return rule != null && Points.waits(rule)
                 ? Duration.ofMillis((long) rule.number("ms")) : null;
     }
 
-    /** Observe a request the caller gave up on while a slow peer kept it waiting, which was never sent; an asynchronous
-     * wait ends on a thread of its own, so the request's context is made current. */
-    private static void abandoned(Call call, Throwable failure) {
+    /** A wait the caller cut short, by its timeout, a cancel or an interrupt, which it meets as failure. A delay stands
+     * for a slow peer, which has the request already and runs it, so the request is sent all the same and its answer
+     * dropped; a fail with ms sends nothing. An asynchronous wait ends on a thread of its own, so the request's context
+     * is made current. */
+    private static void cut(HttpClient client, Call call, Throwable failure) {
+        boolean sent = call.rule().kind().equals("delay");
+        if (sent) {
+            client.sendAsync(call.request(), HttpResponse.BodyHandlers.discarding());
+        }
         try (Scope ignored = call.context().makeCurrent()) {
             Core.current().observe(call.point(), outcome(failure), call.elapsed(), call.elapsed(), call.rule(),
-                    Map.of("error", failure.getClass().getName(), "sent", "false"));
+                    Map.of("error", failure.getClass().getName(), "sent", String.valueOf(sent)));
         }
     }
 
@@ -185,15 +191,15 @@ public final class HttpClients {
         return call.request().timeout().filter(timeout -> timeout.compareTo(wait) <= 0).isPresent();
     }
 
-    /** Wait as a slow peer keeps a send waiting: the request's timeout ends it with HttpTimeoutException and nothing
-     * sent, as the client gives up, and an interrupt ends it as it ends a send; otherwise the request goes on. */
-    private static Call waitAsPeer(Call call, Duration wait) throws IOException, InterruptedException {
+    /** Wait as a slow peer keeps a send waiting: the request's timeout ends it with HttpTimeoutException, as the client
+     * gives up, and an interrupt ends it as it ends a send; otherwise the request goes on. */
+    private static Call waitAsPeer(HttpClient client, Call call, Duration wait) throws IOException, InterruptedException {
         boolean timingOut = timesOut(call, wait);
         try {
             Thread.sleep((timingOut ? call.request().timeout().get() : wait).toMillis());
         } catch (InterruptedException interrupted) {
             own(() -> {
-                abandoned(call, interrupted);
+                cut(client, call, interrupted);
                 return null;
             });
             throw interrupted;
@@ -201,7 +207,7 @@ public final class HttpClients {
         if (timingOut) {
             HttpTimeoutException timedOut = new HttpTimeoutException("request timed out");
             own(() -> {
-                abandoned(call, timedOut);
+                cut(client, call, timedOut);
                 return null;
             });
             throw timedOut;
@@ -253,7 +259,7 @@ public final class HttpClients {
             }
             return waiting(begun.rule());
         });
-        Call call = wait == null ? begun : waitAsPeer(begun, wait);
+        Call call = wait == null ? begun : waitAsPeer(client, begun, wait);
         if (kind.equals("fail")) {
             return own(() -> failure(call, call.rule()));
         }
@@ -292,14 +298,14 @@ public final class HttpClients {
             return waiting(rule);
         });
         boolean timingOut = wait != null && timesOut(begun, wait);
-        // The future the caller holds: cancelled during a wait, the caller has given up and nothing is sent; cancelled
-        // after, the cancel reaches the request the client sends.
+        // The future the caller holds: cancelled during a wait, the caller has given up on a slow peer; cancelled after,
+        // the cancel reaches the request the client sends.
         CompletableFuture<HttpResponse<T>> answer = new CompletableFuture<>();
         AtomicBoolean proceeded = new AtomicBoolean();
         answer.whenComplete((response, failure) -> {
             if (answer.isCancelled() && proceeded.compareAndSet(false, true)) {
                 unchecked(() -> {
-                    abandoned(begun, new CancellationException());
+                    cut(client, begun, new CancellationException());
                     return null;
                 });
             }
@@ -314,7 +320,7 @@ public final class HttpClients {
             if (timingOut) {
                 HttpTimeoutException timedOut = new HttpTimeoutException("request timed out");
                 unchecked(() -> {
-                    abandoned(begun, timedOut);
+                    cut(client, begun, timedOut);
                     return null;
                 });
                 return CompletableFuture.<HttpResponse<T>>failedFuture(timedOut);

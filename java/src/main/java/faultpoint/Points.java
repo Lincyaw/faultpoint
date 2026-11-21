@@ -20,17 +20,37 @@ public final class Points {
     /** Perform delay and crash, blocking the thread as contention does; a fail rule with ms waits the same way before
      * it fails. */
     static void hold(Core core, Rule rule) {
-        if (rule.kind().equals("delay") || (rule.kind().equals("fail") && rule.integer("ms") != null)) {
-            try {
-                Thread.sleep((long) rule.number("ms"));
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-            }
+        if (waits(rule)) {
+            sleep((long) rule.number("ms"));
         }
         if (rule.kind().equals("crash")) {
             Integer code = rule.integer("code");
             core.crash(code == null ? 1 : code);
         }
+    }
+
+    /** Whether a rule waits before it acts: a delay, and a fail with ms. */
+    static boolean waits(Rule rule) {
+        return rule.kind().equals("delay") || (rule.kind().equals("fail") && rule.integer("ms") != null);
+    }
+
+    private static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Perform a boundary rule's hold for a client whose own timeout counts a slow peer's wait as the reply's latency:
+     * a wait longer than the timeout stops at it, and whether it did is returned; a null or zero timeout is none. */
+    static boolean holdWithin(Core core, Rule rule, java.time.Duration timeout) {
+        if (!waits(rule) || timeout == null || timeout.isZero() || timeout.toMillis() >= (long) rule.number("ms")) {
+            hold(core, rule);
+            return false;
+        }
+        sleep(timeout.toMillis());
+        return true;
     }
 
     /** Whether a guarded error path runs: its natural condition, or forced by a fail rule. */

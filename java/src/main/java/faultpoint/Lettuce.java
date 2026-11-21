@@ -6,8 +6,11 @@ import io.opentelemetry.context.Context;
 import io.opentelemetry.context.Scope;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionStage;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -27,23 +30,35 @@ public final class Lettuce {
     private Lettuce() {}
 
     /** A dispatched command, with the request context it was dispatched in: its reply completes on an I/O
-     * thread, which has none. The reply error is Lettuce's exception type for an error reply of Redis. */
-    public record Call(String point, Command command, Rule rule, long started, Context context, Class<?> replyError) {
+     * thread, which has none. The reply error is Lettuce's exception type for an error reply of Redis; cut tells that
+     * the synchronous API's timeout cut the rule's wait short. */
+    public record Call(String point, Command command, Rule rule, long started, Context context, Class<?> replyError, boolean cut) {
         String action() {
             return rule == null ? "" : rule.kind();
         }
 
-        /** A failed command's exception type and, for an error reply, its prefix. */
+        /** A failed command's exception type, for an error reply its prefix, and under a rule whether it was sent: a
+         * delayed command always is, and a failed one never. */
         Map<String, String> failureDetail(Throwable failure) {
+            Map<String, String> detail = new HashMap<>(Map.of("error", failure.getClass().getName()));
             Matcher prefix = REPLY_PREFIX.matcher(String.valueOf(failure.getMessage()));
-            return replyError.isInstance(failure) && prefix.lookingAt()
-                    ? Map.of("error", failure.getClass().getName(), "code", prefix.group(1))
-                    : Map.of("error", failure.getClass().getName());
+            if (replyError.isInstance(failure) && prefix.lookingAt()) {
+                detail.put("code", prefix.group(1));
+            }
+            if (action().equals("delay") || action().equals("fail")) {
+                detail.put("sent", String.valueOf(action().equals("delay")));
+            }
+            return detail;
         }
     }
 
-    /** Begin a command, or return null when it is not a point. */
-    public static Object enter(String name, ByteBuffer firstKey, Class<?> replyError) {
+    /** Lettuce's synchronous API, which waits for a command as long as the connection's timeout. */
+    private static final String SYNCHRONOUS = "io.lettuce.core.FutureSyncInvocationHandler";
+
+    /** Begin a command, or return null when it is not a point. The timeout is the connection's, which Lettuce's
+     * synchronous API waits a command for and so counts a slow server's wait against; an asynchronous caller sets none
+     * of its own, as TimeoutOptions are off unless the application turns them on. */
+    public static Object enter(String name, ByteBuffer firstKey, Class<?> replyError, Duration timeout) {
         long started = System.nanoTime();
         Core core = Core.current();
         Command command = RedisCommands.TABLE.commands().get(name);
@@ -53,13 +68,29 @@ public final class Lettuce {
         String key = firstKey == null ? null : StandardCharsets.UTF_8.decode(firstKey.duplicate()).toString();
         String point = RuleSet.pointId(core.settings.service(), command.kind(), RedisCommands.locator(name, key, identifier));
         Rule rule = core.decide(point);
+        boolean cut = false;
         if (rule != null) {
-            Points.hold(core, rule);
+            boolean synchronous = Points.waits(rule) && StackWalker.getInstance()
+                    .walk(frames -> frames.anyMatch(frame -> frame.getClassName().equals(SYNCHRONOUS)));
+            cut = Points.holdWithin(core, rule, synchronous ? timeout : null);
             if (rule.kind().equals("fail_after") || rule.kind().equals("duplicate")) {
                 core.abort("rule " + rule.id() + ": " + rule.kind() + " at " + point + " cannot resend a Lettuce command");
             }
         }
-        return new Call(point, command, rule, started, Context.current(), replyError);
+        return new Call(point, command, rule, started, Context.current(), replyError, cut);
+    }
+
+    /** Whether the synchronous API's timeout cut the command's wait short. */
+    public static boolean cut(Object call) {
+        return call instanceof Call running && running.cut();
+    }
+
+    /** Observe a command whose wait the synchronous API's timeout cut short, as that API's timeout is observed on a slow
+     * server: it cancels the command. */
+    public static void cutShort(Object call) {
+        Call running = (Call) call;
+        Core.current().observe(running.point(), "error", 0, Points.since(running.started()), running.rule(),
+                running.failureDetail(new CancellationException()));
     }
 
     private static boolean answered(Call call) {
@@ -104,7 +135,7 @@ public final class Lettuce {
     /** Observe a sent command's reply when it completes, on a thread of Lettuce, whose future would keep an error of
      * the observing to itself. */
     public static void observe(Object call, Object command) {
-        if (!(call instanceof Call running) || answered(running) || !(command instanceof CompletionStage<?> reply)) {
+        if (!(call instanceof Call running) || answered(running) || running.cut() || !(command instanceof CompletionStage<?> reply)) {
             return;
         }
         reply.whenComplete((value, error) -> {
