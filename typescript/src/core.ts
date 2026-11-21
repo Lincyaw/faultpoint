@@ -112,15 +112,19 @@ export class Core {
   }
 
   /** Install a rule set; a rule of this service at a point plugins serve must use an action each of those plugins
-   * implements, and rules of other services or of points no plugin here serves are left to their processes. */
+   * implements, a rule of a kind plugins here serve at a point none of them serves is refused, and rules of other
+   * services or of kinds no plugin here serves are left to their processes. */
   apply(ruleset: RuleSet): void {
     const rules = new Map<string, Rule[]>();
     for (const rule of ruleset.rules) {
       const { service, kind, locator } = pointParts(rule.point);
-      const serving = this.declarations.filter((declaration) => declaration.kinds[kind] !== undefined && declaration.locators(locator))
-        .map((declaration) => declaration.kinds[kind]);
-      if (service !== this.settings.service || serving.length === 0) {
+      const ofKind = this.declarations.filter((declaration) => declaration.kinds[kind] !== undefined);
+      if (service !== this.settings.service || ofKind.length === 0) {
         continue;
+      }
+      const serving = ofKind.filter((declaration) => declaration.locators(locator)).map((declaration) => declaration.kinds[kind]);
+      if (serving.length === 0) {
+        this.abort(`rule ${rule.id}: no plugin of this process serves ${rule.point}`);
       }
       if (!serving.every((actions) => actions.includes(rule.action.kind))) {
         this.abort(`rule ${rule.id}: not every plugin of this process serving its point implements ${rule.action.kind} at ${rule.point}`);
