@@ -39,6 +39,8 @@ INVENTORY_LIBRARIES: Final = [{"include": "github.com/jackc/pgx/v5/pgxpool", "ki
                               {"include": "github.com/jackc/puddle/v2", "kinds": LIBRARY_KINDS}]
 ORDERS_PLUGINS: Final = ["points", "import-hook", "httpx", "asgi", "dbapi", "redis"]
 PORTS: Final = {"gateway": 27180, "orders": 27181, "inventory": 27182, "pricing": 27183, "ledger": 27184}
+LEDGER_CLASS_PATH: Final = f"{SHOP / 'ledger' / 'target' / 'classes'}:{SHOP / 'ledger' / 'target' / 'lib' / '*'}"
+"""The class path ledger runs with, which its scan reads too, so that the scan lists the calls into its libraries."""
 WORKLOAD_FILE: Final = "workload.json"
 RULES_FILE: Final = "rules.json"
 STATUSES_FILE: Final = "statuses.json"
@@ -151,7 +153,7 @@ def collect_manifests(sdk: Path) -> None:
     MANIFESTS.mkdir(parents=True, exist_ok=True)
     run(["node", str(sdk / "typescript" / "dist" / "scan.js"), "--service", "gateway", "--root", "dist"], SHOP / "gateway")
     run(["java", "-jar", str(java_agent(sdk)), "scan", "--service", "ledger", "--packages", "shop", "--classes",
-         str(SHOP / "ledger" / "target" / "classes")], SHOP / "ledger")
+         str(SHOP / "ledger" / "target" / "classes"), "--classpath", LEDGER_CLASS_PATH], SHOP / "ledger")
     redis_version = subprocess.run([str(SHOP / "orders" / ".venv" / "bin" / "python"), "-c",
                                     "import importlib.metadata; print(importlib.metadata.version('redis'))"],
                                    check=True, capture_output=True, text=True).stdout.strip()
@@ -199,9 +201,7 @@ def services(directory: Path, sdk: Path, workload: Workload, upstream: Upstream)
                 command=[str(BUILD / "pricing" / "target" / "release" / "pricing")], directory=directory,
                 config={"options": {"tower": routes}}),
         Service(name="ledger", port=PORTS["ledger"],
-                command=["java", f"-javaagent:{java_agent(sdk)}", "-cp",
-                         f"{SHOP / 'ledger' / 'target' / 'classes'}:{SHOP / 'ledger' / 'target' / 'lib' / '*'}",
-                         "shop.Ledger"],
+                command=["java", f"-javaagent:{java_agent(sdk)}", "-cp", LEDGER_CLASS_PATH, "shop.Ledger"],
                 directory=directory, config={"options": {"servlet": routes}},
                 environment={"FAULTPOINT_PACKAGES": "shop", "LEDGER_DATABASE": str(directory / "ledger.db")}),
     ]
