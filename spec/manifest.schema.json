@@ -57,6 +57,14 @@
       },
       "title": "Points",
       "type": "array"
+    },
+    "errors": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Errors",
+      "type": "array"
     }
   },
   "required": [

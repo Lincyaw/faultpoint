@@ -86,6 +86,8 @@ class Manifest(BaseModel):
     service: str
     language: str
     points: tuple[PointEntry, ...]
+    errors: tuple[str, ...] = ()
+    """The error names the service's build registers, which a fail rule may name."""
 
 
 class Library(BaseModel):
