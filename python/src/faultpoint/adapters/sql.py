@@ -13,7 +13,8 @@ from pydantic import BaseModel
 from sqlglot import exp
 from sqlglot.errors import ErrorLevel
 
-from faultpoint.actions import BoundaryError, BoundaryFail, Crash, Delay, Drop, Duplicate, Empty, FailAfter, Failure
+from faultpoint.actions import (BoundaryError, Crash, Delay, Drop, Duplicate, Empty, StoreFail, StoreFailAfter,
+                                StoreFailure)
 from faultpoint.adapters.store import StoreKind, StoreOutcome
 from faultpoint.observations import DetailKey, error_type
 from faultpoint.rules import point_id
@@ -114,9 +115,19 @@ class Store:
         self.driver = driver
         self.dialect = dialect
 
-    def failure(self, failure: Failure) -> Exception:
-        return self.driver.OperationalError(
-            "connection refused" if failure.error is BoundaryError.REFUSED else "timed out")
+    def failure(self, decision: Decision) -> Exception:
+        match decision.action:
+            case StoreFailure(code=str() as code):
+                return self.coded_error(decision, code)
+            case StoreFailure(error=BoundaryError.REFUSED):
+                return self.driver.OperationalError("connection refused")
+        return self.driver.OperationalError("timed out")
+
+    def coded_error(self, decision: Decision, code: str) -> Exception:
+        """The driver's error with a code, which faultpoint cannot build for a DB-API driver, since DB-API defines
+        no error code."""
+        self.runtime.refuse(decision, f"the DB-API driver {self.driver.__name__} has no error faultpoint can build "
+                                      f"with the code {code}")
 
     def decide(self, statement: CursorStatement, sql: str) -> tuple[StoreKind, str, Decision | None]:
         statement.end()
@@ -150,16 +161,17 @@ class Store:
                 return execute()
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
-            case Decision(action=BoundaryFail() as failure):
-                raise self.failure(failure)
+            case Decision(action=StoreFail()):
+                raise self.failure(decision)
             case Decision(action=Drop()):
                 return None
             case Decision(action=Duplicate()):
                 execute()
                 return execute()
-            case Decision(action=FailAfter() as failure):
+            case Decision(action=StoreFailAfter()):
+                error = self.failure(decision)
                 execute()
-                raise self.failure(failure)
+                raise error
         return execute()
 
     async def run_async(self, statement: CursorStatement, sql: str, execute: Callable[[], Awaitable[Any]],
@@ -180,14 +192,15 @@ class Store:
                 return await execute()
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
-            case Decision(action=BoundaryFail() as failure):
-                raise self.failure(failure)
+            case Decision(action=StoreFail()):
+                raise self.failure(decision)
             case Decision(action=Drop()):
                 return None
             case Decision(action=Duplicate()):
                 await execute()
                 return await execute()
-            case Decision(action=FailAfter() as failure):
+            case Decision(action=StoreFailAfter()):
+                error = self.failure(decision)
                 await execute()
-                raise self.failure(failure)
+                raise error
         return await execute()

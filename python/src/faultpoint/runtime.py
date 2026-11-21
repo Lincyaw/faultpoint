@@ -111,13 +111,15 @@ class Runtime:
         applicable = [rule for rule in ruleset.rules
                       if rule.service == self.settings.service and rule.kind in self.kinds]
         actions: dict[str, BaseModel] = {}
+        problems: list[str] = []
         for kind, adapters in self.kinds.items():
             declared = {rule.id: rule.action.model_dump() for rule in applicable if rule.kind == kind}
             try:
-                parsed = [adapter.validate_python(declared) for adapter in adapters]
+                actions |= [adapter.validate_python(declared) for adapter in adapters][0]
             except ValidationError as error:
-                raise RuleRefused("\n".join(refusal(kind, issue) for issue in error.errors())) from error
-            actions |= parsed[0]
+                problems.extend(refusal(kind, issue) for issue in error.errors())
+        if problems:
+            raise RuleRefused("\n".join(problems))
         if self.sink is not None:
             self.sink.flush()
         self.rules = RulesInForce(ruleset.experiment,
@@ -150,6 +152,13 @@ class Runtime:
         if self.sink is not None:
             self.sink.flush()
         os._exit(code)
+
+    def refuse(self, decision: Decision, problem: str) -> NoReturn:
+        """Stop the process at a rule the point it fires at cannot obey, which loading could not tell, since a
+        point id does not say which plugin reaches it; the observations so far are kept."""
+        if self.sink is not None:
+            self.sink.flush()
+        stop(RuleRefused(f"rule {decision.rule.id}: {problem}"))
 
 
 class Plugin(BaseModel):
@@ -189,14 +198,13 @@ def file_rule_source(settings: Settings, config: Config) -> RuleSource | None:
     return None if settings.rules is None else FileRuleSource(settings.rules)
 
 
-def stop() -> NoReturn:
+def stop(error: Exception) -> NoReturn:
     """End the process, so that no experiment runs without the rules and plugins it asked for; a refused rule set
     is reported rule by rule, any other failure by its traceback."""
-    error = sys.exception()
     if isinstance(error, RuleRefused):
         print("\n".join(f"faultpoint: {line}" for line in str(error).splitlines()), file=sys.stderr)
     else:
-        traceback.print_exc()
+        traceback.print_exception(error)
     print("faultpoint: stopping the process", file=sys.stderr, flush=True)
     os._exit(STOP_EXIT_CODE)
 
@@ -206,8 +214,8 @@ def repeat(interval: float, step: Callable[[], None]) -> NoReturn:
         time.sleep(interval)
         try:
             step()
-        except Exception:
-            stop()
+        except Exception as error:
+            stop(error)
 
 
 RUNTIME: Runtime
@@ -236,5 +244,5 @@ def start() -> None:
             atexit.register(RUNTIME.sink.flush)
             threading.Thread(target=repeat, args=(RUNTIME.sink.interval, RUNTIME.sink.flush),
                              name="faultpoint-observations", daemon=True).start()
-    except Exception:
-        stop()
+    except Exception as error:
+        stop(error)

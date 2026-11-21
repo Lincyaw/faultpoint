@@ -6,10 +6,11 @@ from typing import Any, Final
 import wrapt
 from pydantic import BaseModel, JsonValue
 
+from faultpoint.actions import INJECTED_MESSAGE
 from faultpoint.adapters.sql import CursorStatement, Store, quiet_classification
 from faultpoint.adapters.store import READ_ACTIONS, WRITE_ACTIONS, StoreKind
 from faultpoint.rules import STRICT
-from faultpoint.runtime import Plugin, Runtime
+from faultpoint.runtime import Decision, Plugin, Runtime
 
 PSYCOPG_MODULE: Final = "psycopg"
 DEFAULT_DIALECT: Final = "postgres"
@@ -34,6 +35,24 @@ def statement_text(args: Arguments, kwargs: Keywords, cursor: Any) -> str:
         case bytes():
             return query.decode()
     return query.as_string(cursor)
+
+
+class PsycopgStore(Store):
+    """The statements of psycopg, whose errors carry the SQLSTATE PostgreSQL refused a statement with."""
+
+    def coded_error(self, decision: Decision, code: str) -> Exception:
+        """The error psycopg raises for a statement refused with a SQLSTATE: the class it looks up for the code,
+        with the diagnostic of a server error."""
+        errors, field = self.driver.errors, self.driver.pq.DiagnosticField
+        try:
+            error_class = errors.lookup(code)
+        except KeyError:
+            self.runtime.refuse(decision, f"psycopg has no error class for the SQLSTATE {code}")
+        if error_class.sqlstate != code:
+            self.runtime.refuse(decision, f"{code} is not a SQLSTATE: psycopg reports this error with the SQLSTATE "
+                                          f"{error_class.sqlstate}")
+        return error_class(INJECTED_MESSAGE, info={field.SEVERITY: b"ERROR", field.SQLSTATE: code.encode(),
+                                                   field.MESSAGE_PRIMARY: INJECTED_MESSAGE.encode()})
 
 
 class CursorPoints:
@@ -120,7 +139,7 @@ class CursorPoints:
 
 
 def patch(runtime: Runtime, dialect: str, module: ModuleType) -> None:
-    points = CursorPoints(Store(runtime, module, dialect))
+    points = CursorPoints(PsycopgStore(runtime, module, dialect))
     for method, wrapper in (("execute", points.execute), ("executemany", points.executemany),
                             ("fetchone", points.fetchone), ("fetchmany", points.fetchmany),
                             ("fetchall", points.fetchall), ("__next__", points.next_row)):

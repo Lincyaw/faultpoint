@@ -5,6 +5,7 @@ from typing import Any, Final, Self
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel
 
+from faultpoint.actions import ONE_FAILURE
 from faultpoint.rules import STRICT, Rule, RuleSet
 
 KINDS_FILE: Final = ("spec", "kinds.json")
@@ -59,6 +60,8 @@ class KindTable(BaseModel):
             problems.append(f"a {rule.kind} point responds with no status")
         if "code" in parameters and not spec.code:
             problems.append(f"a {rule.kind} point fails with no client library code")
+        if "code" in parameters and error is not None:
+            problems.append(ONE_FAILURE)
         if error is not None and spec.errors is not None and error not in spec.errors:
             problems.append(f"a {rule.kind} point fails with one of {list(spec.errors)}, not {error}")
         if isinstance(error, str) and spec.error_pattern is not None and not spec.error_pattern.match(error):

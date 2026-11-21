@@ -1,7 +1,7 @@
 from enum import StrEnum
-from typing import Literal
+from typing import Final, Literal, Self
 
-from pydantic import BaseModel, Field, ImportString, JsonValue
+from pydantic import BaseModel, Field, ImportString, JsonValue, model_validator
 
 from faultpoint.rules import STRICT
 
@@ -45,7 +45,7 @@ class RaiseFail(BaseModel):
 
 
 class Failure(BaseModel):
-    """What the caller of a failed boundary sees: a synthetic response status or a boundary error."""
+    """What the caller of a failed RPC sees: a synthetic response status or a boundary error."""
 
     model_config = STRICT
 
@@ -59,6 +59,39 @@ class BoundaryFail(Failure):
 
 class FailAfter(Failure):
     """A failure the caller sees after the boundary's effect took place."""
+
+    kind: Literal[ActionKind.FAIL_AFTER]
+
+
+ONE_FAILURE: Final = "a failure names a peer error or a code, not both"
+INJECTED_MESSAGE: Final = "faultpoint: injected failure"
+"""The message of the client library's error that a failure with a code raises, since only the peer knows the text
+that comes with the code."""
+
+
+class StoreFailure(BaseModel):
+    """What the caller of a failed store or message broker sees: a boundary error, or the client library's own error
+    with the code the rule names."""
+
+    model_config = STRICT
+
+    error: BoundaryError | None = None
+    code: str | None = Field(default=None, min_length=1)
+    """The code the client library reports, such as a SQLSTATE or the prefix of a Redis error reply."""
+
+    @model_validator(mode="after")
+    def one_failure(self) -> Self:
+        if self.error is not None and self.code is not None:
+            raise ValueError(ONE_FAILURE)
+        return self
+
+
+class StoreFail(StoreFailure):
+    kind: Literal[ActionKind.FAIL]
+
+
+class StoreFailAfter(StoreFailure):
+    """A failure the caller sees after the write or the message took place."""
 
     kind: Literal[ActionKind.FAIL_AFTER]
 

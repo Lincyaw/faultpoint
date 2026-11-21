@@ -11,7 +11,8 @@ from typing import Annotated, Any, Final
 import wrapt
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints
 
-from faultpoint.actions import BoundaryError, BoundaryFail, Crash, Delay, Drop, Duplicate, Empty, FailAfter, Failure
+from faultpoint.actions import (INJECTED_MESSAGE, BoundaryError, Crash, Delay, Drop, Duplicate, Empty, StoreFail,
+                                StoreFailAfter, StoreFailure)
 from faultpoint.adapters.store import (CONSUME_ACTIONS, READ_ACTIONS, WRITE_ACTIONS, MessageKind, StoreKind,
                                        StoreOutcome)
 from faultpoint.observations import DetailKey, error_type
@@ -199,11 +200,14 @@ class CommandPoints:
     points; a dropped command is acknowledged with True, and a duplicated consume delivers each entry twice."""
 
     def __init__(self, runtime: Runtime, key_identifier: re.Pattern[str], commands: dict[str, Command],
-                 exceptions: ModuleType) -> None:
+                 redis: ModuleType) -> None:
         self.runtime = runtime
         self.key_identifier = key_identifier
         self.commands = commands
-        self.exceptions = exceptions
+        self.exceptions = redis.exceptions
+        # Every parser of redis-py, sync or asyncio, RESP2, RESP3 or hiredis, turns an error reply into an error
+        # with the parse_error they inherit.
+        self.parser = redis.connection.DefaultParser
 
     def decide(self, args: tuple[Any, ...]) -> Decided | None:
         """The point and decision of a command; none for a command that is not a point."""
@@ -217,10 +221,26 @@ class CommandPoints:
         point = point_id(self.runtime.settings.service, command.kind, locator)
         return Decided(command=command, point=point, decision=self.runtime.decide(point))
 
-    def failure(self, failure: Failure) -> Exception:
-        if failure.error is BoundaryError.REFUSED:
-            return self.exceptions.ConnectionError("Connection refused.")
+    def failure(self, decision: Decision) -> Exception:
+        match decision.action:
+            case StoreFailure(code=str() as code):
+                return self.coded_error(decision, code)
+            case StoreFailure(error=BoundaryError.REFUSED):
+                return self.exceptions.ConnectionError("Connection refused.")
         return self.exceptions.TimeoutError("Timeout reading from socket")
+
+    def coded_error(self, decision: Decision, code: str) -> Exception:
+        """The error redis-py raises for an error reply that starts with the code, from redis-py's own parsing of
+        the reply, which keeps the code only when it is the reply's first word in capitals."""
+        try:
+            error = self.parser.parse_error(f"{code} {INJECTED_MESSAGE}")
+        except ValueError as reason:
+            self.runtime.refuse(decision, f"redis-py builds the error of a {code} reply from the arguments Redis "
+                                          f"sends with the code: {reason}")
+        if self.error_detail(error).get(DetailKey.CODE) != code:
+            self.runtime.refuse(decision, f"redis-py reports no code {code} for an error reply, whose code is its "
+                                          f"first word in capitals")
+        return error
 
     def error_detail(self, error: BaseException) -> dict[str, str]:
         """The error type, and the code of an error reply: the prefix redis-py parsed off, or else the leading
@@ -240,10 +260,9 @@ class CommandPoints:
             match decided:
                 case Decided(action=Crash(code=code)):
                     self.runtime.crash(code)
-                case Decided(action=BoundaryFail() as failure):
-                    raised = self.failure(failure)
-                    self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decided.decision,
-                                         self.error_detail(raised))
+                case Decided(decision=Decision(action=StoreFail()) as decision):
+                    raised = self.failure(decision)
+                    self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decision, self.error_detail(raised))
                     raise raised
         return delay_seconds(decisions)
 
@@ -259,8 +278,9 @@ class CommandPoints:
         sent = iter(replies)
         settled = [self.reply(client, queued, decided, [next(sent) for _ in range(copies(decided))])
                    for queued, decided in zip(queue, decisions, strict=True)]
-        failures = [decided.action for decided in decisions
-                    if decided is not None and isinstance(decided.action, FailAfter)]
+        failures = [decided.decision for decided in decisions
+                    if decided is not None and decided.decision is not None
+                    and isinstance(decided.decision.action, StoreFailAfter)]
         if failures:
             raise self.failure(failures[0])
         return settled
@@ -284,9 +304,10 @@ class CommandPoints:
     def observe_reply(self, decided: Decided, reply: Any) -> None:
         """A read or a consume is empty or not; a consume's quantity is the messages it delivered."""
         command, point, decision = decided.command, decided.point, decided.decision
-        match decided.action, reply:
-            case FailAfter() as failure, _:
-                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, self.error_detail(self.failure(failure)))
+        match decision, reply:
+            case Decision(action=StoreFailAfter()), _:
+                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision,
+                                     self.error_detail(self.failure(decision)))
             case _, Exception():
                 self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, self.error_detail(reply))
             case _:
@@ -368,7 +389,7 @@ def patch_asyncio(points: CommandPoints, module: ModuleType) -> None:
 
 
 def patch(runtime: Runtime, key_identifier: re.Pattern[str], commands: dict[str, Command], module: ModuleType) -> None:
-    points = CommandPoints(runtime, key_identifier, commands, module.exceptions)
+    points = CommandPoints(runtime, key_identifier, commands, module)
     wrapt.wrap_function_wrapper(module, "Redis.execute_command", points.execute)
     wrapt.wrap_function_wrapper(module, "client.Pipeline.execute", points.execute_pipeline)
     wrapt.register_post_import_hook(functools.partial(patch_asyncio, points), REDIS_ASYNCIO_MODULE)
