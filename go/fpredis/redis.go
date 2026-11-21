@@ -177,6 +177,10 @@ func (c call) sent() bool {
 		(c.action != "empty" || c.command.Empty == "all_nil")
 }
 
+// late is whether the command still reaches Redis after its caller gave up: a delay the caller's timeout or
+// cancellation cut short models a slow server, which still runs it, while a fail's wait cut short sends nothing.
+func (c call) late() bool { return c.ended != nil && c.action == "delay" }
+
 // block waits as long as a blocking read kept back by an empty rule would have waited for its empty reply, so that
 // a consumer loop does not spin.
 func (c call) block(cmd redis.Cmder) {
@@ -327,6 +331,9 @@ func (h hook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		} else {
 			c.block(cmd)
 		}
+		if c.late() {
+			action.SendLate(ctx, func(late context.Context) { next(late, redis.NewCmd(late, cmd.Args()...)) })
+		}
 		if err == nil && c.action == "duplicate" {
 			faultpoint.Outside(func() { err = next(ctx, cmd) })
 		}
@@ -342,6 +349,7 @@ func (h hook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessP
 		calls := make([]call, len(cmds))
 		known := make([]bool, len(cmds))
 		sent := make([]redis.Cmder, 0, len(cmds))
+		var late []redis.Cmder
 		for index, cmd := range cmds {
 			calls[index], known[index] = h.decide(ctx, cmd)
 			if known[index] && calls[index].action == "duplicate" {
@@ -350,9 +358,19 @@ func (h hook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessP
 			if !known[index] || calls[index].sent() {
 				sent = append(sent, cmd)
 			}
+			if known[index] && calls[index].late() {
+				late = append(late, redis.NewCmd(ctx, cmd.Args()...))
+			}
 		}
 		if len(sent) > 0 {
 			faultpoint.Outside(func() { err = next(ctx, sent) })
+		}
+		// go-redis reads a transaction's replies by its MULTI and EXEC, so late commands of one keep them.
+		if len(late) > 0 && cmds[0].Name() == "multi" {
+			late = append(append([]redis.Cmder{redis.NewStatusCmd(ctx, "multi")}, late...), redis.NewSliceCmd(ctx, "exec"))
+		}
+		if len(late) > 0 {
+			action.SendLate(ctx, func(lateCtx context.Context) { next(lateCtx, late) })
 		}
 		for index, cmd := range cmds {
 			if known[index] {

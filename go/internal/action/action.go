@@ -41,6 +41,16 @@ func Wait(ctx context.Context, rule *faultpoint.Rule) error {
 	return Sleep(ctx, Pause(rule))
 }
 
+// SendLate sends an operation whose delay its caller cut short, as a slow peer still serves what its client gave up
+// on: in the background, under a context that the caller's end does not cancel, the sender discarding the reply.
+func SendLate(ctx context.Context, send func(late context.Context)) {
+	late := context.WithoutCancel(ctx)
+	go func() {
+		defer faultpoint.Guard()
+		faultpoint.Outside(func() { send(late) })
+	}()
+}
+
 // Sleep waits for a duration unless the caller gives up first, and returns the context's error then, nil once the
 // duration is over or when it is zero.
 func Sleep(ctx context.Context, duration time.Duration) error {

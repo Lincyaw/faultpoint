@@ -367,8 +367,9 @@ func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, erro
 }
 
 // RoundTrip sends a request under the rule of its point, a fail_after rule replacing only a 2xx or 3xx response of
-// the peer, and a caller that gives up during an injected wait getting its context's error, as from a slow peer; a
-// failure's detail tells whether the request was written completely, that is whether the peer may have acted on it.
+// the peer, and a caller that gives up during an injected wait getting its context's error, as from a slow peer,
+// whose delayed request still goes out; a failure's detail tells whether the request was written completely, that is
+// whether the peer may have acted on it.
 func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	defer faultpoint.Guard()
 	base := c.base
@@ -391,6 +392,18 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	if rule != nil {
 		kind = rule.Action.Kind
 		err = action.Wait(ctx, rule)
+	}
+	late := err != nil && kind == "delay"
+	if late {
+		action.SendLate(ctx, func(lateCtx context.Context) {
+			lateRequest := request.WithContext(lateCtx)
+			// http.Client gives a request for a transport it does not know a Cancel channel it closes at its timeout.
+			lateRequest.Cancel = nil
+			if answer, failed := base.RoundTrip(lateRequest); failed == nil {
+				io.Copy(io.Discard, answer.Body)
+				answer.Body.Close()
+			}
+		})
 	}
 	if err == nil && kind == "duplicate" && request.Body != nil && request.GetBody == nil {
 		var body []byte
@@ -431,7 +444,7 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	elapsed := faultpoint.Elapsed(started)
 	if err != nil {
 		faultpoint.Observe(ctx, point, errorOutcome(err), elapsed, elapsed, rule,
-			map[string]string{"error": faultpoint.ErrorName(err), "sent": strconv.FormatBool(wrote.Load())})
+			map[string]string{"error": faultpoint.ErrorName(err), "sent": strconv.FormatBool(late || wrote.Load())})
 		return nil, err
 	}
 	detail := map[string]string{"status": strconv.Itoa(response.StatusCode)}
