@@ -83,8 +83,8 @@ async def ready_message(receive: Receive) -> Message | None:
 
 class ServerExchange:
     """One request's exchange with its client: the response status, and whether the client left before the
-    response was sent, which a disconnect the application receives, a probe before the response, a wait of a rule,
-    or a failed send tells; body the probe or the wait takes is handed to the application's next receives."""
+    response was sent, which a disconnect the application receives, a probe before the response, or a failed
+    send tells; body the probe takes is handed to the application's next receive."""
 
     def __init__(self, receive: Receive, send: Send) -> None:
         self.inner_receive = receive
@@ -94,30 +94,9 @@ class ServerExchange:
         self.abandoned = False
 
     async def receive(self) -> Message:
-        message = self.held.pop(0) if self.held else await self.inner_receive()
+        message = self.held.pop() if self.held else await self.inner_receive()
         self.abandoned = self.abandoned or message["type"] == HTTP_DISCONNECT
         return message
-
-    async def leaves(self) -> None:
-        """Return once the client leaves, holding the request body read meanwhile; a client that left takes its
-        body with it, since the server then answers every receive with a disconnect."""
-        while True:
-            message = await self.inner_receive()
-            if message["type"] == HTTP_DISCONNECT:
-                self.abandoned = True
-                self.held.clear()
-                return
-            self.held.append(message)
-
-    async def wait(self, seconds: float) -> None:
-        """Wait as a server that slow before it handles the request, ending early when the client leaves."""
-        leaving = asyncio.ensure_future(self.leaves())
-        try:
-            await asyncio.wait({leaving}, timeout=seconds)
-        finally:
-            leaving.cancel()
-            # A receive still pending in the watch must end before the application receives.
-            await asyncio.wait({leaving})
 
     async def probe(self) -> None:
         """Look, before the response, whether the client left; request body the look takes is held."""
@@ -187,7 +166,7 @@ class ServerPoint:
             if decision is None:
                 decision = await self.respond_undecided(scope, exchange, point)
             else:
-                await self.respond(scope, exchange, decision)
+                await self.respond(scope, exchange.receive, exchange.send, decision)
         except BaseException as error:
             with self.runtime.own:
                 elapsed = elapsed_ms(started)
@@ -200,19 +179,17 @@ class ServerPoint:
                                  RpcOutcome.ERROR if exchange.status is None else status_outcome(exchange.status),
                                  elapsed, elapsed, decision, exchange.detail())
 
-    async def respond(self, scope: Scope, exchange: ServerExchange, decision: Decision) -> None:
-        """Respond as a rule decided before the application ran; a wait ends early when the client leaves, and the
-        application then runs as the server runs it for a client that left."""
+    async def respond(self, scope: Scope, receive: Receive, send: Send, decision: Decision) -> None:
         match decision:
             case Decision(action=Delay(ms=ms)):
-                await exchange.wait(ms / 1000)
-                await self.app(scope, exchange.receive, exchange.send)
+                await asyncio.sleep(ms / 1000)
+                await self.app(scope, receive, send)
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
             case Decision(action=BoundaryFail(status=status, ms=ms)):
                 if ms is not None:
-                    await exchange.wait(ms / 1000)
-                await send_failure(exchange.send, status)
+                    await asyncio.sleep(ms / 1000)
+                await send_failure(send, status)
 
     async def respond_undecided(self, scope: Scope, exchange: ServerExchange, point: str) -> Decision | None:
         """Run the application for a request no rule was decided for before it ran; a fail_after rule its 2xx or
