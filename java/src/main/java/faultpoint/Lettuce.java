@@ -31,24 +31,41 @@ public final class Lettuce {
 
     /** A dispatched command, with the request context it was dispatched in: its reply completes on an I/O
      * thread, which has none. The reply error is Lettuce's exception type for an error reply of Redis; cut tells that
-     * the synchronous API's timeout cut the rule's wait short. */
-    public record Call(String point, Command command, Rule rule, long started, Context context, Class<?> replyError, boolean cut) {
+     * the synchronous API's timeout cut the rule's wait short, and connected that the connection was open, so that
+     * Lettuce wrote the command rather than buffering it. */
+    public record Call(String point, Command command, Rule rule, long started, Context context, Class<?> replyError,
+                       boolean cut, boolean connected) {
         String action() {
             return rule == null ? "" : rule.kind();
         }
 
-        /** A failed command's exception type, for an error reply its prefix, and under a rule whether it was sent: a
-         * delayed command always is, and a failed one never. */
+        /** A failed command's exception type, for an error reply its prefix, and whether it had reached Redis: a command
+         * a fail rule answered never had, and one whose delay the timeout cut short is sent all the same. */
         Map<String, String> failureDetail(Throwable failure) {
             Map<String, String> detail = new HashMap<>(Map.of("error", failure.getClass().getName()));
             Matcher prefix = REPLY_PREFIX.matcher(String.valueOf(failure.getMessage()));
             if (replyError.isInstance(failure) && prefix.lookingAt()) {
                 detail.put("code", prefix.group(1));
             }
-            if (action().equals("delay") || action().equals("fail")) {
-                detail.put("sent", String.valueOf(action().equals("delay")));
+            Boolean sent = action().equals("fail") ? Boolean.FALSE : cut ? Boolean.TRUE : reached(failure);
+            if (sent != null) {
+                detail.put("sent", sent.toString());
             }
             return detail;
+        }
+
+        /** Whether a command that failed of itself had reached Redis: it had when Redis replied with an error, or when
+         * the synchronous API's timeout cancelled one written on an open connection, and it had not when no connection
+         * could be made; null when the failure does not tell. */
+        Boolean reached(Throwable failure) {
+            String type = failure.getClass().getName();
+            if (replyError.isInstance(failure)) {
+                return true;
+            }
+            if (failure instanceof CancellationException || type.equals("io.lettuce.core.RedisCommandTimeoutException")) {
+                return connected;
+            }
+            return type.equals("io.lettuce.core.RedisConnectionException") ? Boolean.FALSE : null;
         }
     }
 
@@ -58,7 +75,7 @@ public final class Lettuce {
     /** Begin a command, or return null when it is not a point. The timeout is the connection's, which Lettuce's
      * synchronous API waits a command for and so counts a slow server's wait against; an asynchronous caller sets none
      * of its own, as TimeoutOptions are off unless the application turns them on. */
-    public static Object enter(String name, ByteBuffer firstKey, Class<?> replyError, Duration timeout) {
+    public static Object enter(String name, ByteBuffer firstKey, Class<?> replyError, Duration timeout, boolean connected) {
         long started = System.nanoTime();
         Core core = Core.current();
         Command command = RedisCommands.TABLE.commands().get(name);
@@ -77,7 +94,7 @@ public final class Lettuce {
                 core.abort("rule " + rule.id() + ": " + rule.kind() + " at " + point + " cannot resend a Lettuce command");
             }
         }
-        return new Call(point, command, rule, started, Context.current(), replyError, cut);
+        return new Call(point, command, rule, started, Context.current(), replyError, cut, connected);
     }
 
     /** Whether the synchronous API's timeout cut the command's wait short. */

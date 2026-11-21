@@ -22,7 +22,7 @@ final class LettuceAdvice {
                         @Advice.Local("call") Object call) {
         call = Lettuce.enter(new String(command.getType().getBytes(), StandardCharsets.US_ASCII),
                 command.getArgs() == null ? null : command.getArgs().getFirstEncodedKey(), RedisCommandExecutionException.class,
-                handler.getTimeout());
+                handler.getTimeout(), handler.isOpen());
         String answer = Lettuce.answer(call);
         if ("fail".equals(answer) && Lettuce.cut(call)) {
             Lettuce.cutShort(call);

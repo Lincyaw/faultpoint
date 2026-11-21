@@ -158,9 +158,7 @@ public final class Jdbc {
         SQLException injected = cut ? queryTimedOut(statement) : rule != null && rule.kind().equals("fail")
                 ? injectedError(statement, rule, "faultpoint: injected store failure") : null;
         if (injected != null) {
-            Map<String, String> detail = new HashMap<>(failureDetail(injected));
-            detail.put("sent", "false");
-            core.observe(point, "error", 0, Points.since(started), rule, detail);
+            core.observe(point, "error", 0, Points.since(started), rule, failureDetail(injected, false));
         }
         return new Execution(point, kind.kind(), rule, started, injected);
     }
@@ -231,11 +229,34 @@ public final class Jdbc {
                 : "code " + code + " at " + rule.point() + " is not a SQLSTATE, five digits or upper-case letters";
     }
 
-    /** A failed statement's exception type and, for an SQLException, its SQLSTATE. */
-    static Map<String, String> failureDetail(Throwable failure) {
-        return failure instanceof SQLException sql && sql.getSQLState() != null
-                ? Map.of("error", failure.getClass().getName(), "code", sql.getSQLState())
-                : Map.of("error", failure.getClass().getName());
+    /** A failed statement's exception type, for an SQLException its SQLSTATE, and whether it had reached the server,
+     * when that is known. */
+    static Map<String, String> failureDetail(Throwable failure, Boolean sent) {
+        Map<String, String> detail = new HashMap<>(Map.of("error", failure.getClass().getName()));
+        if (failure instanceof SQLException sql && sql.getSQLState() != null) {
+            detail.put("code", sql.getSQLState());
+        }
+        if (sent != null) {
+            detail.put("sent", sent.toString());
+        }
+        return detail;
+    }
+
+    /** Whether a statement that failed of itself had reached the server: it had when the server reported the error, as
+     * PostgreSQL's driver keeps the server's message, its query timeout included, and it had not when no connection
+     * could be made, SQLSTATE 08001; null when the failure does not tell. */
+    static Boolean reached(Throwable failure) {
+        if (failure instanceof SQLException sql && "08001".equals(sql.getSQLState())) {
+            return false;
+        }
+        if (!failure.getClass().getName().equals("org.postgresql.util.PSQLException")) {
+            return null;
+        }
+        try {
+            return failure.getClass().getMethod("getServerErrorMessage").invoke(failure) != null ? Boolean.TRUE : null;
+        } catch (ReflectiveOperationException unreadable) {
+            throw Core.internalError(unreadable);
+        }
     }
 
     private static String requireSql(Core core, String sql) {
@@ -292,13 +313,13 @@ public final class Jdbc {
             }
         }
         if (thrown != null) {
-            core.observe(running.point(), "error", running.elapsed(), running.elapsed(), running.rule(), failureDetail(thrown));
+            core.observe(running.point(), "error", running.elapsed(), running.elapsed(), running.rule(), failureDetail(thrown, reached(thrown)));
             return new Outcome(returned, thrown);
         }
         Rule replacing = core.decide(running.point(), Core.ACTS_AFTER);
         if (replacing != null) {
             SQLException injected = injectedError(statement, replacing, "faultpoint: store failed after the statement ran");
-            core.observe(running.point(), "error", running.elapsed(), running.elapsed(), replacing, failureDetail(injected));
+            core.observe(running.point(), "error", running.elapsed(), running.elapsed(), replacing, failureDetail(injected, true));
             return new Outcome(returned, injected);
         }
         if (running.kind().equals("store_write")) {
