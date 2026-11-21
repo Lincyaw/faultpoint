@@ -1,7 +1,7 @@
 package main
 
 //go:generate sh -c "bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h"
-//go:generate sh -c "go tool bpf2go -tags linux -target bpfel -type trigger -type syscall_point -type syscall_rule -type syscall_rule_list -type packet_side -type packet_rule -type packet_rule_list -type natural_key -type register_name -type result_type -type error_rule -type native_action -type native_site -type native_write -type native_rule -type native_rule_list -type native_key -cflags \"-O2 -g -Wall -Werror -Wno-missing-declarations -mcpu=v3 -I$(go list -m -f '{{.Dir}}' github.com/cilium/ebpf)/examples/headers\" points bpf/points.bpf.c"
+//go:generate sh -c "go tool bpf2go -tags linux -target bpfel -type trigger -type syscall_point -type syscall_rule -type syscall_rule_list -type packet_side -type packet_rule -type packet_rule_list -type natural_key -type register_name -type result_type -type error_rule -type native_action -type native_site -type native_write -type native_rule -type native_rule_list -type native_key -type kernel_condition -type kernel_point -type kernel_rule -type kernel_rule_list -cflags \"-O2 -g -Wall -Werror -Wno-missing-declarations -mcpu=v3 -I$(go list -m -f '{{.Dir}}' github.com/cilium/ebpf)/examples/headers\" points bpf/points.bpf.c"
 
 import (
 	"errors"
@@ -28,32 +28,38 @@ const (
 var syscallEntryPrefixes = map[string]string{"amd64": "__x64_sys_", "arm64": "__arm64_sys_"}
 
 // kernel holds what lives as long as the agent, including the triggers, so a rule set's injections stay readable
-// after it is detached, the native points with the probes at their returns, and the event points with their probes.
+// after it is detached, the native points with the probes at their returns, the event points with their probes, and
+// the kernel points; programs are those loaded for one kernel function or tracepoint each.
 type kernel struct {
 	spec    *ebpf.CollectionSpec
 	objects struct {
-		ObserveSyscalls   *ebpf.Program `ebpf:"observe_syscalls"`
-		LeaveNative       *ebpf.Program `ebpf:"leave_native"`
-		ObserveUsdt       *ebpf.Program `ebpf:"observe_usdt"`
-		ObserveTracepoint *ebpf.Program `ebpf:"observe_tracepoint"`
-		CgroupServices    *ebpf.Map     `ebpf:"cgroup_services"`
-		Marks             *ebpf.Map     `ebpf:"marks"`
-		Natural           *ebpf.Map     `ebpf:"natural"`
-		Triggers          *ebpf.Map     `ebpf:"triggers"`
-		NativeSites       *ebpf.Map     `ebpf:"native_sites"`
-		NativeRules       *ebpf.Map     `ebpf:"native_rules"`
-		NativeOutcomes    *ebpf.Map     `ebpf:"native_outcomes"`
-		EventServices     *ebpf.Map     `ebpf:"event_services"`
-		EventCounts       *ebpf.Map     `ebpf:"event_counts"`
+		ObserveSyscalls *ebpf.Program `ebpf:"observe_syscalls"`
+		LeaveNative     *ebpf.Program `ebpf:"leave_native"`
+		ObserveUsdt     *ebpf.Program `ebpf:"observe_usdt"`
+		CgroupServices  *ebpf.Map     `ebpf:"cgroup_services"`
+		Marks           *ebpf.Map     `ebpf:"marks"`
+		Natural         *ebpf.Map     `ebpf:"natural"`
+		Triggers        *ebpf.Map     `ebpf:"triggers"`
+		NativeSites     *ebpf.Map     `ebpf:"native_sites"`
+		NativeRules     *ebpf.Map     `ebpf:"native_rules"`
+		NativeOutcomes  *ebpf.Map     `ebpf:"native_outcomes"`
+		EventServices   *ebpf.Map     `ebpf:"event_services"`
+		EventCounts     *ebpf.Map     `ebpf:"event_counts"`
+		KernelPoints    *ebpf.Map     `ebpf:"kernel_points"`
+		KernelRules     *ebpf.Map     `ebpf:"kernel_rules"`
+		KernelFlights   *ebpf.Map     `ebpf:"kernel_flights"`
+		KernelOutcomes  *ebpf.Map     `ebpf:"kernel_outcomes"`
 	}
 	points     []nativePoint
 	events     []eventPoint
 	eventFiles []*os.File
+	kernels    []kernelPoint
+	programs   []*ebpf.Program
 	links      []link.Link
 }
 
 // injector holds what one rule set attached; closing it detaches every program, removes the qdiscs it installed and
-// the native rules it put.
+// the native and kernel rules it put.
 type injector struct {
 	objects struct {
 		InjectSyscall *ebpf.Program `ebpf:"inject_syscall"`
@@ -67,6 +73,8 @@ type injector struct {
 	qdiscs      []installedQdisc
 	nativeRules *ebpf.Map
 	natives     []uint32
+	kernelRules *ebpf.Map
+	kernels     []uint32
 }
 
 type installedQdisc struct {
@@ -143,19 +151,23 @@ func (k *kernel) Close() error {
 	for _, point := range k.points {
 		errs = append(errs, closeFiles(point.files))
 	}
+	for _, program := range k.programs {
+		errs = append(errs, program.Close())
+	}
 	errs = append(errs, closeFiles(k.eventFiles), k.objects.ObserveSyscalls.Close(), k.objects.LeaveNative.Close(),
-		k.objects.ObserveUsdt.Close(), k.objects.ObserveTracepoint.Close(), k.objects.CgroupServices.Close(),
+		k.objects.ObserveUsdt.Close(), k.objects.CgroupServices.Close(),
 		k.objects.Marks.Close(), k.objects.Natural.Close(), k.objects.Triggers.Close(), k.objects.NativeSites.Close(),
 		k.objects.NativeRules.Close(), k.objects.NativeOutcomes.Close(), k.objects.EventServices.Close(),
-		k.objects.EventCounts.Close())
+		k.objects.EventCounts.Close(), k.objects.KernelPoints.Close(), k.objects.KernelRules.Close(),
+		k.objects.KernelFlights.Close(), k.objects.KernelOutcomes.Close())
 	return errors.Join(errs...)
 }
 
 // inject loads a rule set's maps and attaches its programs: a kprobe on the entry of each syscall a rule names, a tc
-// program on the egress of each device that transmits packets a rule names, and a uprobe on the entries of each native
-// point a fail or crash rule names.
+// program on the egress of each device that transmits packets a rule names, a uprobe on the entries of each native
+// point a fail or crash rule names, and an fmod_ret program on the function of each kernel point a rule names.
 func (k *kernel) inject(rules *kernelRules, services []service, syscalls syscallTable) (*injector, error) {
-	attached := &injector{nativeRules: k.objects.NativeRules}
+	attached := &injector{nativeRules: k.objects.NativeRules, kernelRules: k.objects.KernelRules}
 	if err := attached.attach(k, rules, services, syscalls); err != nil {
 		return nil, errors.Join(err, attached.Close())
 	}
@@ -223,6 +235,25 @@ func (i *injector) attach(k *kernel, rules *kernelRules, services []service, sys
 		if err != nil {
 			return err
 		}
+	}
+	for point, list := range rules.kernels {
+		if err := k.objects.KernelRules.Put(point, list); err != nil {
+			return err
+		}
+		i.kernels = append(i.kernels, point)
+		var injecting struct {
+			Program *ebpf.Program `ebpf:"inject_kernel"`
+		}
+		if err := k.loadKernelProgram(k.kernels[point].function, &injecting); err != nil {
+			return fmt.Errorf("injecting at %s: %w", k.kernels[point].id, err)
+		}
+		i.programs = append(i.programs, injecting.Program)
+		attached, err := link.AttachTracing(link.TracingOptions{Program: injecting.Program,
+			AttachType: ebpf.AttachModifyReturn, Cookie: uint64(point)})
+		if err != nil {
+			return fmt.Errorf("injecting at %s: %w", k.kernels[point].id, err)
+		}
+		i.links = append(i.links, attached)
 	}
 	return nil
 }
@@ -345,6 +376,9 @@ func (i *injector) Close() error {
 	}
 	for _, point := range i.natives {
 		errs = append(errs, i.nativeRules.Delete(point))
+	}
+	for _, point := range i.kernels {
+		errs = append(errs, i.kernelRules.Delete(point))
 	}
 	for _, installed := range i.qdiscs {
 		if err := installed.handle.QdiscDel(installed.qdisc); !errors.Is(err, unix.ENODEV) {

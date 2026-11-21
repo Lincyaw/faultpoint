@@ -8,9 +8,13 @@
 #define MAX_NATIVE_SITES 4096
 #define MAX_RESULT_REGISTERS 4
 #define MAX_EVENTS 4096
+#define MAX_KERNEL_POINTS 256
+#define NAME_LENGTH 64
 #define SIGKILL 9
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86DD
+#define AF_INET 2
+#define AF_INET6 10
 
 char LICENSE[] SEC("license") = "Dual MIT/GPL";
 
@@ -19,6 +23,11 @@ enum register_name { AX, BX, CX, DX, SI, DI, R8, R9, R10, R11 };
 enum result_type { INT32, INT64, POINTER, BOOL };
 enum error_rule { NONZERO, NEGATIVE, ZERO };
 enum native_action { FAIL, CRASH, NEGATE };
+enum kernel_condition { CONDITION_PORT = 1, CONDITION_ADDRESS = 2, CONDITION_NAME = 4 };
+
+/* The helpers fentry, fexit and fmod_ret programs read the attached function's arguments and result with. */
+static long (*bpf_get_func_arg)(void *ctx, __u32 n, __u64 *value) = (void *)BPF_FUNC_get_func_arg;
+static long (*bpf_get_func_ret)(void *ctx, __u64 *value) = (void *)BPF_FUNC_get_func_ret;
 
 struct trigger {
 	__u64 skip;
@@ -106,6 +115,38 @@ struct native_rule {
 struct native_rule_list {
 	__u32 count;
 	struct native_rule rules[MAX_POINT_RULES];
+};
+
+/* A kernel function point: its service, and which of the function's arguments, -1 for none, are the socket address
+ * and the file its rules' conditions read. */
+struct kernel_point {
+	__u32 service;
+	__s32 sockaddr_argument;
+	__s32 file_argument;
+};
+
+/* A fail rule of a kernel point: its negative errno and the conditions of its bit set; the port is in host order and
+ * the address IPv4-mapped, as the agent's packet rules hold them. */
+struct kernel_rule {
+	__u32 rule;
+	__s32 error;
+	enum kernel_condition conditions;
+	__u16 port;
+	__u8 address[16];
+	__u8 name[NAME_LENGTH];
+};
+
+struct kernel_rule_list {
+	__u32 count;
+	struct kernel_rule rules[MAX_POINT_RULES];
+};
+
+/* A call in flight between its fmod_ret and its fexit; unused is named so that initializers zero it, since padding the
+ * compiler leaves uninitialized would make equal keys differ. */
+struct kernel_flight {
+	__u64 task;
+	__u32 point;
+	__u32 unused;
 };
 
 /* An outcome of a native point: flagged is a failed call or a true check, value the integer result of a failed call,
@@ -203,6 +244,36 @@ struct {
 	__type(key, __u32);
 	__type(value, __u64);
 } event_counts SEC(".maps");
+
+/* Indexed by the cookie of a kernel point's links. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_KERNEL_POINTS);
+	__type(key, __u32);
+	__type(value, struct kernel_point);
+} kernel_points SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_KERNEL_POINTS);
+	__type(key, __u32);
+	__type(value, struct kernel_rule_list);
+} kernel_rules SEC(".maps");
+
+/* The rule that injected a call, for the fexit to count the call under it rather than as natural. */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct kernel_flight);
+	__type(value, __u32);
+} kernel_flights SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct native_key);
+	__type(value, __u64);
+} kernel_outcomes SEC(".maps");
 
 static __always_inline __u32 *current_service(void)
 {
@@ -516,4 +587,111 @@ int inject_packet(struct __sk_buff *skb)
 		return TCX_NEXT;
 	}
 	return TCX_NEXT;
+}
+
+/* What a kernel call's arguments give the conditions of its rules. */
+struct kernel_call {
+	__u16 port;
+	__u8 addressed;
+	__u8 address[16];
+	__u8 name[NAME_LENGTH];
+};
+
+static __always_inline void read_call(void *ctx, const struct kernel_point *point, struct kernel_call *call)
+{
+	__u64 argument = 0;
+	if (point->sockaddr_argument >= 0 && !bpf_get_func_arg(ctx, point->sockaddr_argument, &argument)) {
+		struct sockaddr_in6 address = {};
+		bpf_probe_read_kernel(&address, sizeof(address), (void *)argument);
+		call->port = bpf_ntohs(address.sin6_port);
+		if (address.sin6_family == AF_INET) {
+			call->address[10] = 0xff;
+			call->address[11] = 0xff;
+			__builtin_memcpy(&call->address[12], &((struct sockaddr_in *)&address)->sin_addr, 4);
+			call->addressed = 1;
+		} else if (address.sin6_family == AF_INET6) {
+			__builtin_memcpy(call->address, &address.sin6_addr, 16);
+			call->addressed = 1;
+		} else {
+			call->port = 0;
+		}
+	}
+	if (point->file_argument >= 0 && !bpf_get_func_arg(ctx, point->file_argument, &argument)) {
+		struct dentry *dentry = NULL;
+		const unsigned char *name = NULL;
+		if (!bpf_probe_read_kernel(&dentry, sizeof(dentry), &((struct file *)argument)->f_path.dentry) && dentry &&
+		    !bpf_probe_read_kernel(&name, sizeof(name), &dentry->d_name.name) && name)
+			bpf_probe_read_kernel_str(call->name, sizeof(call->name), name);
+	}
+}
+
+static __always_inline bool kernel_matches(const struct kernel_rule *rule, const struct kernel_call *call)
+{
+	if ((rule->conditions & CONDITION_PORT) && rule->port != call->port)
+		return false;
+	if ((rule->conditions & CONDITION_ADDRESS) && !call->addressed)
+		return false;
+	for (int i = 0; (rule->conditions & CONDITION_ADDRESS) && i < 16; i++)
+		if (rule->address[i] != call->address[i])
+			return false;
+	for (int i = 0; (rule->conditions & CONDITION_NAME) && i < NAME_LENGTH; i++) {
+		if (rule->name[i] != call->name[i])
+			return false;
+		if (!rule->name[i])
+			break;
+	}
+	return true;
+}
+
+/* Before a kernel function's body runs, a fail rule whose conditions the call meets returns its errno, so the body is
+ * skipped; a result an earlier fmod_ret program gave is kept. */
+SEC("fmod_ret")
+int inject_kernel(void *ctx)
+{
+	__u64 previous = 0;
+	bpf_get_func_ret(ctx, &previous);
+	__u32 index = bpf_get_attach_cookie(ctx);
+	struct kernel_point *point = bpf_map_lookup_elem(&kernel_points, &index);
+	__u32 *service = current_service();
+	if (!point || !service || *service != point->service || previous)
+		return previous;
+	struct kernel_rule_list *rules = bpf_map_lookup_elem(&kernel_rules, &index);
+	if (!rules)
+		return 0;
+	struct kernel_call call = {};
+	read_call(ctx, point, &call);
+	for (__u32 i = 0; i < MAX_POINT_RULES && i < rules->count; i++) {
+		struct kernel_rule *rule = &rules->rules[i];
+		if (!kernel_matches(rule, &call) || !fires(rule->rule))
+			continue;
+		struct kernel_flight flight = {.task = bpf_get_current_pid_tgid(), .point = index};
+		bpf_map_update_elem(&kernel_flights, &flight, &rule->rule, BPF_ANY);
+		return rule->error;
+	}
+	return 0;
+}
+
+/* After a kernel function returns, its result is counted, under the injecting rule when an fmod_ret program of the
+ * agent gave it, since fexit runs whether or not the body was skipped. */
+SEC("fexit")
+int observe_kernel(void *ctx)
+{
+	__u32 index = bpf_get_attach_cookie(ctx);
+	struct kernel_point *point = bpf_map_lookup_elem(&kernel_points, &index);
+	__u32 *service = current_service();
+	if (!point || !service || *service != point->service)
+		return 0;
+	__u64 result = 0;
+	bpf_get_func_ret(ctx, &result);
+	struct kernel_flight flight = {.task = bpf_get_current_pid_tgid(), .point = index};
+	__u32 *rule = bpf_map_lookup_elem(&kernel_flights, &flight);
+	struct native_key key = {.point = index, .rule = rule ? *rule + 1 : 0};
+	if (rule)
+		bpf_map_delete_elem(&kernel_flights, &flight);
+	__s64 value = (__s32)result;
+	key.flagged = value != 0;
+	if (key.flagged)
+		key.value = value;
+	increment(&kernel_outcomes, &key);
+	return 0;
 }

@@ -56,9 +56,9 @@ const (
 const (
 	uprobeSafety  = "an entry injection skips the function's body, so its out-parameters and side effects do not happen"
 	usdtSafety    = "attaching sets the probe's semaphore in every process mapping the file, which runs its argument code"
-	kernelSafety  = "the override skips the function's body; the agent serves no kernel call point yet"
+	kernelSafety  = "the override skips the function's body; the agent serves the kernel call points of security_ functions only"
 	fmodRetSafety = "fmod_ret skips the whole body, so no LSM runs and the operation does not happen, and every call " +
-		"on the host pays for the program; the agent serves no kernel call point yet"
+		"on the host pays for the programs, attached while the agent reports or a rule injects there"
 	syscallSafety = "the override returns before the syscall runs, for the service's cgroups only"
 )
 

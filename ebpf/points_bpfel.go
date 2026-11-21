@@ -28,6 +28,45 @@ const (
 	pointsErrorRuleZERO     pointsErrorRule = 2
 )
 
+type pointsKernelCondition uint32
+
+const (
+	pointsKernelConditionCONDITION_PORT    pointsKernelCondition = 1
+	pointsKernelConditionCONDITION_ADDRESS pointsKernelCondition = 2
+	pointsKernelConditionCONDITION_NAME    pointsKernelCondition = 4
+)
+
+type pointsKernelFlight struct {
+	_      structs.HostLayout
+	Task   uint64
+	Point  uint32
+	Unused uint32
+}
+
+type pointsKernelPoint struct {
+	_                structs.HostLayout
+	Service          uint32
+	SockaddrArgument int32
+	FileArgument     int32
+}
+
+type pointsKernelRule struct {
+	_          structs.HostLayout
+	Rule       uint32
+	Error      int32
+	Conditions pointsKernelCondition
+	Port       uint16
+	Address    [16]uint8
+	Name       [64]uint8
+	_          [2]byte
+}
+
+type pointsKernelRuleList struct {
+	_     structs.HostLayout
+	Count uint32
+	Rules [8]pointsKernelRule
+}
+
 type pointsNativeAction uint32
 
 const (
@@ -173,6 +212,10 @@ const (
 	pointsMapCgroupServices     = "cgroup_services"
 	pointsMapEventCounts        = "event_counts"
 	pointsMapEventServices      = "event_services"
+	pointsMapKernelFlights      = "kernel_flights"
+	pointsMapKernelOutcomes     = "kernel_outcomes"
+	pointsMapKernelPoints       = "kernel_points"
+	pointsMapKernelRules        = "kernel_rules"
 	pointsMapMarks              = "marks"
 	pointsMapNativeOutcomes     = "native_outcomes"
 	pointsMapNativeRules        = "native_rules"
@@ -182,9 +225,11 @@ const (
 	pointsMapSyscallRules       = "syscall_rules"
 	pointsMapTriggers           = "triggers"
 	pointsProgEnterNative       = "enter_native"
+	pointsProgInjectKernel      = "inject_kernel"
 	pointsProgInjectPacket      = "inject_packet"
 	pointsProgInjectSyscall     = "inject_syscall"
 	pointsProgLeaveNative       = "leave_native"
+	pointsProgObserveKernel     = "observe_kernel"
 	pointsProgObserveSyscalls   = "observe_syscalls"
 	pointsProgObserveTracepoint = "observe_tracepoint"
 	pointsProgObserveUsdt       = "observe_usdt"
@@ -236,9 +281,11 @@ type pointsSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type pointsProgramSpecs struct {
 	EnterNative       *ebpf.ProgramSpec `ebpf:"enter_native"`
+	InjectKernel      *ebpf.ProgramSpec `ebpf:"inject_kernel"`
 	InjectPacket      *ebpf.ProgramSpec `ebpf:"inject_packet"`
 	InjectSyscall     *ebpf.ProgramSpec `ebpf:"inject_syscall"`
 	LeaveNative       *ebpf.ProgramSpec `ebpf:"leave_native"`
+	ObserveKernel     *ebpf.ProgramSpec `ebpf:"observe_kernel"`
 	ObserveSyscalls   *ebpf.ProgramSpec `ebpf:"observe_syscalls"`
 	ObserveTracepoint *ebpf.ProgramSpec `ebpf:"observe_tracepoint"`
 	ObserveUsdt       *ebpf.ProgramSpec `ebpf:"observe_usdt"`
@@ -251,6 +298,10 @@ type pointsMapSpecs struct {
 	CgroupServices *ebpf.MapSpec `ebpf:"cgroup_services"`
 	EventCounts    *ebpf.MapSpec `ebpf:"event_counts"`
 	EventServices  *ebpf.MapSpec `ebpf:"event_services"`
+	KernelFlights  *ebpf.MapSpec `ebpf:"kernel_flights"`
+	KernelOutcomes *ebpf.MapSpec `ebpf:"kernel_outcomes"`
+	KernelPoints   *ebpf.MapSpec `ebpf:"kernel_points"`
+	KernelRules    *ebpf.MapSpec `ebpf:"kernel_rules"`
 	Marks          *ebpf.MapSpec `ebpf:"marks"`
 	NativeOutcomes *ebpf.MapSpec `ebpf:"native_outcomes"`
 	NativeRules    *ebpf.MapSpec `ebpf:"native_rules"`
@@ -293,6 +344,10 @@ type pointsMaps struct {
 	CgroupServices *ebpf.Map `ebpf:"cgroup_services"`
 	EventCounts    *ebpf.Map `ebpf:"event_counts"`
 	EventServices  *ebpf.Map `ebpf:"event_services"`
+	KernelFlights  *ebpf.Map `ebpf:"kernel_flights"`
+	KernelOutcomes *ebpf.Map `ebpf:"kernel_outcomes"`
+	KernelPoints   *ebpf.Map `ebpf:"kernel_points"`
+	KernelRules    *ebpf.Map `ebpf:"kernel_rules"`
 	Marks          *ebpf.Map `ebpf:"marks"`
 	NativeOutcomes *ebpf.Map `ebpf:"native_outcomes"`
 	NativeRules    *ebpf.Map `ebpf:"native_rules"`
@@ -308,6 +363,10 @@ func (m *pointsMaps) Close() error {
 		m.CgroupServices,
 		m.EventCounts,
 		m.EventServices,
+		m.KernelFlights,
+		m.KernelOutcomes,
+		m.KernelPoints,
+		m.KernelRules,
 		m.Marks,
 		m.NativeOutcomes,
 		m.NativeRules,
@@ -333,9 +392,11 @@ type pointsVariables struct {
 // It can be passed to loadPointsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type pointsPrograms struct {
 	EnterNative       *ebpf.Program `ebpf:"enter_native"`
+	InjectKernel      *ebpf.Program `ebpf:"inject_kernel"`
 	InjectPacket      *ebpf.Program `ebpf:"inject_packet"`
 	InjectSyscall     *ebpf.Program `ebpf:"inject_syscall"`
 	LeaveNative       *ebpf.Program `ebpf:"leave_native"`
+	ObserveKernel     *ebpf.Program `ebpf:"observe_kernel"`
 	ObserveSyscalls   *ebpf.Program `ebpf:"observe_syscalls"`
 	ObserveTracepoint *ebpf.Program `ebpf:"observe_tracepoint"`
 	ObserveUsdt       *ebpf.Program `ebpf:"observe_usdt"`
@@ -344,9 +405,11 @@ type pointsPrograms struct {
 func (p *pointsPrograms) Close() error {
 	return _PointsClose(
 		p.EnterNative,
+		p.InjectKernel,
 		p.InjectPacket,
 		p.InjectSyscall,
 		p.LeaveNative,
+		p.ObserveKernel,
 		p.ObserveSyscalls,
 		p.ObserveTracepoint,
 		p.ObserveUsdt,

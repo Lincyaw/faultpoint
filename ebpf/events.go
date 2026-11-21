@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 )
 
@@ -45,8 +46,19 @@ func (k *kernel) observeEvents(selected []selectedRecord) error {
 		}
 		k.events = append(k.events, eventPoint{id: record.ID, service: event.owner.name})
 		if record.Observe == mechanismTracepoint {
+			// A tracepoint holds a program once however many links attach it, so each event has its own program.
+			var observing struct {
+				Program *ebpf.Program `ebpf:"observe_tracepoint"`
+			}
+			err := k.spec.LoadAndAssign(&observing, &ebpf.CollectionOptions{MapReplacements: map[string]*ebpf.Map{
+				pointsMapCgroupServices: k.objects.CgroupServices, pointsMapEventServices: k.objects.EventServices,
+				pointsMapEventCounts: k.objects.EventCounts}})
+			if err != nil {
+				return fmt.Errorf("observing %s: %w", record.ID, err)
+			}
+			k.programs = append(k.programs, observing.Program)
 			group, name, _ := strings.Cut(record.Target.Symbol, ":")
-			attached, err := link.Tracepoint(group, name, k.objects.ObserveTracepoint,
+			attached, err := link.Tracepoint(group, name, observing.Program,
 				&link.TracepointOptions{Cookie: uint64(index)})
 			if err != nil {
 				return fmt.Errorf("observing %s: %w", record.ID, err)

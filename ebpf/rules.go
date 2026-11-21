@@ -107,18 +107,29 @@ type kernelRules struct {
 	packets    map[pointsPacketSide]*pointsPacketRuleList
 	delayed    map[pointsPacketSide]bool
 	natives    map[uint32]*pointsNativeRuleList
+	kernels    map[uint32]*pointsKernelRuleList
 }
 
-// translate keeps the syscall, packet and native function rules of the configured services and checks that the agent
-// can apply them; rules of other services and kinds, and call and check rules outside native functions, are left to
-// the processes that serve them.
-func translate(ruleset faultpoint.RuleSet, services []service, syscalls *syscallTable, points []nativePoint, seed int64) (*kernelRules, error) {
+// kernelCondition is when a kernel point's fail rule injects: at a call whose socket address has the port and the
+// address, or whose file has the base name; all given must hold.
+type kernelCondition struct {
+	Port    uint16 `json:"port"`
+	Address string `json:"address"`
+	Name    string `json:"name"`
+}
+
+// translate keeps the syscall, packet, native and kernel function rules of the configured services and checks that
+// the agent can apply them; rules of other services and kinds, and call and check rules outside native and kernel
+// functions, are left to the processes that serve them.
+func translate(ruleset faultpoint.RuleSet, services []service, syscalls *syscallTable, points []nativePoint,
+	kernels []kernelPoint, seed int64) (*kernelRules, error) {
 	translated := &kernelRules{
 		experiment: ruleset.Experiment,
 		syscalls:   map[pointsSyscallPoint]*pointsSyscallRuleList{},
 		packets:    map[pointsPacketSide]*pointsPacketRuleList{},
 		delayed:    map[pointsPacketSide]bool{},
 		natives:    map[uint32]*pointsNativeRuleList{},
+		kernels:    map[uint32]*pointsKernelRuleList{},
 	}
 	for _, rule := range ruleset.Rules {
 		name, kind, locator, err := faultpoint.SplitPoint(rule.Point)
@@ -127,12 +138,13 @@ func translate(ruleset faultpoint.RuleSet, services []service, syscalls *syscall
 		}
 		served := slices.IndexFunc(services, func(s service) bool { return s.name == name })
 		native := slices.IndexFunc(points, func(point nativePoint) bool { return point.id == rule.Point })
-		nativeKind := kind == kindCall || kind == kindCheck
-		if served < 0 || actions[kind] == nil || (nativeKind && native < 0 && !nativeLocator.MatchString(locator)) {
+		kernel := slices.IndexFunc(kernels, func(point kernelPoint) bool { return point.id == rule.Point })
+		unserved := (kind == kindCall || kind == kindCheck) && native < 0 && kernel < 0
+		if served < 0 || actions[kind] == nil || (unserved && !nativeLocator.MatchString(locator)) {
 			continue
 		}
-		if nativeKind && native < 0 {
-			return nil, fmt.Errorf("rule %s: no configured native function has point %s", rule.ID, rule.Point)
+		if unserved {
+			return nil, fmt.Errorf("rule %s: no configured native or kernel function has point %s", rule.ID, rule.Point)
 		}
 		if !slices.Contains(actions[kind], rule.Action.Kind) {
 			return nil, fmt.Errorf("rule %s: the agent implements %v at a %s point, not %s", rule.ID, actions[kind], kind, rule.Action.Kind)
@@ -147,6 +159,8 @@ func translate(ruleset faultpoint.RuleSet, services []service, syscalls *syscall
 			outcome, err = translated.addSyscall(rule, index, services[served].index, syscalls.number(locator))
 		case kind == kindPacket:
 			outcome, err = translated.addPacket(rule, index, services[served], locator)
+		case kernel >= 0:
+			err = translated.addKernel(rule, index, uint32(kernel), kernels[kernel])
 		default:
 			err = translated.addNative(rule, index, uint32(native), points[native])
 		}
@@ -303,6 +317,62 @@ func (translated *kernelRules) addNative(rule faultpoint.Rule, index, point uint
 	}
 	if int(list.Count) == len(list.Rules) {
 		return fmt.Errorf("a native point has at most %d rules", len(list.Rules))
+	}
+	list.Rules[list.Count] = entry
+	list.Count++
+	return nil
+}
+
+// addKernel adds a fail rule of a kernel point, with an errno legal there and the conditions of its when, each of which
+// needs the function to take the argument it reads.
+func (translated *kernelRules) addKernel(rule faultpoint.Rule, index, point uint32, function kernelPoint) error {
+	if rule.Action.Kind != actionFail {
+		return fmt.Errorf("%s only fails, with an errno", function.id)
+	}
+	var fail struct {
+		Error string          `json:"error"`
+		When  kernelCondition `json:"when"`
+	}
+	if err := decodeParams(rule.Action.Params, &fail); err != nil {
+		return err
+	}
+	value, legal := function.errors[fail.Error]
+	if !legal {
+		return fmt.Errorf("%s fails with one of the errnos legal for it, %v, not %q", function.id,
+			slices.Sorted(maps.Keys(function.errors)), fail.Error)
+	}
+	entry := pointsKernelRule{Rule: index, Error: value}
+	when, site := fail.When, function.site
+	switch {
+	case (when.Port != 0 || when.Address != "") && site.SockaddrArgument == noArgument:
+		return fmt.Errorf("%s takes no socket address for a port or an address to match", function.id)
+	case when.Name != "" && site.FileArgument == noArgument:
+		return fmt.Errorf("%s takes no file for a name to match", function.id)
+	case len(when.Name) >= len(entry.Name)-1 || strings.Contains(when.Name, "/"):
+		return fmt.Errorf("a name to match is a file's base name, shorter than %d bytes, so that a longer name the "+
+			"program cuts never matches it: %q", len(entry.Name)-1, when.Name)
+	}
+	if when.Port != 0 {
+		entry.Conditions, entry.Port = entry.Conditions|pointsKernelConditionCONDITION_PORT, when.Port
+	}
+	if when.Address != "" {
+		address, err := netip.ParseAddr(when.Address)
+		if err != nil {
+			return err
+		}
+		entry.Conditions, entry.Address = entry.Conditions|pointsKernelConditionCONDITION_ADDRESS, address.As16()
+	}
+	if when.Name != "" {
+		entry.Conditions |= pointsKernelConditionCONDITION_NAME
+		copy(entry.Name[:], when.Name)
+	}
+	list := translated.kernels[point]
+	if list == nil {
+		list = &pointsKernelRuleList{}
+		translated.kernels[point] = list
+	}
+	if int(list.Count) == len(list.Rules) {
+		return fmt.Errorf("a kernel point has at most %d rules", len(list.Rules))
 	}
 	list.Rules[list.Count] = entry
 	list.Count++
