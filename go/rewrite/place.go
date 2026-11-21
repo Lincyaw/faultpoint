@@ -9,6 +9,7 @@ import (
 	"go/printer"
 	"go/token"
 	"go/types"
+	"go/version"
 	"log"
 	"os"
 	"path"
@@ -25,6 +26,10 @@ import (
 const (
 	pointsPackage = "faultpoint/fppoints"
 	codeWidth     = 120
+	// genericsVersion is the first Go version with generics, which a call handed to fppoints.Call needs.
+	genericsVersion = "go1.18"
+	// undeclaredVersion is the Go version the go command compiles a module at whose go.mod has no go directive.
+	undeclaredVersion = "go1.16"
 )
 
 var errorType = types.Universe.Lookup("error").Type()
@@ -136,6 +141,7 @@ type function struct {
 type placer struct {
 	service   string
 	path      string
+	version   string
 	placement Placement
 	fset      *token.FileSet
 	info      *types.Info
@@ -147,8 +153,12 @@ type placer struct {
 
 // placePoints places the points of a file in its syntax tree and returns them.
 func placePoints(service, relative string, placement Placement, pkg *packages.Package, file *ast.File) []PointEntry {
-	p := &placer{service: service, path: relative, placement: placement, fset: pkg.Fset, info: pkg.TypesInfo,
-		anchors: map[ast.Node]string{}, ordinals: map[string]int{}}
+	p := &placer{service: service, path: relative, version: undeclaredVersion, placement: placement, fset: pkg.Fset,
+		info: pkg.TypesInfo, anchors: map[ast.Node]string{}, ordinals: map[string]int{}}
+	// go/packages type-checks a module without a go directive at the toolchain's version, not at the one it compiles at.
+	if pkg.Module.GoVersion != "" {
+		p.version = "go" + pkg.Module.GoVersion
+	}
 	astutil.Apply(file, p.pre, p.post)
 	return p.points
 }
@@ -388,10 +398,13 @@ func (p *placer) placeCondition(cursor *astutil.Cursor, node *ast.IfStmt) {
 }
 
 // producingCall is the call whose error an `err != nil` checks, in the if's init or in the statement just before
-// it, when the call can be handed to fppoints.Call: the assignment's only value is a call of a function or method
-// value named without side effects, which is no conversion, builtin or inferred generic instance, whose last result
-// is the error, and which the boundary wiring leaves alone. It is nil otherwise.
+// it, when the call can be handed to fppoints.Call: the module's Go version has generics, the assignment's only value
+// is a call of a function or method value named without side effects, which is no conversion, builtin or inferred
+// generic instance, whose last result is the error, and which the boundary wiring leaves alone. It is nil otherwise.
 func (p *placer) producingCall(cursor *astutil.Cursor, node *ast.IfStmt, variable *ast.Ident) *ast.CallExpr {
+	if version.Compare(p.version, genericsVersion) < 0 {
+		return nil
+	}
 	statement := node.Init
 	if statement == nil && cursor.Index() > 0 {
 		switch parent := cursor.Parent().(type) {
