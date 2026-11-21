@@ -180,8 +180,9 @@ func start() {
 	}
 }
 
-// install replaces the rule set; a rule of this service at a point a plugin serves must be within the limits
-// enforceLimits checks, and rules of other services or points are left to the processes that serve them.
+// install replaces the rule set; a rule of this service at a kind a plugin serves must name a point one of them
+// serves and be within the limits enforceLimits checks, and rules of other services or kinds are left to the
+// processes that serve them.
 func (c *core) install(data []byte) {
 	ruleset, err := ParseRuleSet(data)
 	if err != nil {
@@ -193,9 +194,12 @@ func (c *core) install(data []byte) {
 		injections: map[string]int{}, randoms: map[string]*rand.Rand{}}
 	for index := range ruleset.Rules {
 		rule := &ruleset.Rules[index]
-		service, _, _, _ := SplitPoint(rule.Point)
-		if service != c.settings.service || len(c.serving(rule.Point)) == 0 {
+		service, kind, _, _ := SplitPoint(rule.Point)
+		if service != c.settings.service || len(c.plugins[kind]) == 0 {
 			continue
+		}
+		if len(c.serving(rule.Point)) == 0 {
+			Abort("rule %s: no plugin of this process serves %s", rule.ID, rule.Point)
 		}
 		c.enforceLimits(rule)
 		next.byPoint[rule.Point] = append(next.byPoint[rule.Point], rule)
