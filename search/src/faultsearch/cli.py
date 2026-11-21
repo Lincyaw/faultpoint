@@ -176,10 +176,36 @@ def complete(experiment: Experiment) -> None:
                f"{len(completed.clusters)} clusters")
 
 
+@app.command("chains")
+def chains_command(experiment: Experiment,
+                   first: Annotated[str, typer.Option(help="The start of the first fault's key.")] = "",
+                   last: Annotated[str, typer.Option(help="The end of the last effect's key.")] = "",
+                   through: Annotated[list[str], typer.Option(help="Text the chain's key contains.")] = [],
+                   shown: Annotated[int, typer.Option(help="The most chains shown.")] = 20) -> None:
+    """The ranked chains of the phased stitching from a first fault to a last effect, with their rank among all
+    chains and, for a stitched-only chain across layers ending in a failure the user sees, among those, which is
+    exact within the chains the stitching kept in full."""
+    stitching = Store(experiment).load(Stitching, chains_file(Strategy.PHASED))
+    kept = {chain.key: chain for chain in (*stitching.top, *stitching.top_cross_layer)}
+    across = [key for key in stitching.keys
+              if key in kept and kept[key].stitched_only and kept[key].crosses_layers and kept[key].terminal]
+    found = [(rank, key) for rank, key in enumerate(stitching.keys, 1)
+             if key.startswith(f"[{first}") and key.endswith(last) and all(text in key for text in through)]
+    typer.echo(f"{len(found)} of {len(stitching.keys)} chains match; {len(stitching.top)} kept in full by rank")
+    for rank, key in found[:shown]:
+        chain = kept.get(key)
+        place = ("not kept" if chain is None else f"cross-layer stitched-only {across.index(key) + 1}"
+                 if key in across else "stitched only" if chain.stitched_only
+                 else f"shown end to end in {', '.join(chain.end_to_end)}")
+        typer.echo(f"#{rank} ({place}) condition {kept[key].condition if chain else '-'}: {key}")
+
+
 @app.command("validate")
 def validate_command(experiment: Experiment,
                      stitched_only: Annotated[int, typer.Option(help="Best chains that exist only by stitching.")] = 10,
                      single_scenario: Annotated[int, typer.Option(help="Best chains one scenario showed.")] = 3,
+                     single_scenario_cross_layer: Annotated[int, typer.Option(
+                         help="Best chains across layers one scenario showed.")] = 0,
                      cross_layer: Annotated[int, typer.Option(
                          help="Best stitched-only chains across layers, besides those chosen already.")] = 0,
                      per_pair: Annotated[int, typer.Option(
@@ -195,7 +221,8 @@ def validate_command(experiment: Experiment,
         if store.has(VALIDATIONS) else []
     runner = recorded_runner(store)
     validations = validate(runner,
-                           selected(stitching, stitched_only, single_scenario, cross_layer, per_pair, chain, validated),
+                           selected(stitching, stitched_only, single_scenario, single_scenario_cross_layer, cross_layer,
+                                    per_pair, chain, validated),
                            recorded_scenarios(store, runner.system), stitching.min_count_increase)
     store.save(validations, VALIDATIONS)
     feedback = store.load(MappingFeedback, MAPPING_FEEDBACK) if store.has(MAPPING_FEEDBACK) \

@@ -18,6 +18,8 @@ class Selection(StrEnum):
     SINGLE_SCENARIO = "ranked-single-scenario"
     CROSS_LAYER = "ranked-cross-layer"
     """Stitched only, with hops in more than one layer, ending in a failure the user sees."""
+    SINGLE_SCENARIO_CROSS_LAYER = "ranked-single-scenario-cross-layer"
+    """Shown end to end by one scenario, with hops in more than one layer, ending in a failure the user sees."""
     NAMED = "named"
     """Asked for by its key, outside the ranking."""
 
@@ -119,18 +121,22 @@ def capped(chains: list[Chain], count: int, per_pair: int) -> list[Chain]:
     return picks
 
 
-def selected(stitching: Stitching, stitched_only: int, single_scenario: int, cross_layer: int, per_pair: int,
-             named: list[str], validated: list[Chain]) -> list[tuple[Chain, Selection]]:
-    """The best ranked chains that exist only by stitching, a few that one scenario showed end to end, the best
-    stitched-only chains across layers not chosen already, at most per_pair of them alike, and the chains named by
-    their keys, which may also be chains validated before."""
+def selected(stitching: Stitching, stitched_only: int, single_scenario: int, single_scenario_cross_layer: int,
+             cross_layer: int, per_pair: int, named: list[str],
+             validated: list[Chain]) -> list[tuple[Chain, Selection]]:
+    """The best ranked chains that exist only by stitching, a few that one scenario showed end to end, of any layers
+    and across layers, the best stitched-only chains across layers not chosen already, at most per_pair of them alike,
+    and the chains named by their keys, which may also be chains validated before."""
     by_key = {chain.key: chain for chain in (*validated, *stitching.top, *stitching.top_cross_layer)}
     ranked = [chain for chain in stitching.top if chain.stitched_only][:stitched_only]
     chosen = {chain.key for chain in ranked}
     across = capped([chain for chain in stitching.top_cross_layer if chain.stitched_only and chain.key not in chosen],
                     cross_layer, per_pair)
     return ([(chain, Selection.STITCHED_ONLY) for chain in ranked]
-            + [(chain, Selection.SINGLE_SCENARIO) for chain in stitching.top if not chain.stitched_only][:single_scenario]
+            + [(chain, Selection.SINGLE_SCENARIO) for chain in stitching.top
+               if not chain.stitched_only][:single_scenario]
+            + [(chain, Selection.SINGLE_SCENARIO_CROSS_LAYER) for chain in stitching.top_cross_layer
+               if not chain.stitched_only][:single_scenario_cross_layer]
             + [(chain, Selection.CROSS_LAYER) for chain in across]
             + [(by_key[key], Selection.NAMED) for key in named])
 
