@@ -4,7 +4,8 @@
       "type": "object",
       "properties": {
         "error": {"type": "string", "minLength": 1},
-        "status": {"type": "integer", "minimum": 100, "maximum": 599}
+        "status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "code": {"type": "string", "minLength": 1}
       },
       "additionalProperties": false
     },
@@ -12,7 +13,8 @@
       "type": "object",
       "properties": {
         "error": {"type": "string", "minLength": 1},
-        "status": {"type": "integer", "minimum": 100, "maximum": 599}
+        "status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "code": {"type": "string", "minLength": 1}
       },
       "additionalProperties": false
     },
@@ -70,24 +72,28 @@
       "actions": ["fail", "empty", "delay", "crash"],
       "outcomes": ["rows", "empty", "error"],
       "errors": ["timeout", "refused"],
+      "code": true,
       "details": ["error", "code"]
     },
     "store_write": {
       "actions": ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
       "outcomes": ["ok", "error"],
       "errors": ["timeout", "refused"],
+      "code": true,
       "details": ["error", "code"]
     },
     "publish": {
       "actions": ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
       "outcomes": ["ok", "error"],
       "errors": ["timeout", "refused"],
+      "code": true,
       "details": ["error", "code"]
     },
     "consume": {
       "actions": ["fail", "fail_after", "duplicate", "empty", "delay", "crash"],
       "outcomes": ["rows", "empty", "error"],
       "errors": ["timeout", "refused"],
+      "code": true,
       "details": ["error", "code"]
     },
     "syscall": {
