@@ -91,7 +91,7 @@ class EffectKey(BaseModel):
 
     @classmethod
     def of(cls, effect: Effect) -> Self:
-        return cls(point=effect.point, outcome=effect.outcome, metric=effect.metric)
+        return cls(point=effect.point, outcome=effect.outcome, metric=effect.metric, detail=effect.detail)
 
 
 class Group(BaseModel):
