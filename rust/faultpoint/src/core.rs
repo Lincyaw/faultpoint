@@ -165,9 +165,16 @@ impl Core {
 
     /// The first rule of a point whose scope matches the current request and whose trigger fires.
     pub fn decide(&self, point: &str) -> Option<Rule> {
+        self.decide_among(point, |_| true)
+    }
+
+    /// The first rule of a point among the rules of the given actions whose scope matches the current request and
+    /// whose trigger fires. Only those rules are counted, so that a point deciding before and after its operation
+    /// counts a rule only where it can act.
+    pub fn decide_among(&self, point: &str, actions: fn(&str) -> bool) -> Option<Rule> {
         let state = self.state.read().unwrap().clone();
         for rule in state.rules.get(point)? {
-            if !rule.scope.iter().all(|(key, value)| self.baggage(key).as_deref() == Some(value.as_str())) {
+            if !actions(&rule.action.kind) || !rule.scope.iter().all(|(key, value)| self.baggage(key).as_deref() == Some(value.as_str())) {
                 continue;
             }
             let mut counters = self.counters.lock().unwrap();

@@ -173,13 +173,14 @@ pub enum Before {
     Run(Option<Rule>),
 }
 
-/// Decide the rule of a call point before its call, so that delay and crash act before the call runs.
+/// Decide the rule of a call point before its call, so that delay and crash act before the call runs; a fail_after
+/// rule is left to after_call.
 pub fn before_call(point: &str) -> Before {
     let core = core();
     if !core.enabled {
         return Before::Run(None);
     }
-    let rule = core.decide(point);
+    let rule = core.decide_among(point, |action| action != "fail_after");
     if let Some(rule) = &rule {
         hold(rule);
     }
@@ -189,16 +190,21 @@ pub fn before_call(point: &str) -> Before {
     }
 }
 
-/// Observe the result of a call under the rule decided before it; under a fail_after rule the call has run and
-/// its result is replaced by the injected error.
+/// Observe the result of a call; a call that succeeded has its result replaced by the injected error when a
+/// fail_after rule fires now, and any other result is observed under the rule decided before the call.
 pub fn after_call<T, E: From<Injected>>(point: &str, rule: Option<Rule>, result: Result<T, E>) -> Result<T, E> {
     let core = core();
     if !core.enabled {
         return result;
     }
-    let result = match &rule {
-        Some(rule) if rule.action.kind == "fail_after" => Err(Injected { point: point.into() }.into()),
-        _ => result,
+    // A fail_after rule acts only on a call that succeeded, so it is decided and counted only then; a call's own
+    // error stays, under the rule decided before the call.
+    let (rule, result) = match result {
+        Ok(value) => match core.decide_among(point, |action| action == "fail_after") {
+            Some(replacing) => (Some(replacing), Err(Injected { point: point.into() }.into())),
+            None => (rule, Ok(value)),
+        },
+        Err(error) => (rule, Err(error)),
     };
     match &result {
         Ok(_) => core.observe(point, "ok", 0.0, rule.as_ref(), Detail::new()),
