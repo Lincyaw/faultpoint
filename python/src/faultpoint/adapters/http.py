@@ -57,6 +57,12 @@ def path_template(path: str, identifier: re.Pattern[str]) -> str:
     return "/".join("{}" if identifier.match(segment) else segment for segment in path.split("/"))
 
 
+def read_timeout(request: Any) -> float | None:
+    """The seconds the client waits for a response before it times out, from the timeout its client put on the
+    request; none when the request has no read timeout."""
+    return request.extensions.get("timeout", {}).get("read")
+
+
 def status_outcome(status: int) -> str:
     return f"{status // 100}xx"
 
@@ -308,16 +314,31 @@ class ClientPoint:
         self.observe(point, started, decision, response)
         return response
 
+    def wait(self, request: Any, ms: int) -> None:
+        """Wait as a peer that slow makes the client wait: no longer than the request's read timeout, at which the
+        client times out."""
+        timeout = read_timeout(request)
+        time.sleep(ms / 1000 if timeout is None else min(ms / 1000, timeout))
+        if timeout is not None and ms / 1000 > timeout:
+            raise self.library.ReadTimeout("timed out", request=request)
+
+    async def wait_async(self, request: Any, ms: int) -> None:
+        """Wait as a peer that slow makes the client wait, as wait does, ending early when the caller cancels."""
+        timeout = read_timeout(request)
+        await asyncio.sleep(ms / 1000 if timeout is None else min(ms / 1000, timeout))
+        if timeout is not None and ms / 1000 > timeout:
+            raise self.library.ReadTimeout("timed out", request=request)
+
     def exchange(self, send: Callable[[Any], Any], request: Any, decision: Decision | None) -> Any:
         match decision:
             case Decision(action=Delay(ms=ms)):
-                time.sleep(ms / 1000)
+                self.wait(request, ms)
                 return send(request)
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
             case Decision(action=BoundaryFail(ms=ms) as failure):
                 if ms is not None:
-                    time.sleep(ms / 1000)
+                    self.wait(request, ms)
                 return self.failed(failure, request)
             case Decision(action=Duplicate()):
                 request.read()
@@ -347,13 +368,13 @@ class ClientPoint:
                              decision: Decision | None) -> Any:
         match decision:
             case Decision(action=Delay(ms=ms)):
-                await asyncio.sleep(ms / 1000)
+                await self.wait_async(request, ms)
                 return await send(request)
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
             case Decision(action=BoundaryFail(ms=ms) as failure):
                 if ms is not None:
-                    await asyncio.sleep(ms / 1000)
+                    await self.wait_async(request, ms)
                 return self.failed(failure, request)
             case Decision(action=Duplicate()):
                 await request.aread()

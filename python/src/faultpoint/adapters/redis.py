@@ -268,8 +268,20 @@ class CommandPoints:
                     self.runtime.crash(code)
         return delay_seconds(decisions)
 
-    def fail_unsent(self, decisions: list[Decided | None], started: float) -> None:
-        """Fail before anything is sent, once the wait is over, when a rule fails one of the commands."""
+    def waited(self, client: Any, delay: float) -> float:
+        """The seconds to wait before sending: the delay, no longer than the client's socket timeout, at which a
+        client of a server that slow times out."""
+        with self.runtime.own:
+            timeout = client.connection_pool.connection_kwargs.get("socket_timeout")
+            return delay if timeout is None else min(delay, timeout)
+
+    def fail_unsent(self, decisions: list[Decided | None], started: float, delay: float, waited: float) -> None:
+        """Fail before anything is sent, once the wait is over: as the client times out when its socket timeout
+        cut the wait short, or as a rule fails one of the commands."""
+        if waited < delay:
+            timed_out = self.exceptions.TimeoutError("Timeout reading from socket")
+            self.failed(decisions, timed_out, started)
+            raise timed_out
         for decided in decisions:
             match decided:
                 case Decided(decision=Decision(action=StoreFail()) as decision):
@@ -357,9 +369,10 @@ class CommandPoints:
         started = time.monotonic()
         decisions = [self.decide(args)]
         delay = self.prepare(decisions)
-        if delay:
-            time.sleep(delay)
-        self.fail_unsent(decisions, started)
+        waited = self.waited(client, delay)
+        if waited:
+            time.sleep(waited)
+        self.fail_unsent(decisions, started, delay, waited)
         try:
             replies = [execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
         except Exception as error:
@@ -373,9 +386,10 @@ class CommandPoints:
         stack: list[Queued] = list(pipeline.command_stack)
         decisions = [self.decide(queued_args) for queued_args, _ in stack]
         delay = self.prepare(decisions)
-        if delay:
-            time.sleep(delay)
-        self.fail_unsent(decisions, started)
+        waited = self.waited(pipeline, delay)
+        if waited:
+            time.sleep(waited)
+        self.fail_unsent(decisions, started, delay, waited)
         pipeline.command_stack[:] = [queued for queued, decided in zip(stack, decisions, strict=True)
                                      for _ in range(copies(decided))]
         try:
@@ -390,9 +404,10 @@ class CommandPoints:
         started = time.monotonic()
         decisions = [self.decide(args)]
         delay = self.prepare(decisions)
-        if delay:
-            await asyncio.sleep(delay)
-        self.fail_unsent(decisions, started)
+        waited = self.waited(client, delay)
+        if waited:
+            await asyncio.sleep(waited)
+        self.fail_unsent(decisions, started, delay, waited)
         try:
             replies = [await execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
         except Exception as error:
@@ -406,9 +421,10 @@ class CommandPoints:
         stack: list[Queued] = list(pipeline.command_stack)
         decisions = [self.decide(queued_args) for queued_args, _ in stack]
         delay = self.prepare(decisions)
-        if delay:
-            await asyncio.sleep(delay)
-        self.fail_unsent(decisions, started)
+        waited = self.waited(pipeline, delay)
+        if waited:
+            await asyncio.sleep(waited)
+        self.fail_unsent(decisions, started, delay, waited)
         pipeline.command_stack[:] = [queued for queued, decided in zip(stack, decisions, strict=True)
                                      for _ in range(copies(decided))]
         try:
