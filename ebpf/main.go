@@ -34,8 +34,18 @@ type agent struct {
 	injected   []uint64
 }
 
-// main ends through the core's Abort or Crash, whose registered cleanup detaches what the agent attached.
+// main ends through the core's Abort or Crash, whose registered cleanup detaches what the agent attached; with scan, it
+// only writes the hook catalog of the configured services.
 func main() {
+	if len(os.Args) > 1 {
+		if len(os.Args) != 3 || os.Args[1] != scanCommand {
+			faultpoint.Abort("the agent takes no arguments, or %s and the directory to write the catalog to", scanCommand)
+		}
+		if err := scan(os.Args[2]); err != nil {
+			faultpoint.Abort("%v", err)
+		}
+		return
+	}
 	rules, report := os.Getenv(environmentPrefix+"RULES"), os.Getenv(environmentPrefix+"REPORT")
 	if rules == "" && report == "" {
 		faultpoint.Abort("neither FAULTPOINT_RULES nor FAULTPOINT_REPORT is set, so the agent has nothing to do")

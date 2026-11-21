@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,6 +30,9 @@ const (
 	outcomeFalse   = "false"
 	buildIDSection = ".note.gnu.build-id"
 	buildIDDigits  = 12
+	gnuNoteName    = "GNU\x00"
+	// gnuBuildIDType is NT_GNU_BUILD_ID, a note type debug/elf does not name.
+	gnuBuildIDType = 3
 	detailValue    = "value"
 	// cloneSuffix is what GCC appends to the name of a copy of a function it specializes, splits or moves out of line.
 	cloneSuffix = `(\.(constprop|isra|part|cold)(\.\d+)?)+$`
@@ -279,7 +283,7 @@ func (function functionOptions) validate() error {
 	return nil
 }
 
-// buildID reads the GNU build-id note, whose layout debug/elf does not read.
+// buildID reads the GNU build-id note of a file.
 func buildID(file *elf.File) (string, error) {
 	section := file.Section(buildIDSection)
 	if section == nil {
@@ -289,20 +293,35 @@ func buildID(file *elf.File) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var header struct{ NameSize, DescriptionSize, Type uint32 }
-	if err := binary.Read(bytes.NewReader(data), file.ByteOrder, &header); err != nil {
-		return "", err
-	}
-	start := uint64(binary.Size(header)) + uint64(header.NameSize+3)&^3
-	end := start + uint64(header.DescriptionSize)
-	if header.DescriptionSize < buildIDDigits/2 || end > uint64(len(data)) {
-		return "", fmt.Errorf("the file's %s holds no build-id of %d hex digits", buildIDSection, buildIDDigits)
-	}
-	return hex.EncodeToString(data[start:end]), nil
+	return gnuBuildID(data, file.ByteOrder)
 }
 
-// symbolTable maps the names of a file's symbols, static and dynamic, to their first definition; a stripped file has
-// only dynamic ones.
+// gnuBuildID finds the GNU build-id among ELF notes, whose layout debug/elf does not read: a header of name size,
+// description size and type, then the name and the description, each padded to four bytes.
+func gnuBuildID(notes []byte, order binary.ByteOrder) (string, error) {
+	var header struct{ NameSize, DescriptionSize, Type uint32 }
+	for reader := bytes.NewReader(notes); reader.Len() > 0; {
+		if err := binary.Read(reader, order, &header); err != nil {
+			return "", err
+		}
+		name := make([]byte, (header.NameSize+3)&^3)
+		description := make([]byte, (header.DescriptionSize+3)&^3)
+		if _, err := io.ReadFull(reader, name); err != nil {
+			return "", err
+		}
+		if _, err := io.ReadFull(reader, description); err != nil {
+			return "", err
+		}
+		if header.Type == gnuBuildIDType && string(name[:header.NameSize]) == gnuNoteName &&
+			header.DescriptionSize >= buildIDDigits/2 {
+			return hex.EncodeToString(description[:header.DescriptionSize]), nil
+		}
+	}
+	return "", fmt.Errorf("the notes hold no GNU build-id of %d hex digits", buildIDDigits)
+}
+
+// symbolTable maps the names of a file's defined symbols, static and dynamic, to their definitions as symbolNames names
+// them; a stripped file has only dynamic ones.
 func symbolTable(file *elf.File) (map[string]elf.Symbol, error) {
 	static, err := file.Symbols()
 	if err != nil && !errors.Is(err, elf.ErrNoSymbols) {
@@ -312,13 +331,37 @@ func symbolTable(file *elf.File) (map[string]elf.Symbol, error) {
 	if err != nil && !errors.Is(err, elf.ErrNoSymbols) {
 		return nil, err
 	}
-	table := map[string]elf.Symbol{}
-	for _, symbol := range append(static, dynamic...) {
-		if _, seen := table[symbol.Name]; !seen && symbol.Value != 0 {
-			table[symbol.Name] = symbol
+	return symbolNames(slices.DeleteFunc(append(static, dynamic...), func(symbol elf.Symbol) bool {
+		return symbol.Value == 0 || symbol.Section == elf.SHN_UNDEF
+	})), nil
+}
+
+// symbolNames gives every definition among a file's symbols a name of its own: a version that is not the default one,
+// such as glibc's realpath@GLIBC_2.2.5, follows the name after @, and when definitions at several addresses share a
+// name, the global one keeps it and the local ones are qualified with their address after #, as dictFind#207360 is
+// the copy of hiredis in redis-server.
+func symbolNames(symbols []elf.Symbol) map[string]elf.Symbol {
+	definitions := map[string][]elf.Symbol{}
+	for _, symbol := range symbols {
+		name := symbol.Name
+		if symbol.HasVersion && symbol.VersionIndex.IsHidden() && symbol.Version != "" {
+			name += "@" + symbol.Version
+		}
+		if !slices.ContainsFunc(definitions[name], func(known elf.Symbol) bool { return known.Value == symbol.Value }) {
+			definitions[name] = append(definitions[name], symbol)
 		}
 	}
-	return table, nil
+	named := map[string]elf.Symbol{}
+	for name, defined := range definitions {
+		for _, symbol := range defined {
+			if len(defined) > 1 && elf.ST_BIND(symbol.Info) == elf.STB_LOCAL {
+				named[fmt.Sprintf("%s#%x", name, symbol.Value)] = symbol
+				continue
+			}
+			named[name] = symbol
+		}
+	}
+	return named
 }
 
 // functionSites finds a function and its compiler clones in a file: the entry of each that is called, which a clone
@@ -354,14 +397,14 @@ func functionSites(file *elf.File, symbols map[string]elf.Symbol, function funct
 		default:
 			found = append(found, foundSite{symbol: name, address: symbol.Value, entry: true, predicate: function.Predicate})
 		}
-		offsets, err := returnOffsets(code)
+		exits, err := decodeExits(code)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
-		for _, offset := range offsets {
+		for _, offset := range exits.returns {
 			found = append(found, foundSite{symbol: name, address: symbol.Value + offset})
 		}
-		returns += len(offsets)
+		returns += len(exits.returns)
 	}
 	for name := range function.Clones {
 		if !slices.Contains(names[1:], name) {
@@ -391,9 +434,24 @@ func functionCode(file *elf.File, symbol elf.Symbol) ([]byte, error) {
 	return nil, fmt.Errorf("the bytes of %s, %d at %#x, are in no executable section", symbol.Name, symbol.Size, symbol.Value)
 }
 
-// returnOffsets decodes a function and returns the offsets of its ret instructions.
-func returnOffsets(code []byte) ([]uint64, error) {
-	var offsets []uint64
+// codeExits are what a function's decoded code says of how it ends: the offsets of its ret instructions, the direct
+// jumps out of it, which are tail calls whose results no ret probe sees, and its indirect jumps, which may be tail
+// calls or jump tables; its conditional branches are the sites a forced branch could use.
+type codeExits struct {
+	returns      []uint64
+	tailCalls    int
+	indirect     int
+	conditionals int
+}
+
+// conditionalJumps are the x86 instructions that branch on a condition.
+var conditionalJumps = []x86asm.Op{x86asm.JA, x86asm.JAE, x86asm.JB, x86asm.JBE, x86asm.JCXZ, x86asm.JE, x86asm.JECXZ,
+	x86asm.JG, x86asm.JGE, x86asm.JL, x86asm.JLE, x86asm.JNE, x86asm.JNO, x86asm.JNP, x86asm.JNS, x86asm.JO, x86asm.JP,
+	x86asm.JRCXZ, x86asm.JS}
+
+// decodeExits decodes a function's code.
+func decodeExits(code []byte) (codeExits, error) {
+	var exits codeExits
 	for offset := 0; offset < len(code); {
 		if bytes.HasPrefix(code[offset:], endbr64) {
 			offset += len(endbr64)
@@ -401,14 +459,23 @@ func returnOffsets(code []byte) ([]uint64, error) {
 		}
 		instruction, err := x86asm.Decode(code[offset:], 64)
 		if err != nil {
-			return nil, fmt.Errorf("cannot decode the instruction at offset %d: %w", offset, err)
+			return exits, fmt.Errorf("cannot decode the instruction at offset %d: %w", offset, err)
 		}
-		if instruction.Op == x86asm.RET {
-			offsets = append(offsets, uint64(offset))
+		relative, direct := instruction.Args[0].(x86asm.Rel)
+		destination := offset + instruction.Len + int(relative)
+		switch {
+		case instruction.Op == x86asm.RET:
+			exits.returns = append(exits.returns, uint64(offset))
+		case instruction.Op == x86asm.JMP && !direct:
+			exits.indirect++
+		case instruction.Op == x86asm.JMP && (destination < 0 || destination >= len(code)):
+			exits.tailCalls++
+		case slices.Contains(conditionalJumps, instruction.Op):
+			exits.conditionals++
 		}
 		offset += instruction.Len
 	}
-	return offsets, nil
+	return exits, nil
 }
 
 // fileOffset converts the link-time address of an instruction into its offset in the file, where a uprobe is set.

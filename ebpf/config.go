@@ -15,12 +15,13 @@ const (
 	jsonlOptionsName = "jsonl"
 )
 
-// agentOptions are given under "ebpf" in the file FAULTPOINT_CONFIG names; syscalls are those observed, and functions
-// the native functions of the services' containers that carry points.
+// agentOptions are given under "ebpf" in the file FAULTPOINT_CONFIG names; syscalls are those observed, functions the
+// native functions of the services' containers that carry points, and hooks the records a scan selects per service.
 type agentOptions struct {
 	Services  map[string]serviceOptions `json:"services"`
 	Syscalls  []string                  `json:"syscalls"`
 	Functions []functionOptions         `json:"functions"`
+	Hooks     map[string]hookOptions    `json:"hooks"`
 }
 
 // serviceOptions say where a service runs: the cgroups of its processes and the devices that carry its packets.
