@@ -61,17 +61,31 @@ type statement struct {
 	action  string
 }
 
-// decide classifies a statement, decides its rule and performs the rule's delay or crash.
+// decide classifies a statement, decides its rule that acts before it runs and performs the rule's delay or crash.
 func decide(ctx context.Context, query string) statement {
 	known := classifier.Classify(query)
 	s := statement{ctx: ctx, inner: context.WithValue(ctx, ownerKey{}, true), kind: known.Kind, command: known.Command,
 		point: faultpoint.PointID(faultpoint.Service(), known.Kind, known.Locator)}
-	s.rule = faultpoint.Decide(ctx, s.point)
+	s.rule = faultpoint.Decide(ctx, s.point, action.Before...)
 	if s.rule != nil {
 		action.Hold(s.rule)
 		s.action = s.rule.Action.Kind
 	}
 	return s
+}
+
+// failAfter decides, once the statement completed normally and no rule acted on it before, whether a fail_after
+// rule replaces its result, and returns the error that rule gives, nil without one.
+func (s *statement) failAfter() error {
+	if s.rule != nil {
+		return nil
+	}
+	s.rule = faultpoint.Decide(s.ctx, s.point, "fail_after")
+	if s.rule == nil {
+		return nil
+	}
+	s.action = s.rule.Action.Kind
+	return action.Failure(s.rule, postgresError)
 }
 
 // refuse ends the process for an action this call cannot perform, such as dropping a statement whose rows the
@@ -125,8 +139,11 @@ func Exec(db execer, ctx context.Context, sql string, arguments ...any) (pgconn.
 	if err == nil && s.action == "duplicate" {
 		tag, err = run()
 	}
-	if err == nil && s.action == "fail_after" {
-		tag, err = pgconn.CommandTag{}, action.Failure(s.rule, postgresError)
+	if err == nil {
+		err = s.failAfter()
+	}
+	if err != nil && s.action == "fail_after" {
+		tag = pgconn.CommandTag{}
 	}
 	if err == nil && s.action == "empty" {
 		tag = pgconn.NewCommandTag(s.command + " 0")
@@ -152,16 +169,12 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 		return failedRows{err: err}, err
 	}
 	rows, err := db.Query(s.inner, sql, arguments...)
-	if err == nil && (s.action == "duplicate" || s.action == "fail_after") {
+	if err == nil && s.action == "duplicate" {
 		rows.Close()
 		err = rows.Err()
 	}
 	if err == nil && s.action == "duplicate" {
 		rows, err = db.Query(s.inner, sql, arguments...)
-	}
-	if err == nil && s.action == "fail_after" {
-		err = action.Failure(s.rule, postgresError)
-		rows = failedRows{err: err}
 	}
 	if err != nil {
 		s.observe(0, err)
@@ -170,13 +183,24 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 	return &observedRows{Rows: rows, statement: s, empty: s.action == "empty"}, nil
 }
 
-// observedRows counts the rows a caller reads and observes the outcome once, when the rows end or are closed.
+// observedRows counts the rows a caller reads and observes the outcome once, when the rows end or are closed; err is
+// the error a fail_after rule gave once the rows ended normally, as a statement that wrote and returned rows before
+// failing would.
 type observedRows struct {
 	pgx.Rows
 	statement statement
 	empty     bool
 	read      int64
 	done      bool
+	err       error
+}
+
+// Err is the error of the rows: a fail_after rule's, or pgx's.
+func (r *observedRows) Err() error {
+	if r.err != nil {
+		return r.err
+	}
+	return r.Rows.Err()
 }
 
 func (r *observedRows) Next() bool {
@@ -200,11 +224,14 @@ func (r *observedRows) finish() {
 	}
 	r.done = true
 	r.Rows.Close()
+	if r.Rows.Err() == nil {
+		r.err = r.statement.failAfter()
+	}
 	rows := r.read
 	if r.statement.kind == "store_write" {
 		rows = r.Rows.CommandTag().RowsAffected()
 	}
-	r.statement.observe(rows, r.Rows.Err())
+	r.statement.observe(rows, r.Err())
 }
 
 type rowQuerier interface {
@@ -243,8 +270,8 @@ func (r *observedRow) Scan(dest ...any) error {
 	if err == nil && s.action == "duplicate" {
 		err = r.query().Scan(dest...)
 	}
-	if err == nil && s.action == "fail_after" {
-		err = action.Failure(s.rule, postgresError)
+	if err == nil {
+		err = s.failAfter()
 	}
 	if err == nil && s.action == "empty" {
 		err = pgx.ErrNoRows
@@ -283,14 +310,11 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 	} else {
 		results = db.SendBatch(s.inner, batch)
 	}
-	if err == nil && (s.action == "duplicate" || s.action == "fail_after") {
+	if err == nil && s.action == "duplicate" {
 		err = results.Close()
 	}
 	if err == nil && s.action == "duplicate" {
 		results = db.SendBatch(s.inner, batch)
-	}
-	if err == nil && s.action == "fail_after" {
-		err = action.Failure(s.rule, postgresError)
 	}
 	if err != nil {
 		s.observe(0, err)
@@ -299,16 +323,27 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 	return &observedResults{BatchResults: results, statement: s, queued: int64(len(batch.QueuedQueries))}
 }
 
+// observedResults observe a batch once, when its results are closed, where a fail_after rule gives its error once
+// the batch completed normally; every later Close returns the same error, as pgx's does.
 type observedResults struct {
 	pgx.BatchResults
 	statement statement
 	queued    int64
+	closed    bool
+	err       error
 }
 
 func (r *observedResults) Close() error {
-	err := r.BatchResults.Close()
-	r.statement.observe(r.queued, err)
-	return err
+	if r.closed {
+		return r.err
+	}
+	r.closed = true
+	r.err = r.BatchResults.Close()
+	if r.err == nil {
+		r.err = r.statement.failAfter()
+	}
+	r.statement.observe(r.queued, r.err)
+	return r.err
 }
 
 type beginner interface {
@@ -338,13 +373,16 @@ func BeginTx(db optionsBeginner, ctx context.Context, options pgx.TxOptions) (pg
 // begin starts a transaction unless a fail rule refuses it; nothing else can be injected where no statement runs.
 func begin(ctx context.Context, run func(context.Context) (pgx.Tx, error)) (pgx.Tx, error) {
 	s := decide(ctx, "BEGIN")
-	s.refuse("Begin", "drop", "duplicate", "fail_after")
+	s.refuse("Begin", "drop", "duplicate")
 	var tx pgx.Tx
 	var err error
 	if s.action == "fail" {
 		err = action.Failure(s.rule, postgresError)
 	} else {
 		tx, err = run(s.inner)
+	}
+	if err == nil && s.failAfter() != nil {
+		s.refuse("Begin", "fail_after")
 	}
 	s.observe(0, err)
 	return tx, err

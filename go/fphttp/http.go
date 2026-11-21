@@ -226,8 +226,9 @@ func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, erro
 	return nil, action.PeerError(rule, params.Error)
 }
 
-// RoundTrip sends a request under the rule of its point; a failure's detail tells whether the request was written
-// completely, that is whether the peer may have acted on it.
+// RoundTrip sends a request under the rule of its point, a fail_after rule replacing only a response the peer gave;
+// a failure's detail tells whether the request was written completely, that is whether the peer may have acted on
+// it.
 func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	base := c.base
 	if base == nil {
@@ -241,7 +242,7 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	propagator.Inject(ctx, propagation.HeaderCarrier(request.Header))
 	point := faultpoint.PointID(faultpoint.Service(), "rpc_client",
 		request.Method+" "+request.URL.Host+pathTemplate(request.URL.Path))
-	rule := faultpoint.Decide(ctx, point)
+	rule := faultpoint.Decide(ctx, point, action.Before...)
 	started := time.Now()
 	kind := ""
 	if rule != nil {
@@ -262,6 +263,12 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 		response, err = failure(request, rule)
 	} else {
 		response, err = base.RoundTrip(request)
+	}
+	if err == nil && rule == nil {
+		rule = faultpoint.Decide(ctx, point, "fail_after")
+	}
+	if err == nil && rule != nil {
+		kind = rule.Action.Kind
 	}
 	if err == nil && (kind == "duplicate" || kind == "fail_after") {
 		io.Copy(io.Discard, response.Body)

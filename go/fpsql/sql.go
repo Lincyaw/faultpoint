@@ -3,10 +3,12 @@
 package fpsql
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -101,11 +103,11 @@ func DriverName(name string) string {
 	return instrumented
 }
 
-// begin decides the rule of a statement's point and performs its delay or crash.
+// begin decides the rule of a statement's point that acts before it runs and performs its delay or crash.
 func begin(ctx context.Context, query string) (string, *faultpoint.Rule, string) {
 	known := classifier.Classify(query)
 	point := faultpoint.PointID(faultpoint.Service(), known.Kind, known.Locator)
-	rule := faultpoint.Decide(ctx, point)
+	rule := faultpoint.Decide(ctx, point, action.Before...)
 	if rule == nil {
 		return point, nil, ""
 	}
@@ -128,7 +130,10 @@ func (i interceptor) exec(ctx context.Context, query string, run func() (driver.
 	if err == nil && kind == "duplicate" {
 		result, err = run()
 	}
-	if err == nil && kind == "fail_after" {
+	if err == nil && rule == nil {
+		rule = faultpoint.Decide(ctx, point, "fail_after")
+	}
+	if err == nil && rule != nil && rule.Action.Kind == "fail_after" {
 		err = action.Failure(rule, i.coded)
 	}
 	if err != nil {
@@ -145,12 +150,44 @@ func (i interceptor) exec(ctx context.Context, query string, run func() (driver.
 
 type queryKey struct{}
 
-// query is a read in progress, whose outcome is observed when its rows are closed.
+// query is a statement whose rows are being read, whose outcome is observed when its rows are closed; ended is
+// whether reading them reached their end or an error, and err is the error a fail_after rule gave.
 type query struct {
 	point string
 	rule  *faultpoint.Rule
 	empty bool
 	rows  int
+	ended bool
+	err   error
+}
+
+// advance records what reading a row gave: a row, or the end of the rows, where a fail_after rule may give its error
+// instead, as a statement that returned its rows and then failed would, or an error of the statement's own.
+func (q *query) advance(ctx context.Context, err error, coded func(code string) error) error {
+	switch {
+	case err == nil:
+		q.rows++
+	case errors.Is(err, io.EOF):
+		q.ended = true
+		err = cmp.Or(q.failAfter(ctx, coded), err)
+	default:
+		q.ended = true
+	}
+	return err
+}
+
+// failAfter decides, once a statement's rows ended or closed without an error and no rule acted on it before,
+// whether a fail_after rule replaces its result, and returns the error that rule gives, nil without one.
+func (q *query) failAfter(ctx context.Context, coded func(code string) error) error {
+	if q.rule != nil {
+		return nil
+	}
+	q.rule = faultpoint.Decide(ctx, q.point, "fail_after")
+	if q.rule == nil {
+		return nil
+	}
+	q.err = action.Failure(q.rule, coded)
+	return q.err
 }
 
 func (i interceptor) read(ctx context.Context, sql string, run func() (driver.Rows, error)) (context.Context, driver.Rows, error) {
@@ -192,26 +229,33 @@ func (i interceptor) StmtQueryContext(ctx context.Context, stmt driver.StmtQuery
 	return i.read(ctx, sql, func() (driver.Rows, error) { return stmt.QueryContext(ctx, args) })
 }
 
-func (interceptor) RowsNext(ctx context.Context, rows driver.Rows, dest []driver.Value) error {
+func (i interceptor) RowsNext(ctx context.Context, rows driver.Rows, dest []driver.Value) error {
 	state, found := ctx.Value(queryKey{}).(*query)
 	if found && state.empty {
 		return io.EOF
 	}
 	err := rows.Next(dest)
-	if found && err == nil {
-		state.rows++
+	if found {
+		err = state.advance(ctx, err, i.coded)
 	}
 	return err
 }
 
-// RowsClose observes a read's outcome once its rows are counted.
-func (interceptor) RowsClose(ctx context.Context, rows driver.Rows) error {
-	if state, found := ctx.Value(queryKey{}).(*query); found {
-		outcome := "empty"
-		if state.rows > 0 {
-			outcome = "rows"
-		}
-		faultpoint.Observe(ctx, state.point, outcome, float64(state.rows), state.rule, nil)
+// RowsClose closes a statement's rows and observes its outcome once they are counted; rows the caller closes before
+// their end without an error, as Row.Scan does, may still take a fail_after rule's error here.
+func (i interceptor) RowsClose(ctx context.Context, rows driver.Rows) error {
+	err := rows.Close()
+	state, found := ctx.Value(queryKey{}).(*query)
+	if found && err == nil && !state.ended {
+		err = state.failAfter(ctx, i.coded)
 	}
-	return rows.Close()
+	switch {
+	case found && state.err != nil:
+		faultpoint.Observe(ctx, state.point, "error", 0, state.rule, sqlpoint.ErrorDetail(state.err))
+	case found && state.rows > 0:
+		faultpoint.Observe(ctx, state.point, "rows", float64(state.rows), state.rule, nil)
+	case found:
+		faultpoint.Observe(ctx, state.point, "empty", 0, state.rule, nil)
+	}
+	return err
 }

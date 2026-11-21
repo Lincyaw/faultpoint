@@ -111,8 +111,8 @@ type call struct {
 	action  string
 }
 
-// decide finds a command in the table, decides its rule and performs the rule's delay or crash; a command outside
-// the table is not a point.
+// decide finds a command in the table, decides its rule that acts before it is sent and performs the rule's delay or
+// crash; a command outside the table is not a point.
 func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 	name := strings.ToUpper(cmd.Name())
 	known, found := commands[name]
@@ -124,7 +124,7 @@ func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 		locator += " " + identifier.ReplaceAllString(found, "{}")
 	}
 	c := call{ctx: ctx, command: known, point: faultpoint.PointID(faultpoint.Service(), known.Kind, locator)}
-	c.rule = faultpoint.Decide(ctx, c.point)
+	c.rule = faultpoint.Decide(ctx, c.point, action.Before...)
 	if c.rule != nil {
 		action.Hold(c.rule)
 		c.action = c.rule.Action.Kind
@@ -157,8 +157,15 @@ func (c call) block(cmd redis.Cmder) {
 	}
 }
 
-// settle applies what a rule does once the command was sent or kept back, and observes the outcome.
+// settle applies what a rule does once the command was sent or kept back, and observes the outcome; a fail_after
+// rule is decided only for a command that no rule acted on before and that Redis answered without an error.
 func (c call) settle(cmd redis.Cmder, err error) error {
+	if err == nil && c.rule == nil {
+		c.rule = faultpoint.Decide(c.ctx, c.point, "fail_after")
+	}
+	if c.rule != nil {
+		c.action = c.rule.Action.Kind
+	}
 	switch {
 	case c.action == "fail" || (err == nil && c.action == "fail_after"):
 		err = action.Failure(c.rule, replyError)

@@ -70,10 +70,6 @@ func observeCall(ctx context.Context, point string, rule *faultpoint.Rule, err e
 	faultpoint.Observe(ctx, point, "error", 0, rule, map[string]string{"error": faultpoint.ErrorName(err)})
 }
 
-// beforeCall are the actions of a call point decided before its call; fail_after is decided once the call returned
-// no error, so that a call failing by itself keeps its error and does not count towards a fail_after rule.
-var beforeCall = []string{"fail", "delay", "crash"}
-
 // Call is the call point of a call site whose error the caller checks: the rewriter calls Call(ctx, id, f)(args)
 // where the source calls f(args), so that the arguments are evaluated as before. Under a fail rule f is not called:
 // the results are zero values and the error the rule names. Under fail_after f is called and, when it returned no
@@ -84,7 +80,7 @@ func Call[F any](ctx context.Context, point string, fn F) F {
 	}
 	callee := reflect.ValueOf(fn)
 	called := reflect.MakeFunc(callee.Type(), func(arguments []reflect.Value) []reflect.Value {
-		rule := faultpoint.Decide(ctx, point, beforeCall...)
+		rule := faultpoint.Decide(ctx, point, action.Before...)
 		if rule != nil {
 			action.Hold(rule)
 		}
@@ -127,7 +123,7 @@ func Failed(ctx context.Context, point string, err *error) bool {
 	if *err == nil {
 		rule = faultpoint.Decide(ctx, point)
 	} else {
-		rule = faultpoint.Decide(ctx, point, beforeCall...)
+		rule = faultpoint.Decide(ctx, point, action.Before...)
 	}
 	if rule != nil {
 		action.Hold(rule)

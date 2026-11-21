@@ -19,6 +19,11 @@ const (
 	Refused = "refused"
 )
 
+// Before are the actions a point decides before its operation runs. It decides fail_after only once the operation
+// completed normally, so that an operation failing by itself keeps its failure, is observed as natural and does not
+// count towards a fail_after rule.
+var Before = []string{"fail", "drop", "duplicate", "empty", "delay", "crash"}
+
 // Hold performs delay and crash: a delay blocks the calling goroutine, a crash ends the process with its code.
 func Hold(rule *faultpoint.Rule) {
 	switch rule.Action.Kind {
