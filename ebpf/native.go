@@ -30,7 +30,7 @@ const (
 	buildIDSection = ".note.gnu.build-id"
 	buildIDDigits  = 12
 	detailValue    = "value"
-	// cloneSuffix is what GCC appends to the name of a copy of a function that it specializes, splits or moves out of line.
+	// cloneSuffix is what GCC appends to the name of a copy of a function it specializes, splits or moves out of line.
 	cloneSuffix = `(\.(constprop|isra|part|cold)(\.\d+)?)+$`
 )
 
@@ -157,8 +157,8 @@ func locateFunctions(configured []functionOptions, services []service) ([]native
 // from the code of one of them, since all are one build.
 func locateFunction(function functionOptions, services []service, hostRoot int, index, firstCookie uint32) (nativePoint, []pointsNativeSite, error) {
 	owner := slices.IndexFunc(services, func(s service) bool { return s.name == function.Service })
-	if owner < 0 {
-		return nativePoint{}, nil, errors.New("the service is not configured")
+	if owner < 0 || len(services[owner].cgroupPaths) == 0 {
+		return nativePoint{}, nil, errors.New("the service is not configured with a cgroup to find the file in")
 	}
 	if err := function.validate(); err != nil {
 		return nativePoint{}, nil, err
@@ -202,7 +202,8 @@ func locateFunction(function functionOptions, services []service, hostRoot int, 
 		id: faultpoint.PointID(function.Service, function.Kind,
 			fmt.Sprintf("%s@%s:%s", filepath.Base(function.File), build[:buildIDDigits], function.Symbol)),
 		kind: function.Kind, service: services[owner].index, errors: injected, files: files, executables: executables,
-		entries: entries, returns: returns, valued: function.Kind == kindCall && function.Result.Type != "pointer",
+		entries: entries, returns: returns,
+		valued: function.Kind == kindCall && resultTypes[function.Result.Type] != pointsResultTypePOINTER,
 	}, sites, nil
 }
 
@@ -240,7 +241,7 @@ func readBuild(files []*os.File) (*elf.File, string, []*link.Executable, error) 
 // that give a word for each result register.
 func (function functionOptions) validate() error {
 	result := function.Result
-	_, typed := resultTypes[result.Type]
+	resultType, typed := resultTypes[result.Type]
 	_, ruled := errorRules[result.Error]
 	switch {
 	case !filepath.IsAbs(function.File) || function.Symbol == "":
@@ -251,7 +252,7 @@ func (function functionOptions) validate() error {
 		!slices.Contains(result.Registers, result.Outcome):
 		return fmt.Errorf("a result has 1 to %d registers, the outcome register among them: %+v",
 			len(pointsNativeRule{}.Write), result)
-	case !typed || (function.Kind == kindCheck) != (result.Type == "bool") || (function.Kind == kindCall) != ruled:
+	case !typed || (function.Kind == kindCheck) != (resultType == pointsResultTypeBOOL) || (function.Kind == kindCall) != ruled:
 		return fmt.Errorf("a call's result is an int32, int64 or pointer whose error is nonzero, negative or zero, and a check's is a bool: %+v", result)
 	}
 	named := slices.Clone(result.Registers)
