@@ -179,19 +179,32 @@ func (p *placer) place(kind string, node ast.Node, anchor string) string {
 	return p.record(id, kind, node, anchor)
 }
 
-// contextOf is the context a function's points use: its context.Context parameter, the Context() of its
-// *http.Request parameter, the enclosing function's, or nil.
+// contextAccessors are the parameter types a function's points take their context from, with the selectors that
+// read it from the parameter, the last one a method called: the request context of a handler of net/http or gin, or
+// a context.Context itself.
+var contextAccessors = map[string][]string{
+	"context.Context":                   nil,
+	"*net/http.Request":                 {"Context"},
+	"*github.com/gin-gonic/gin.Context": {"Request", "Context"},
+}
+
+// contextOf is the context a function's points use: the context of its first parameter of a type of
+// contextAccessors, the enclosing function's, or nil.
 func (p *placer) contextOf(parameters *ast.FieldList) func() ast.Expr {
 	for _, field := range parameters.List {
 		for _, name := range field.Names {
-			identifier := name.Name
-			pointer, isPointer := types.Unalias(p.info.TypeOf(name)).(*types.Pointer)
-			switch {
-			case identifier != "_" && qualifiedName(p.info.TypeOf(name)) == "context.Context":
-				return func() ast.Expr { return ast.NewIdent(identifier) }
-			case identifier != "_" && isPointer && qualifiedName(pointer.Elem()) == "net/http.Request":
+			typeName := types.TypeString(p.info.TypeOf(name), func(pkg *types.Package) string { return pkg.Path() })
+			if selectors, found := contextAccessors[typeName]; found && name.Name != "_" {
+				identifier := name.Name
 				return func() ast.Expr {
-					return &ast.CallExpr{Fun: &ast.SelectorExpr{X: ast.NewIdent(identifier), Sel: ast.NewIdent("Context")}}
+					var context ast.Expr = ast.NewIdent(identifier)
+					for _, selector := range selectors {
+						context = &ast.SelectorExpr{X: context, Sel: ast.NewIdent(selector)}
+					}
+					if len(selectors) > 0 {
+						context = &ast.CallExpr{Fun: context}
+					}
+					return context
 				}
 			}
 		}
