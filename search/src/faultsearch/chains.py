@@ -6,12 +6,14 @@ from math import prod
 from statistics import fmean
 from typing import Final
 
+from faultpoint.placement import Manifest
+from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel
 
 from faultsearch.allocation import Allocation, Strategy
-from faultsearch.catalog import FROZEN, Fault, Layer, point_service
-from faultsearch.counterfactual import EffectKey, TreatmentRecord
-from faultsearch.edges import Condition, Edge, holds
+from faultsearch.catalog import FROZEN, Catalog, Fault, Layer, point_service
+from faultsearch.counterfactual import EffectKey, Scenarios, TreatmentRecord
+from faultsearch.edges import Acceptance, Condition, Edge, EffectMap, build_edges, holds
 from faultsearch.evidence import ClassChecks, MappingFeedback, step_classes, step_probability
 
 LAYER_PATH_SEPARATOR: Final = " > "
@@ -26,7 +28,8 @@ type Group = tuple[tuple[int, ...], str]
 def confidence(steps: Iterable[Step], checked: dict[str, ClassChecks]) -> float:
     """The estimated chance that validation confirms every step after a chain's first hop, the product of the steps'
     chances, so that a chain resting on more substitutions, or on classes validations refuted, ranks lower."""
-    return prod(step_probability(step_classes(*step), checked) for step in steps)
+    return prod(step_probability(step_classes(effect, counterpart, point_service(consequence.point)), checked)
+                for effect, counterpart, consequence in steps)
 
 
 def contradicted_hops(edges: tuple[Edge, ...], witnessed: dict[str, dict[str, set[str]]]) -> tuple[int, ...]:
@@ -321,3 +324,35 @@ def stitch(edges: list[Edge], allocation: Allocation, records: list[TreatmentRec
                          + [chain for chain in cross_layer if chain.shown][:CROSS_LAYER_KEPT]),
                      cycles=tuple(ranked_chains(cycle_trails, allocation, records, min_count_increase, checked)),
                      min_count_increase=min_count_increase, refuted_mappings=tuple(sorted(refuted)))
+
+
+class Stitcher(BaseModel):
+    """What learning edges from records and stitching them takes besides the records and the allocation: the system's
+    scenarios, effect map, catalog and topology, the comparison's thresholds and the beam's settings."""
+
+    model_config = FROZEN
+
+    scenarios: Scenarios
+    effects: EffectMap
+    catalog: Catalog
+    kinds: KindTable
+    upstream: frozenset[str]
+    targets: dict[str, str]
+    services: dict[int, str]
+    manifests: dict[str, Manifest]
+    min_count_increase: float
+    min_mean_increase: float
+    acceptance: Acceptance
+    width: int
+    max_hops: int
+    kept: int
+
+    def edges(self, records: list[TreatmentRecord]) -> list[Edge]:
+        return build_edges(records, self.scenarios, self.effects, self.catalog, self.kinds, self.upstream, self.targets,
+                           self.services, self.manifests, self.min_count_increase, self.min_mean_increase,
+                           self.acceptance)
+
+    def chains(self, edges: list[Edge], allocation: Allocation, records: list[TreatmentRecord],
+               feedback: MappingFeedback) -> Stitching:
+        return stitch(edges, allocation, records, self.width, self.max_hops, self.kept, self.min_count_increase,
+                      feedback)

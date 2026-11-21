@@ -14,13 +14,14 @@ from stitch_mechanism.deployment import SYSTEMS as STITCH_MECHANISM_BUILDS
 
 from faultsearch.allocation import (Allocation, AllocationSettings, Exploration, Strategy, extended_allocation,
                                     phased_allocation, random_allocation)
+from faultsearch.budget import BUDGETS, Plan, Trajectory, budget_table, simulate
 from faultsearch.catalog import (FROZEN, ActionTable, Catalog, Fault, build_catalog, control_executions, point_layer,
                                  point_manifests, point_scoped)
-from faultsearch.chains import Stitching, stitch
+from faultsearch.chains import Stitcher, Stitching
 from faultsearch.counterfactual import (EffectKey, NamedWorkload, Runner, RunSettings, Scenarios, tenant_names,
                                         treatment_record)
-from faultsearch.edges import (Acceptance, Condition, EdgeSet, EffectMap, build_edges, counterpart_assignments,
-                               holds)
+from faultsearch.edges import Acceptance, Condition, EdgeSet, EffectMap, counterpart_assignments, holds
+from faultsearch.refill import candidate_phase
 from faultsearch.report import render, summarise
 from faultsearch.store import (ACTIONS_INPUT, ALLOCATION_SETTINGS, CATALOG, EFFECTS_INPUT, HEADROOM, INPUTS,
                                MAPPING_FEEDBACK, REPORT, RUN_SETTINGS, SCENARIOS_INPUT, VALIDATIONS, Store,
@@ -40,6 +41,13 @@ SYSTEMS: Final = {system.name: system for system in (SHOP, *STITCH_MECHANISM_BUI
 Explored = Annotated[str, typer.Option(help=f"The system to explore, one of {', '.join(SYSTEMS)}.")]
 MaxLoad = Annotated[float, typer.Option(
     help="The host's 1-minute load above which no new repetition starts while others still run.")]
+WIDTH: Final = 20000
+"""The partial chains the beam keeps at every length."""
+MAX_HOPS: Final = 4
+MIN_COUNT_INCREASE: Final = 0.2
+"""The smallest relative increase of a count that counts as an effect."""
+EVERY_CHAIN: Final = 10**6
+"""Chains written in full when the candidate phase continues every stitched chain."""
 
 
 def services_by_port(system: System) -> dict[int, str]:
@@ -60,6 +68,17 @@ def recorded_runner(store: Store, max_load: float) -> Runner:
     if system.verified_build(settings.sdk) != settings.commit:
         raise RuntimeError(f"the services are not built from {settings.commit}")
     return Runner(store, settings, system, max_load)
+
+
+def recorded_stitcher(store: Store, system: System, min_count_increase: float, acceptance: Acceptance, width: int,
+                      max_hops: int, kept: int) -> Stitcher:
+    return Stitcher(scenarios=recorded_scenarios(store, system),
+                    effects=store.record_input(EffectMap.read(system.entry_service), INPUTS, EFFECTS_INPUT),
+                    catalog=store.load(Catalog, CATALOG), kinds=KindTable.installed(), upstream=UPSTREAM_SERVICES,
+                    targets=UNSCOPED_TARGETS, services=services_by_port(system),
+                    manifests=point_manifests(system.manifests), min_count_increase=min_count_increase,
+                    min_mean_increase=store.load(RunSettings, RUN_SETTINGS).min_mean_increase, acceptance=acceptance,
+                    width=width, max_hops=max_hops, kept=kept)
 
 
 def scenario_catalog(store: Store, runner: Runner, scenarios: Scenarios) -> Catalog:
@@ -141,33 +160,28 @@ def replay(experiment: Experiment,
 
 @app.command("stitch")
 def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
-                   width: Annotated[int, typer.Option(help="Partial chains kept at every length.")] = 20000,
-                   max_hops: int = 4,
+                   width: Annotated[int, typer.Option(help="Partial chains kept at every length.")] = WIDTH,
+                   max_hops: int = MAX_HOPS,
                    kept: Annotated[int, typer.Option(help="Ranked chains written in full.")] = 300,
                    min_count_increase: Annotated[float, typer.Option(
-                       help="The smallest relative increase of a count that counts as an effect.")] = 0.2,
+                       help="The smallest relative increase of a count that counts as an effect.")] = MIN_COUNT_INCREASE,
                    acceptance: Annotated[Acceptance, typer.Option(
                        help="How a substitute run is compared with the natural run it stands for.")]
                    = Acceptance.BEHAVIOUR) -> None:
     """Learn the edges of a strategy's injections and stitch them into ranked chains and cycles, leaving out the
     steps from an effect through a counterpart to a consequence that validations refuted."""
     store = Store(experiment)
-    system = recorded_system(store)
+    stitcher = recorded_stitcher(store, recorded_system(store), min_count_increase, acceptance, width, max_hops, kept)
     allocation = store.load(Allocation, allocation_file(strategy))
     records = [treatment_record(store, assignment.fault, assignment.scenario) for assignment in allocation.assignments]
-    catalog = store.load(Catalog, CATALOG)
-    edges = build_edges(records, recorded_scenarios(store, system),
-                        store.record_input(EffectMap.read(system.entry_service), INPUTS, EFFECTS_INPUT),
-                        catalog, KindTable.installed(), UPSTREAM_SERVICES, UNSCOPED_TARGETS,
-                        services_by_port(system), point_manifests(system.manifests), min_count_increase,
-                        store.load(RunSettings, RUN_SETTINGS).min_mean_increase, acceptance)
+    edges = stitcher.edges(records)
     store.save(EdgeSet(strategy=strategy, edges=tuple(edges), acceptance=acceptance), edges_file(strategy))
     feedback = store.load(MappingFeedback, MAPPING_FEEDBACK) if store.has(MAPPING_FEEDBACK) \
         else MappingFeedback(checks=())
-    stitching = stitch(edges, allocation, records, width, max_hops, kept, min_count_increase, feedback)
+    stitching = stitcher.chains(edges, allocation, records, feedback)
     store.save(stitching, chains_file(strategy))
     needed = counterpart_assignments(edges, {(assignment.fault.key, assignment.scenario)
-                                             for assignment in allocation.assignments}, catalog)
+                                             for assignment in allocation.assignments}, stitcher.catalog)
     typer.echo(f"{strategy}: {len(edges)} edges, {stitching.chains} chains ({stitching.stitched_only} stitched only, "
                f"{stitching.single_scenario} shown end to end by one scenario, {stitching.undetermined} undetermined), "
                f"{len(stitching.cycles)} cycles; {len(needed)} counterpart injections not yet run")
@@ -191,6 +205,64 @@ def complete(experiment: Experiment, max_load: MaxLoad = math.inf) -> None:
     store.save(completed, allocation_file(Strategy.PHASED))
     typer.echo(f"{len(needed)} counterpart injections: {len(completed.assignments)} injections, "
                f"{len(completed.clusters)} clusters")
+
+
+@app.command()
+def focus(experiment: Experiment,
+          budget: Annotated[int, typer.Option(help="Counterpart injections the candidate phase may spend.")],
+          max_load: MaxLoad = math.inf) -> None:
+    """The candidate phase after the phased allocation's assignments: spend a budget of counterpart injections on the
+    hypothesised hops of the best candidate chains, by expected information per injection, stitching again after
+    every batch."""
+    store = Store(experiment)
+    runner = recorded_runner(store, max_load)
+    stitcher = recorded_stitcher(store, runner.system, MIN_COUNT_INCREASE, Acceptance.BEHAVIOUR, WIDTH, MAX_HOPS,
+                                 EVERY_CHAIN)
+    exploration = Exploration(runner, stitcher.catalog, stitcher.scenarios,
+                              store.load(AllocationSettings, ALLOCATION_SETTINGS))
+    exploration.run(list(store.load(Allocation, allocation_file(Strategy.PHASED)).assignments))
+    spent = candidate_phase(exploration, budget, Strategy.PHASED, stitcher)
+    allocation = exploration.allocation(Strategy.PHASED)
+    store.save(allocation, allocation_file(Strategy.PHASED))
+    typer.echo(f"candidate phase: {spent} injections; {len(allocation.assignments)} in all")
+
+
+@app.command()
+def budgets(experiment: Experiment,
+            explore: Annotated[list[int], typer.Option(help="An exploring budget, in (fault, scenario) pairs.")],
+            refill: Annotated[list[int], typer.Option(help="A refill budget, in counterpart injections.")],
+            seed: Annotated[list[int], typer.Option(help="A seed every plan runs with.")],
+            plan: Annotated[list[Plan], typer.Option(help="A plan to compare.")] = list(Plan),
+            first: Annotated[str, typer.Option(help="The start of a target chain's first fault's key.")] = "",
+            last: Annotated[str, typer.Option(help="The end of a target chain's last effect's key.")] = "",
+            through: Annotated[list[str], typer.Option(help="Text a target chain's key contains.")] = [],
+            hops: Annotated[int, typer.Option(help="A target chain's hops, any number when 0.")] = 0) -> None:
+    """Compare allocation plans offline on a full experiment's records, running nothing: every plan, exploring budget
+    and seed spends the refill budgets in turn, then stitches and validates from the records alone; a pair the
+    records lack is charged and counted. Trajectories already compared are read back; the table shows a target
+    chain's ranks among the stitched-only chains across layers ending at the user."""
+    store = Store(experiment)
+    runner = recorded_runner(store, math.inf)
+    stitcher = recorded_stitcher(store, runner.system, MIN_COUNT_INCREASE, Acceptance.BEHAVIOUR, WIDTH, MAX_HOPS,
+                                 EVERY_CHAIN)
+    settings = store.load(AllocationSettings, ALLOCATION_SETTINGS)
+    trajectories = []
+    for chosen_plan in plan:
+        for budget in explore:
+            for chosen_seed in seed:
+                name = f"{chosen_plan}-explore{budget}-seed{chosen_seed}.json"
+                if not store.has(BUDGETS, name):
+                    store.save(simulate(chosen_plan, budget, refill, chosen_seed, runner, settings, stitcher),
+                               BUDGETS, name)
+                    typer.echo(f"compared {name}")
+                trajectory = store.load(Trajectory, BUDGETS, name)
+                if [found.refill for found in trajectory.snapshots] != sorted(refill):
+                    raise ValueError(f"{name} was compared at other refill budgets")
+                trajectories.append(trajectory)
+    for line in budget_table(trajectories, lambda key: key.startswith(f"[{first}") and key.endswith(last)
+                             and all(text in key for text in through) and hops in (0, key.count(" -> ") + 1),
+                             store.load(Allocation, allocation_file(Strategy.PHASED))):
+        typer.echo(line)
 
 
 @app.command()
@@ -319,7 +391,7 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
           system: Explored = SHOP.name, repetitions: int = 3, workers: int = 6, alpha: float = 0.1,
           min_mean_increase: float = 0.5,
           min_count_increase: Annotated[float, typer.Option(
-              help="The smallest relative increase of a count that counts as an effect.")] = 0.2,
+              help="The smallest relative increase of a count that counts as an effect.")] = MIN_COUNT_INCREASE,
           max_load: MaxLoad = math.inf) -> None:
     """Inject given faults alone in given workloads, against controls of those workloads, and show every tenant's
     statuses and every effect: a check of what a constructed system does, before a search explores it."""

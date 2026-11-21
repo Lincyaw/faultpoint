@@ -18,15 +18,20 @@ class Substitution(StrEnum):
     """A delay standing for a mean that grew, which reproduces the slowness but not what caused it."""
 
 
-def step_classes(effect: EffectKey, counterpart: Fault, consequence: EffectKey) -> tuple[str, ...]:
+def step_classes(effect: EffectKey, counterpart: Fault, consequence_service: str) -> tuple[str, ...]:
     """The classes a step from an effect through its counterpart to a consequence belongs to, through which the checks
     of one step inform the estimate of another: the counterpart's action at its kind of point, the point the effect is
     at, the services of the counterpart and of the consequence, and whether the counterpart only approximates the
     effect."""
     substitution = Substitution.APPROXIMATE if effect.metric == Metric.MEAN else Substitution.EXACT
     return (f"action {counterpart.action.kind} at {point_kind(counterpart.point)}", f"effect at {effect.point}",
-            f"services {point_service(counterpart.point)} > {point_service(consequence.point)}",
-            f"substitution {substitution}")
+            f"services {point_service(counterpart.point)} > {consequence_service}", f"substitution {substitution}")
+
+
+def smoothed(successes: int, failures: int) -> float:
+    """The mean of a Beta(1, 1) prior updated with outcomes, so that a class without any is an even chance and a few
+    move it only part of the way."""
+    return (successes + 1) / (successes + failures + 2)
 
 
 class ClassChecks(BaseModel):
@@ -38,9 +43,7 @@ class ClassChecks(BaseModel):
     refuted: int
 
     def probability(self) -> float:
-        """The mean of a Beta(1, 1) prior updated with the checks, so that an unchecked class is an even chance and a
-        few checks move it only part of the way."""
-        return (self.confirmed + 1) / (self.confirmed + self.refuted + 2)
+        return smoothed(self.confirmed, self.refuted)
 
 
 class MappingCheck(BaseModel):

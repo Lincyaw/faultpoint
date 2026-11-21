@@ -8,7 +8,7 @@ from faultpoint.tools.analysis import Effect, Metric, natural_tallies
 from faultpoint.tools.analysis import Selection as Repetition
 from pydantic import BaseModel
 
-from faultsearch.catalog import FROZEN, Layer
+from faultsearch.catalog import FROZEN, Layer, point_service
 from faultsearch.chains import Chain, Group, confidence
 from faultsearch.counterfactual import (UNSCOPED, EffectKey, NamedWorkload, Runner, Scenarios, TreatmentRecord,
                                         tenant_names)
@@ -75,7 +75,8 @@ def mapping_checks(validations: Validations) -> list[MappingCheck]:
     """For every validated hop whose effect appeared, whether the next hop's effect followed."""
     return [MappingCheck(effect=effect.key, counterpart=counterpart.key, consequence=consequence.key,
                          confirmed=validation.hops[index + 1].confirmed, chain=validation.chain.key,
-                         workload=validation.workload.name, classes=step_classes(effect, counterpart, consequence))
+                         workload=validation.workload.name,
+                         classes=step_classes(effect, counterpart, point_service(consequence.point)))
             for validation in validations.validations if validation.record.exercised
             for index, (effect, counterpart, consequence) in enumerate(validation.chain.steps())
             if validation.hops[index].confirmed]

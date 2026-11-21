@@ -25,6 +25,8 @@ class Phase(StrEnum):
     RANDOM = "random"
     COUNTERPART = "counterpart"
     """A fault no assignment tried that the effect map names for an effect, injected where the effect appeared."""
+    CANDIDATE = "candidate"
+    """A counterpart injected to decide a hypothesised hop of one of the best candidate chains."""
 
 
 class AllocationSettings(BaseModel):
@@ -137,6 +139,10 @@ class Exploration:
         self.assignments += assignments
         self.records.update({(assignment.fault.key, assignment.scenario): record
                              for assignment, record in zip(assignments, records, strict=True)})
+
+    def tried(self) -> set[tuple[str, str]]:
+        """The (fault, scenario) pairs the budget was spent on."""
+        return set(self.records)
 
     def untested(self, fault: Fault, taken: set[tuple[str, str]]) -> list[str]:
         """The scenarios that execute a fault's point and that it was not assigned to, best covering first."""
