@@ -39,6 +39,19 @@ export class JsonlSink implements ObservationSink {
     // A timer's error would reach the application's uncaughtException handler, which may keep the process running without its observations.
     setInterval(() => CORE.own(() => this.flush()), options.flush_seconds * 1000).unref();
     process.on("exit", () => this.flush());
+    // A signal no one else listens to ends the process without the exit event, so this writes first and then lets the
+    // signal's default action end it, as without faultpoint; an application that listens stops the process itself.
+    for (const signal of ["SIGTERM", "SIGINT"] as const) {
+      const stop = (): void => {
+        if (process.listenerCount(signal) > 1) {
+          return;
+        }
+        CORE.own(() => this.flush());
+        process.removeListener(signal, stop);
+        process.kill(process.pid, signal);
+      };
+      process.on(signal, stop);
+    }
   }
 
   add(observation: Observation): void {
