@@ -29,6 +29,11 @@ var StatementLocator = regexp.MustCompile("#[0-9a-f]{" + strconv.Itoa(hashDigits
 // adapter depends on no driver.
 var CodedErrors = map[string]func(code string) error{}
 
+// Reached tell, by the package of a database/sql driver, whether a statement that the driver failed reached the
+// database, known false when its failure does not tell; the adapter plugin of the driver's client library adds its
+// own from its init.
+var Reached = map[string]func(err error) (sent, known bool){}
+
 // Point is where a statement is a store point: its kind, its locator, and its first command, upper case.
 type Point struct {
 	Kind    string

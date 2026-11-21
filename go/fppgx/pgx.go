@@ -37,6 +37,24 @@ func init() {
 		}})
 	classifier = sqlpoint.NewClassifier(options.ReadCommands)
 	sqlpoint.CodedErrors[pgxDriver] = postgresError
+	sqlpoint.Reached[pgxDriver] = reached
+}
+
+// reached tells whether a statement that pgx failed reached PostgreSQL: an error of the server, or a timeout waiting
+// for its reply, says it did; a failure to connect or to take a pool's connection in time, or one that pgx marks as
+// before sending anything, says it did not; any other failure tells nothing.
+func reached(err error) (sent, known bool) {
+	var refused *pgconn.ConnectError
+	var server *pgconn.PgError
+	switch {
+	// pgxpool returns the bare context's error when no connection frees in time, while pgx wraps a deadline it meets
+	// after sending; a bare cancellation is either.
+	case errors.As(err, &refused), pgconn.SafeToRetry(err), err == context.DeadlineExceeded:
+		return false, true
+	case errors.As(err, &server), pgconn.Timeout(err):
+		return true, true
+	}
+	return false, false
 }
 
 // postgresError is the error pgx gives for a statement PostgreSQL refused with a SQLSTATE, as a fail rule injects it.
@@ -118,12 +136,13 @@ func (s statement) refuse(call string, actions ...string) {
 	}
 }
 
-// observe records an outcome: error, with its name and SQLSTATE, rows or empty for a read, ok for a write, with the
-// rows read or affected and the time since the statement entered its point.
+// observe records an outcome: error, with its name, SQLSTATE and whether the statement was sent, rows or empty for a
+// read, ok for a write, with the rows read or affected and the time since the statement entered its point.
 func (s statement) observe(rows int64, err error) {
 	defer faultpoint.Guard()
 	if err != nil {
-		faultpoint.Observe(s.ctx, s.point, "error", 0, faultpoint.Elapsed(s.started), s.rule, sqlpoint.ErrorDetail(err))
+		faultpoint.Observe(s.ctx, s.point, "error", 0, faultpoint.Elapsed(s.started), s.rule,
+			action.Sent(sqlpoint.ErrorDetail(err), s.rule, s.ended != nil, err, reached))
 		return
 	}
 	outcome := "ok"

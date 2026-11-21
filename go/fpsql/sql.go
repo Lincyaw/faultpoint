@@ -101,7 +101,8 @@ func DriverName(name string) string {
 		uncoded.Store(driverType.PkgPath()+"."+driverType.Name(), true)
 		faultpoint.Recheck()
 	}
-	sql.Register(instrumented, sqlmw.Driver(wrapped, interceptor{coded: coded}))
+	sql.Register(instrumented, sqlmw.Driver(wrapped,
+		interceptor{coded: coded, driverReached: sqlpoint.Reached[driverType.PkgPath()]}))
 	return instrumented
 }
 
@@ -127,6 +128,7 @@ func (i interceptor) exec(ctx context.Context, query string, run func() (driver.
 	defer faultpoint.Guard()
 	started := time.Now()
 	point, rule, kind, err := i.begin(ctx, query)
+	cut := err != nil
 	var result driver.Result
 	switch {
 	case err == nil && kind == "drop":
@@ -144,7 +146,8 @@ func (i interceptor) exec(ctx context.Context, query string, run func() (driver.
 		err = action.Failure(rule, i.coded)
 	}
 	if err != nil {
-		faultpoint.Observe(ctx, point, "error", 0, faultpoint.Elapsed(started), rule, sqlpoint.ErrorDetail(err))
+		faultpoint.Observe(ctx, point, "error", 0, faultpoint.Elapsed(started), rule,
+			action.Sent(sqlpoint.ErrorDetail(err), rule, cut, err, i.reached))
 		return nil, err
 	}
 	var affected int64
@@ -206,12 +209,14 @@ func (i interceptor) read(ctx context.Context, sql string, run func() (driver.Ro
 	defer faultpoint.Guard()
 	started := time.Now()
 	point, rule, kind, err := i.begin(ctx, sql)
+	cut := err != nil
 	var rows driver.Rows
 	if err == nil {
 		faultpoint.Outside(func() { rows, err = run() })
 	}
 	if err != nil {
-		faultpoint.Observe(ctx, point, "error", 0, faultpoint.Elapsed(started), rule, sqlpoint.ErrorDetail(err))
+		faultpoint.Observe(ctx, point, "error", 0, faultpoint.Elapsed(started), rule,
+			action.Sent(sqlpoint.ErrorDetail(err), rule, cut, err, i.reached))
 		return ctx, nil, err
 	}
 	state := &query{point: point, rule: rule, empty: kind == "empty", started: started}
@@ -219,10 +224,24 @@ func (i interceptor) read(ctx context.Context, sql string, run func() (driver.Ro
 }
 
 // interceptor makes the statements of one wrapped driver store points; coded builds that driver's error with a code,
-// nil for a driver without a builder in sqlpoint.CodedErrors.
+// nil for a driver without a builder in sqlpoint.CodedErrors, and driverReached is the driver's own in
+// sqlpoint.Reached, nil without one.
 type interceptor struct {
 	sqlmw.NullInterceptor
-	coded func(code string) error
+	coded         func(code string) error
+	driverReached func(err error) (sent, known bool)
+}
+
+// reached tells whether a statement that the driver failed reached the database: driver.ErrBadConn says it did not,
+// as a driver returns it only when the database cannot have run the statement, and the driver's own tells the rest.
+func (i interceptor) reached(err error) (sent, known bool) {
+	switch {
+	case errors.Is(err, driver.ErrBadConn):
+		return false, true
+	case i.driverReached != nil:
+		return i.driverReached(err)
+	}
+	return false, false
 }
 
 func (i interceptor) ConnExecContext(ctx context.Context, conn driver.ExecerContext, sql string, args []driver.NamedValue) (driver.Result, error) {
@@ -266,7 +285,7 @@ func (i interceptor) RowsClose(ctx context.Context, rows driver.Rows) (err error
 	switch {
 	case found && state.err != nil:
 		faultpoint.Observe(ctx, state.point, "error", 0, faultpoint.Elapsed(state.started), state.rule,
-			sqlpoint.ErrorDetail(state.err))
+			action.Sent(sqlpoint.ErrorDetail(state.err), state.rule, false, state.err, i.reached))
 	case found && state.rows > 0:
 		faultpoint.Observe(ctx, state.point, "rows", float64(state.rows), faultpoint.Elapsed(state.started), state.rule, nil)
 	case found:

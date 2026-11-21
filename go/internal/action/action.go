@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -49,6 +50,27 @@ func SendLate(ctx context.Context, send func(late context.Context)) {
 		defer faultpoint.Guard()
 		faultpoint.Outside(func() { send(late) })
 	}()
+}
+
+// Sent records in a failure's detail whether the operation reached its peer, and returns the detail. A rule's own
+// failure says it: a fail kept the operation back, a fail_after replaced the reply of one that went, and a delay
+// that its caller cut short models a slow peer that has it. Any other failure is the client library's, about which
+// reached tells, known false leaving sent out of the detail.
+func Sent(detail map[string]string, rule *faultpoint.Rule, cut bool, err error,
+	reached func(err error) (sent, known bool)) map[string]string {
+	var sent, known bool
+	switch {
+	case rule != nil && rule.Action.Kind == "fail":
+		known = true
+	case rule != nil && (rule.Action.Kind == "fail_after" || (cut && rule.Action.Kind == "delay")):
+		sent, known = true, true
+	default:
+		sent, known = reached(err)
+	}
+	if known {
+		detail["sent"] = strconv.FormatBool(sent)
+	}
+	return detail
 }
 
 // Sleep waits for a duration unless the caller gives up first, and returns the context's error then, nil once the

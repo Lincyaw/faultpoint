@@ -81,6 +81,7 @@ func Instrument[C interface{ AddHook(redis.Hook) }](client C) C {
 	if single, isSingle := any(client).(*redis.Client); isSingle {
 		instrumented.readTimeout = single.Options().ReadTimeout
 		instrumented.server = serverAddress(single.Options().Addr)
+		instrumented.once = single.Options().MaxRetries == 0
 	}
 	client.AddHook(instrumented)
 	return client
@@ -141,6 +142,8 @@ type call struct {
 	started time.Time
 	// ended is the context's error when the caller gave up during the rule's wait.
 	ended error
+	// once is whether the client sends a command at most once, as hook.once tells.
+	once bool
 }
 
 // decide finds a command in the table, decides its rule that acts before it is sent and performs the rule's wait or
@@ -158,7 +161,7 @@ func (h hook) decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 		locator += " " + identifier.ReplaceAllString(found, "{}")
 	}
 	c := call{ctx: ctx, command: known, point: faultpoint.PointID(faultpoint.Service(), known.Kind, locator),
-		started: started}
+		started: started, once: h.once}
 	c.rule = faultpoint.Decide(ctx, c.point, action.Before...)
 	if c.rule != nil {
 		c.ended = h.wait(ctx, c.rule, known.Kind)
@@ -226,7 +229,7 @@ func (c call) settle(cmd redis.Cmder, err error) error {
 	case reads && c.command.Empty == "nil" && errors.Is(err, redis.Nil):
 		outcome = "empty"
 	case err != nil:
-		outcome, detail = "error", errorDetail(err)
+		outcome, detail = "error", action.Sent(errorDetail(err), c.rule, c.ended != nil, err, c.reached)
 	case reads && empty(cmd, c.command.Empty):
 		outcome = "empty"
 	case reads:
@@ -254,6 +257,28 @@ func errorDetail(err error) map[string]string {
 		detail["code"], _, _ = strings.Cut(reply.Error(), " ")
 	}
 	return detail
+}
+
+// reached tells whether a command that go-redis failed reached Redis: a reply, or a failure reading one, says it did.
+// For a client that sends a command once, a failure to take or set up a connection or to write the command says it
+// did not, while after a retry, which may have sent it before, it tells nothing; nor does any other failure.
+func (c call) reached(err error) (sent, known bool) {
+	var reply redis.Error
+	var failed *net.OpError
+	var timeout net.Error
+	operation := errors.As(err, &failed)
+	switch {
+	case errors.As(err, &reply), operation && failed.Op == "read":
+		return true, true
+	case !c.once:
+		return false, false
+	// go-redis unwraps the error of setting up a connection, so a timeout there, like the pool's, is no
+	// *net.OpError; a bare context error is the end of a wait for the pool.
+	case operation && (failed.Op == "dial" || failed.Op == "write"), errors.Is(err, redis.ErrClosed),
+		err == context.Canceled, err == context.DeadlineExceeded, !operation && errors.As(err, &timeout) && timeout.Timeout():
+		return false, true
+	}
+	return false, false
 }
 
 // Every typed go-redis command has Val and SetVal, through which the reply is read and replaced.
@@ -310,10 +335,12 @@ func size(cmd redis.Cmder) int {
 }
 
 // hook makes the commands of one client points, with the read timeout and the server of a single client, which are
-// zero for other clients, whose injected waits only their callers end.
+// zero for other clients, whose injected waits only their callers end; once is whether the client is a single one
+// that does not retry, whose failure before sending a command shows that it never sent it.
 type hook struct {
 	readTimeout time.Duration
 	server      serverAddress
+	once        bool
 }
 
 func (hook) DialHook(next redis.DialHook) redis.DialHook { return next }
