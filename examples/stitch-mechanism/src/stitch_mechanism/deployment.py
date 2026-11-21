@@ -204,11 +204,11 @@ def serve_and_load(directory: Path, sdk: Path, build: Path) -> None:
 
 
 def repetition(directory: Path, workload: dict[str, JsonValue], rules: dict[str, Any], sdk: Path,
-               instrumentation: Instrumentation, variant: Build) -> Statuses:
+               instrumentation: Instrumentation, seed: int, variant: Build) -> Statuses:
     """One run of quote and a build's catalog under a rule set, with the prices and discount rules in PostgreSQL and
     the cached SKUs' prices in Redis."""
     mechanism = Workload.model_validate(workload)
-    return isolated_repetition(directory, mechanism, rules, sdk, instrumentation, price_sql(mechanism),
+    return isolated_repetition(directory, mechanism, rules, sdk, instrumentation, seed, price_sql(mechanism),
                                cache_commands(mechanism), "stitch_mechanism.deployment", variant.directory)
 
 

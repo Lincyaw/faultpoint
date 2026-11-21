@@ -50,6 +50,9 @@ RULES_FILE: Final = "rules.json"
 STATUSES_FILE: Final = "statuses.json"
 RESPONSES_FILE: Final = "responses.json"
 INSTRUMENTATION_FILE: Final = "instrumentation.json"
+SEED_FILE: Final = "seed.txt"
+"""The repetition's FAULTPOINT_SEED, so that the rules that act on a share of the executions draw anew in every
+repetition."""
 REFUSAL_FILE: Final = "refusal.txt"
 FAULTPOINT_VARIABLES: Final = "FAULTPOINT_"
 """The prefix of the environment variables every SDK reads, none of which a service without faultpoint gets."""
@@ -273,7 +276,8 @@ def attached_environment(directory: Path, service: Service) -> dict[str, str]:
         **service.config, "options": {**options, "jsonl": {"flush_seconds": FLUSH_SECONDS}}})
     return {**detached_environment(service), **service.attachment, "FAULTPOINT_SERVICE": service.name,
             "FAULTPOINT_RULES": str(directory / RULES_FILE),
-            "FAULTPOINT_REPORT": str(directory / f"{service.name}.jsonl"), "FAULTPOINT_CONFIG": str(config)}
+            "FAULTPOINT_REPORT": str(directory / f"{service.name}.jsonl"), "FAULTPOINT_CONFIG": str(config),
+            "FAULTPOINT_SEED": (directory / SEED_FILE).read_text()}
 
 
 def service_environment(directory: Path, service: Service, instrumentation: Instrumentation) -> dict[str, str]:
@@ -417,17 +421,18 @@ def refusal(directory: Path) -> str | None:
 
 
 def isolated_repetition(directory: Path, workload: BaseModel, rules: dict[str, Any], sdk: Path,
-                        instrumentation: Instrumentation, sql: str, redis_commands: list[str], module: str,
+                        instrumentation: Instrumentation, seed: int, sql: str, redis_commands: list[str], module: str,
                         build: Path) -> Statuses:
-    """One run of a build of a system's services under a rule set, with a fresh database and cache seeded as given
-    and, with faultpoint, the kernel agent watching the upstream containers, attaching what it selects of the build's
-    hook catalog; the system's deployment module serves and loads it in a namespace of its own, and its observations
-    stay in its directory."""
+    """One run of a build of a system's services under a rule set and a seed for its rules' draws, with a fresh
+    database and cache seeded as given and, with faultpoint, the kernel agent watching the upstream containers,
+    attaching what it selects of the build's hook catalog; the system's deployment module serves and loads it in a
+    namespace of its own, and its observations stay in its directory."""
     shutil.rmtree(directory, ignore_errors=True)
     directory.mkdir(parents=True)
     (directory / WORKLOAD_FILE).write_text(workload.model_dump_json())
     (directory / RULES_FILE).write_text(json.dumps(rules))
     (directory / INSTRUMENTATION_FILE).write_text(instrumentation.model_dump_json())
+    (directory / SEED_FILE).write_text(str(seed))
     prefix = f"fp-{sha256(str(directory).encode()).hexdigest()[:12]}"
     remove_containers(prefix)
     try:
@@ -451,11 +456,11 @@ def stock_sql(workload: Workload) -> str:
 
 
 def repetition(directory: Path, workload: dict[str, JsonValue], rules: dict[str, Any], sdk: Path,
-               instrumentation: Instrumentation) -> Statuses:
+               instrumentation: Instrumentation, seed: int) -> Statuses:
     """One run of the whole shop under a rule set, with inventory's stock in PostgreSQL and an empty price cache."""
     shop = Workload.model_validate(workload)
-    return isolated_repetition(directory, shop, rules, sdk, instrumentation, stock_sql(shop), [], "shop.deployment",
-                               BUILD)
+    return isolated_repetition(directory, shop, rules, sdk, instrumentation, seed, stock_sql(shop), [],
+                               "shop.deployment", BUILD)
 
 
 class System(BaseModel):
@@ -471,7 +476,7 @@ class System(BaseModel):
     ports: dict[str, int]
     build: Callable[[Path], str]
     verified_build: Callable[[Path], str]
-    repetition: Callable[[Path, dict[str, JsonValue], dict[str, Any], Path, Instrumentation], Statuses]
+    repetition: Callable[[Path, dict[str, JsonValue], dict[str, Any], Path, Instrumentation, int], Statuses]
 
 
 SYSTEM: Final = System(name="shop", scenarios=SCENARIOS, manifests=MANIFESTS, entry_service="gateway", ports=PORTS,

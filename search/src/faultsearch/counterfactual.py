@@ -13,15 +13,18 @@ from faultpoint.rules import Rule, RuleSet, Trigger
 from faultpoint.tools.analysis import Comparison, Effect, Metric, Selection, compare
 from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, Field, JsonValue
-from shop.deployment import REFUSAL_FILE, SCOPE_KEY, STATUSES_FILE, Instrumentation, Statuses, System, refusal
+from shop.deployment import (REFUSAL_FILE, SCOPE_KEY, SEED_FILE, STATUSES_FILE, Instrumentation, Statuses, System,
+                             refusal)
 
 from faultsearch.catalog import BOUNDARY_KINDS, FROZEN, Fault, point_kind
 from faultsearch.store import CONTROLS, LEAKS, TREATMENTS, Store
 
 UNSCOPED: Final = ""
+"""The scope of observations no request baggage reached, such as the kernel's."""
 LOAD_POLL_S: Final = 2.0
 """How often a repetition held back by the host's load checks it again."""
-"""The scope of observations no request baggage reached, such as the kernel's."""
+DEFAULT_SEED: Final = 0
+"""The seed every SDK draws with when FAULTPOINT_SEED is not set."""
 TENANTS: Final = "tenants"
 """The workload parameter every system has: how many tenants, named a, b, c and on, send requests."""
 
@@ -179,6 +182,9 @@ class TreatmentRecord(BaseModel):
     rates: dict[str, float] = {}
     """The share of its point's natural executions each effect's outcome had in the treatment repetitions; records
     from before it was kept have none."""
+    seeds: tuple[int, ...] = ()
+    """The FAULTPOINT_SEED of every treatment repetition, in the order of the labels; records from before repetitions
+    had their own ran every repetition with the SDKs' default seed, 0."""
 
     @property
     def exercised(self) -> bool:
@@ -265,6 +271,12 @@ type Running = list[tuple[str, Future[Statuses]]]
 """Repetitions submitted, by label."""
 
 
+def repetition_seed(label: str) -> int:
+    """The FAULTPOINT_SEED of a repetition, from its label, so that the repetitions of one group draw their rules'
+    chances anew and a repetition run again draws the same."""
+    return int(sha256(label.encode()).hexdigest()[:15], 16)
+
+
 def finish(running: Running) -> None:
     """Wait for repetitions to end, showing each one's statuses, and raise what failed in one."""
     for label, future in running:
@@ -321,6 +333,12 @@ class Runner:
     def statuses(self, label: str) -> Statuses:
         return Statuses.model_validate_json((self.store.repetition(label) / STATUSES_FILE).read_text())
 
+    def seed(self, label: str) -> int:
+        """The FAULTPOINT_SEED a repetition ran with; one from before repetitions had their own ran with the SDKs'
+        default, 0."""
+        path = self.store.repetition(label) / SEED_FILE
+        return int(path.read_text()) if path.exists() else DEFAULT_SEED
+
     def pending(self, jobs: list[Job]) -> list[Job]:
         """The repetitions not run before, every rule of which the kind table allows."""
         pending = [job for job in jobs if not (self.store.repetition(job[0]) / STATUSES_FILE).exists()
@@ -358,7 +376,7 @@ class Runner:
         directory = self.store.repetition(label)
         try:
             return self.system.repetition(directory, workload, ruleset.model_dump(mode="json"), self.settings.sdk,
-                                          self.settings.instrumentation)
+                                          self.settings.instrumentation, repetition_seed(label))
         except subprocess.CalledProcessError:
             reason = refusal(directory)
             if reason is None:
@@ -415,7 +433,8 @@ class Runner:
                 statuses=tuple(self.statuses(label).tenants[tenant] for label in labels), effects=effects,
                 leakage=leakage, elapsed=effects_elapsed(observed, labels, {tenant, UNSCOPED}, effects),
                 boundary=boundary_loads(observed, labels, tenant),
-                rates=effects_rates(observed, labels, {tenant, UNSCOPED}, effects)))
+                rates=effects_rates(observed, labels, {tenant, UNSCOPED}, effects),
+                seeds=tuple(self.seed(label) for label in labels)))
         return records
 
     def settle(self, group: Group, running: Running) -> Group | None:

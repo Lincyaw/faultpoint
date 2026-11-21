@@ -382,6 +382,7 @@ class Trial(BaseModel):
 
     point: str
     action: Action
+    probability: float = 1.0
     condition: Condition = {}
 
 
@@ -403,7 +404,8 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
         RUN_SETTINGS), explored, max_load)
     scenarios = recorded_scenarios(store, explored)
     pairs = [(Fault(point=item.point, action=item.action, layer=point_layer(item.point, UPSTREAM_SERVICES),
-                    scoped=point_scoped(item.point, point_layer(item.point, UPSTREAM_SERVICES), runner.kinds)),
+                    scoped=point_scoped(item.point, point_layer(item.point, UPSTREAM_SERVICES), runner.kinds),
+                    probability=item.probability),
               merged_workload(item.condition, scenarios))
              for item in TypeAdapter(list[Trial]).validate_json(trials.read_bytes())]
     for (fault, workload), record in zip(pairs, runner.isolated_treatments(pairs), strict=True):
