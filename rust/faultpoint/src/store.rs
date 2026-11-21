@@ -3,7 +3,7 @@
 //! neither client.
 
 use std::any::type_name;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::{LazyLock, Mutex};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlparser::ast::{Statement, visit_relations};
+use sqlparser::ast::{ObjectName, Query, Select, Statement, Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -43,9 +43,48 @@ pub struct Hooks<T, E> {
     pub code: fn(&E) -> Option<String>,
 }
 
-/// The kind and locator of a SQL statement: a query is read and anything else written, the tables it
-/// touches and the hash of its normalised text. Text the parser rejects is written, since no query
-/// form a database accepts is outside the PostgreSQL dialect's grammar.
+/// What statements touch: their relations, the names of their WITH items, and whether they write, as any
+/// statement other than a query does wherever it sits, a WITH item included, and as a query INTO a table does.
+#[derive(Default)]
+struct Touched {
+    relations: BTreeSet<String>,
+    named: BTreeSet<String>,
+    writes: bool,
+}
+
+impl Visitor for Touched {
+    type Break = ();
+
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
+        self.writes |= !matches!(statement, Statement::Query(_));
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if let Some(with) = &query.with {
+            self.named.extend(with.cte_tables.iter().map(|cte| cte.alias.name.to_string()));
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
+        if let Some(into) = &select.into {
+            self.writes = true;
+            self.relations.extend(into.targets.iter().map(ToString::to_string));
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
+        self.relations.insert(relation.to_string());
+        ControlFlow::Continue(())
+    }
+}
+
+/// The kind and locator of a SQL statement: a query that writes through neither a WITH item nor INTO is read
+/// and anything else written, the tables it touches, a relation without a schema named as a WITH item being
+/// that item, and the hash of its normalised text. Text the parser rejects is written, since no query form a
+/// database accepts is outside the PostgreSQL dialect's grammar.
 pub fn sql_point(sql: &str) -> (&'static str, String) {
     let mut statements = STATEMENTS.lock().unwrap();
     if let Some(known) = statements.get(sql) {
@@ -53,14 +92,12 @@ pub fn sql_point(sql: &str) -> (&'static str, String) {
     }
     let point = match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
         Ok(parsed) => {
-            let reads = !parsed.is_empty() && parsed.iter().all(|statement| matches!(statement, Statement::Query(_)));
-            let mut tables = std::collections::BTreeSet::new();
-            let _ = visit_relations(&parsed, |relation| {
-                tables.insert(relation.to_string());
-                ControlFlow::<()>::Continue(())
-            });
+            let mut touched = Touched::default();
+            let _ = parsed.visit(&mut touched);
+            let reads = !parsed.is_empty() && !touched.writes;
+            let tables = touched.relations.difference(&touched.named).cloned().collect::<Vec<_>>();
             let shape = parsed.iter().map(ToString::to_string).collect::<Vec<_>>().join(";");
-            let table = if tables.is_empty() { "-".to_owned() } else { tables.into_iter().collect::<Vec<_>>().join("+") };
+            let table = if tables.is_empty() { "-".to_owned() } else { tables.join("+") };
             (if reads { "store_read" } else { "store_write" }, format!("{table}#{}", digest(&shape)))
         }
         Err(_) => ("store_write", format!("-#{}", digest(sql))),
