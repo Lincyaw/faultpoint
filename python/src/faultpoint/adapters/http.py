@@ -11,7 +11,7 @@ import wrapt
 from pydantic import BaseModel, JsonValue
 
 from faultpoint.actions import BoundaryError, BoundaryFail, Crash, Delay, Duplicate, FailAfter, Failure
-from faultpoint.observations import DetailKey, error_type, flag
+from faultpoint.observations import DetailKey, elapsed_ms, error_type, flag
 from faultpoint.rules import STRICT, point_id
 from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
 
@@ -59,10 +59,6 @@ def path_template(path: str, identifier: re.Pattern[str]) -> str:
 
 def status_outcome(status: int) -> str:
     return f"{status // 100}xx"
-
-
-def elapsed_ms(started: float) -> float:
-    return (time.monotonic() - started) * 1000
 
 
 async def send_failure(send: Send, status: int | None) -> None:
@@ -167,13 +163,15 @@ class ServerPoint:
                 await self.respond(scope, exchange.receive, exchange.send, decision)
         except BaseException as error:
             with self.runtime.own:
-                self.runtime.observe(point, RpcOutcome.ERROR, elapsed_ms(started), decision,
+                elapsed = elapsed_ms(started)
+                self.runtime.observe(point, RpcOutcome.ERROR, elapsed, elapsed, decision,
                                      {**exchange.detail(), DetailKey.ERROR: error_type(error)})
             raise
         with self.runtime.own:
+            elapsed = elapsed_ms(started)
             self.runtime.observe(point,
                                  RpcOutcome.ERROR if exchange.status is None else status_outcome(exchange.status),
-                                 elapsed_ms(started), decision, exchange.detail())
+                                 elapsed, elapsed, decision, exchange.detail())
 
     async def respond(self, scope: Scope, receive: Receive, send: Send, decision: Decision) -> None:
         match decision:
@@ -273,12 +271,14 @@ class ClientPoint:
 
     def observe(self, point: str, started: float, decision: Decision | None, response: Any) -> None:
         with self.runtime.own:
-            self.runtime.observe(point, status_outcome(response.status_code), elapsed_ms(started), decision,
+            elapsed = elapsed_ms(started)
+            self.runtime.observe(point, status_outcome(response.status_code), elapsed, elapsed, decision,
                                  {DetailKey.STATUS: str(response.status_code), **self.sent(decision, None)})
 
     def observe_error(self, point: str, started: float, decision: Decision | None, error: Exception) -> None:
         with self.runtime.own:
-            self.runtime.observe(point, self.error_outcome(error), elapsed_ms(started), decision,
+            elapsed = elapsed_ms(started)
+            self.runtime.observe(point, self.error_outcome(error), elapsed, elapsed, decision,
                                  {DetailKey.ERROR: error_type(error), **self.sent(decision, error)})
 
     def completed(self, point: str, decision: Decision | None, response: Any) -> Decision | None:

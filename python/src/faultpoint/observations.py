@@ -42,6 +42,11 @@ def flag(value: bool) -> str:
     return "true" if value else "false"
 
 
+def elapsed_ms(started: float) -> float:
+    """The milliseconds since a time.monotonic() reading."""
+    return (time.monotonic() - started) * 1000
+
+
 class Observation(BaseModel):
     """One execution of a point."""
 
@@ -53,6 +58,7 @@ class Observation(BaseModel):
     scope: str
     rule: str | None
     quantity: float
+    elapsed: float
     trace_id: str | None
     detail: dict[str, str] = Field(default_factory=dict)
 
@@ -76,6 +82,9 @@ class ObservationRecord(BaseModel):
     count: int = Field(ge=1)
     total: float
     """The summed quantity of the executions, such as latency in milliseconds or rows."""
+    elapsed: float = 0.0
+    """The summed milliseconds the executions took from entering the point to their result, injected delays
+    included; zero for the kinds without a duration."""
     exemplars: tuple[str, ...] = ()
     """Trace ids of some of the executions."""
     detail: dict[str, str] = Field(default_factory=dict)
@@ -117,6 +126,7 @@ class JsonlOptions(BaseModel):
 class TallyEntry(BaseModel):
     count: int = 0
     total: float = 0.0
+    elapsed: float = 0.0
     exemplars: list[str] = Field(default_factory=list)
 
 
@@ -140,6 +150,7 @@ class JsonlSink:
             entry = self.tally.setdefault(key, TallyEntry())
             entry.count += 1
             entry.total += observation.quantity
+            entry.elapsed += observation.elapsed
             if observation.trace_id is not None and len(entry.exemplars) < self.options.exemplars \
                     and self.options.sampled(observation.trace_id):
                 entry.exemplars.append(observation.trace_id)
@@ -150,7 +161,8 @@ class JsonlSink:
             records = [ObservationRecord(
                 experiment=experiment, service=self.service, process=self.process,
                 start=self.window_start, end=end, point=point, outcome=outcome, scope=scope,
-                rule=rule, count=entry.count, total=entry.total, exemplars=tuple(entry.exemplars),
+                rule=rule, count=entry.count, total=entry.total, elapsed=entry.elapsed,
+                exemplars=tuple(entry.exemplars),
                 detail=dict(detail)) for (experiment, point, outcome, scope, rule, detail), entry in self.tally.items()]
             self.tally = {}
             self.window_start = end

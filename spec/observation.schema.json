@@ -54,6 +54,11 @@
       "title": "Total",
       "type": "number"
     },
+    "elapsed": {
+      "default": 0.0,
+      "title": "Elapsed",
+      "type": "number"
+    },
     "exemplars": {
       "default": [],
       "items": {

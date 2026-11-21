@@ -15,7 +15,7 @@ from faultpoint.actions import (INJECTED_MESSAGE, BoundaryError, Crash, Delay, D
                                 StoreFailAfter, StoreFailure)
 from faultpoint.adapters.store import (MessageKind, StoreKind, StoreOutcome, consume_actions, read_actions,
                                        write_actions)
-from faultpoint.observations import DetailKey, error_type
+from faultpoint.observations import DetailKey, elapsed_ms, error_type
 from faultpoint.rules import point_id
 from faultpoint.runtime import Decision, Plugin, Runtime
 
@@ -258,7 +258,7 @@ class CommandPoints:
                     codes = []
             return {DetailKey.ERROR: error_type(error), **({DetailKey.CODE: codes[0]} if codes else {})}
 
-    def prepare(self, decisions: list[Decided | None]) -> float:
+    def prepare(self, decisions: list[Decided | None], started: float) -> float:
         """Crash or fail before anything is sent, and the seconds to wait before sending."""
         for decided in decisions:
             match decided:
@@ -266,28 +266,31 @@ class CommandPoints:
                     self.runtime.crash(code)
                 case Decided(decision=Decision(action=StoreFail()) as decision):
                     raised = self.failure(decision)
-                    self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decision, self.error_detail(raised))
+                    self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, elapsed_ms(started), decision,
+                                         self.error_detail(raised))
                     raise raised
         return delay_seconds(decisions)
 
-    def failed(self, decisions: list[Decided | None], error: Exception) -> None:
+    def failed(self, decisions: list[Decided | None], error: Exception, started: float) -> None:
+        elapsed = elapsed_ms(started)
         for decided in decisions:
             if decided is not None:
-                self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decided.decision,
+                self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, elapsed, decided.decision,
                                      self.error_detail(error))
 
-    def settle(self, client: Any, queue: list[Queued], decisions: list[Decided | None],
-               replies: list[Any]) -> list[Any]:
-        """Each command's reply out of the replies of what was sent, observed, and a failure after the effect of
-        a command that completed."""
+    def settle(self, client: Any, queue: list[Queued], decisions: list[Decided | None], replies: list[Any],
+               started: float) -> list[Any]:
+        """Each command's reply out of the replies of what was sent, observed with the time since `started`, and a
+        failure after the effect of a command that completed."""
         with self.runtime.own:
+            elapsed = elapsed_ms(started)
             sent = iter(replies)
             settled = [self.reply(client, queued, decided, [next(sent) for _ in range(copies(decided))])
                        for queued, decided in zip(queue, decisions, strict=True)]
             completed = [self.completed(decided, reply) for decided, reply in zip(decisions, settled, strict=True)]
             for decided, reply in zip(completed, settled, strict=True):
                 if decided is not None:
-                    self.observe_reply(decided, reply)
+                    self.observe_reply(decided, reply, elapsed)
             failures = [decided.decision for decided in completed
                         if decided is not None and decided.decision is not None
                         and isinstance(decided.decision.action, StoreFailAfter)]
@@ -317,47 +320,51 @@ class CommandPoints:
                 reply = sent[-1]
         return reply
 
-    def observe_reply(self, decided: Decided, reply: Any) -> None:
+    def observe_reply(self, decided: Decided, reply: Any, elapsed: float) -> None:
         """A read or a consume is empty or not; a consume's quantity is the messages it delivered."""
         command, point, decision = decided.command, decided.point, decided.decision
         match decision, reply:
             case Decision(action=StoreFailAfter()), _:
-                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision,
+                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, elapsed, decision,
                                      self.error_detail(self.failure(decision)))
             case _, Exception():
-                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, self.error_detail(reply))
+                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, elapsed, decision, self.error_detail(reply))
             case _:
-                self.observe_result(command, point, reply, decision)
+                self.observe_result(command, point, reply, decision, elapsed)
 
-    def observe_result(self, command: Command, point: str, reply: Any, decision: Decision | None) -> None:
+    def observe_result(self, command: Command, point: str, reply: Any, decision: Decision | None,
+                       elapsed: float) -> None:
         match command.kind:
             case StoreKind.READ:
                 self.runtime.observe(point, StoreOutcome.EMPTY if is_empty(reply, command.empty)
-                                     else StoreOutcome.ROWS, 0.0, decision)
+                                     else StoreOutcome.ROWS, 0.0, elapsed, decision)
             case MessageKind.CONSUME:
                 messages = delivered(command, reply)
-                self.runtime.observe(point, StoreOutcome.ROWS if messages else StoreOutcome.EMPTY, messages, decision)
+                self.runtime.observe(point, StoreOutcome.ROWS if messages else StoreOutcome.EMPTY, messages, elapsed,
+                                     decision)
             case _:
-                self.runtime.observe(point, StoreOutcome.OK, 0.0, decision)
+                self.runtime.observe(point, StoreOutcome.OK, 0.0, elapsed, decision)
 
     def execute(self, execute_command: Callable[..., Any], client: Any, args: tuple[Any, ...],
                 kwargs: dict[str, Any]) -> Any:
+        started = time.monotonic()
         decisions = [self.decide(args)]
-        delay = self.prepare(decisions)
+        delay = self.prepare(decisions, started)
         if delay:
             time.sleep(delay)
         try:
             replies = [execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
         except Exception as error:
-            self.failed(decisions, error)
+            self.failed(decisions, error, started)
             raise
-        return self.settle(client, [(args, kwargs)], decisions, replies)[0]
+        return self.settle(client, [(args, kwargs)], decisions, replies, started)[0]
 
     def execute_pipeline(self, execute: Callable[..., list[Any]], pipeline: Any, args: tuple[Any, ...],
                          kwargs: dict[str, Any]) -> list[Any]:
+        started = time.monotonic()
         stack: list[Queued] = list(pipeline.command_stack)
         decisions = [self.decide(queued_args) for queued_args, _ in stack]
-        delay = self.prepare(decisions)
+        delay = self.prepare(decisions, started)
         if delay:
             time.sleep(delay)
         pipeline.command_stack[:] = [queued for queued, decided in zip(stack, decisions, strict=True)
@@ -365,28 +372,30 @@ class CommandPoints:
         try:
             replies = execute(*args, **kwargs)
         except Exception as error:
-            self.failed(decisions, error)
+            self.failed(decisions, error, started)
             raise
-        return self.settle(pipeline, stack, decisions, replies)
+        return self.settle(pipeline, stack, decisions, replies, started)
 
     async def execute_async(self, execute_command: Callable[..., Awaitable[Any]], client: Any,
                             args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        started = time.monotonic()
         decisions = [self.decide(args)]
-        delay = self.prepare(decisions)
+        delay = self.prepare(decisions, started)
         if delay:
             await asyncio.sleep(delay)
         try:
             replies = [await execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
         except Exception as error:
-            self.failed(decisions, error)
+            self.failed(decisions, error, started)
             raise
-        return self.settle(client, [(args, kwargs)], decisions, replies)[0]
+        return self.settle(client, [(args, kwargs)], decisions, replies, started)[0]
 
     async def execute_pipeline_async(self, execute: Callable[..., Awaitable[list[Any]]], pipeline: Any,
                                      args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
+        started = time.monotonic()
         stack: list[Queued] = list(pipeline.command_stack)
         decisions = [self.decide(queued_args) for queued_args, _ in stack]
-        delay = self.prepare(decisions)
+        delay = self.prepare(decisions, started)
         if delay:
             await asyncio.sleep(delay)
         pipeline.command_stack[:] = [queued for queued, decided in zip(stack, decisions, strict=True)
@@ -394,9 +403,9 @@ class CommandPoints:
         try:
             replies = await execute(*args, **kwargs)
         except Exception as error:
-            self.failed(decisions, error)
+            self.failed(decisions, error, started)
             raise
-        return self.settle(pipeline, stack, decisions, replies)
+        return self.settle(pipeline, stack, decisions, replies, started)
 
 
 def patch_asyncio(points: CommandPoints, module: ModuleType) -> None:

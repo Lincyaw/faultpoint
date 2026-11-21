@@ -7,7 +7,7 @@ from typing import Any, Final
 
 import faultpoint.runtime
 from faultpoint.actions import Crash, Delay, Fail, Negate, RaiseFail, RaiseFailAfter, Raising, SetValue, Shift
-from faultpoint.observations import DetailKey, error_type
+from faultpoint.observations import DetailKey, elapsed_ms, error_type
 from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
 
 INJECTED_MESSAGE: Final = ""
@@ -70,7 +70,7 @@ def branch(point: str, taken: bool) -> bool:
         match decision:
             case Decision(action=Fail()):
                 taken = True
-        runtime.observe(point, PointOutcome.TAKEN if taken else PointOutcome.NOT_TAKEN, 0.0, decision)
+        runtime.observe(point, PointOutcome.TAKEN if taken else PointOutcome.NOT_TAKEN, 0.0, 0.0, decision)
     return taken
 
 
@@ -84,11 +84,13 @@ class CallSite:
         self.point = point
         self.candidates = candidates
         self.decision: Decision | None = None
+        self.started = time.monotonic()
 
     def raised(self, raising: Raising) -> BaseException:
         """The exception a rule raises, observed as the call site's error."""
         raised = self.candidates()[0] if raising.error is None else raising.error
-        self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision, {DetailKey.ERROR: error_type(raised)})
+        self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, elapsed_ms(self.started), self.decision,
+                             {DetailKey.ERROR: error_type(raised)})
         return raised(INJECTED_MESSAGE)
 
     def __enter__(self) -> None:
@@ -111,9 +113,9 @@ class CallSite:
                 case None, Decision(action=RaiseFailAfter() as raising):
                     raised = self.raised(raising)
                 case None, _:
-                    self.runtime.observe(self.point, PointOutcome.OK, 0.0, self.decision)
+                    self.runtime.observe(self.point, PointOutcome.OK, 0.0, elapsed_ms(self.started), self.decision)
                 case _:
-                    self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision,
+                    self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, elapsed_ms(self.started), self.decision,
                                          {DetailKey.ERROR: error_type(kind)})
         if raised is not None:
             raise raised
@@ -131,14 +133,16 @@ def check(point: str, result: bool) -> bool:
         match decision:
             case Decision(action=Negate()):
                 result = not result
-        runtime.observe(point, PointOutcome.TRUE if result else PointOutcome.FALSE, 0.0, decision)
+        runtime.observe(point, PointOutcome.TRUE if result else PointOutcome.FALSE, 0.0, 0.0, decision)
     return result
 
 
 def loop(point: str) -> None:
     runtime = faultpoint.runtime.RUNTIME
     with runtime.own:
-        runtime.observe(point, PointOutcome.ITERATION, 0.0, decide_in_process(runtime, point))
+        started = time.monotonic()
+        decision = decide_in_process(runtime, point)
+        runtime.observe(point, PointOutcome.ITERATION, 0.0, elapsed_ms(started), decision)
 
 
 def value(point: str, observed: Any) -> Any:
@@ -152,7 +156,7 @@ def value(point: str, observed: Any) -> Any:
             case Decision(action=Shift(amount=amount)):
                 observed = observed + amount
         runtime.observe(point, PointOutcome.OBSERVED,
-                        float(observed) if isinstance(observed, int | float) else 0.0, decision)
+                        float(observed) if isinstance(observed, int | float) else 0.0, 0.0, decision)
     return observed
 
 
@@ -164,7 +168,7 @@ def clock(point: str, reading: Any) -> Any:
         match decision:
             case Decision(action=Shift(amount=amount)):
                 reading = reading + (timedelta(seconds=amount) if isinstance(reading, date) else amount)
-        runtime.observe(point, PointOutcome.READ, 0.0, decision)
+        runtime.observe(point, PointOutcome.READ, 0.0, 0.0, decision)
     return reading
 
 
@@ -172,9 +176,11 @@ def acquire(point: str, acquired: bool) -> bool:
     """Whether a resource was acquired: its natural outcome, or rejected by a fail rule."""
     runtime = faultpoint.runtime.RUNTIME
     with runtime.own:
+        started = time.monotonic()
         decision = decide_in_process(runtime, point)
         match decision:
             case Decision(action=Fail()):
                 acquired = False
-        runtime.observe(point, PointOutcome.ACQUIRED if acquired else PointOutcome.REJECTED, 0.0, decision)
+        runtime.observe(point, PointOutcome.ACQUIRED if acquired else PointOutcome.REJECTED, 0.0,
+                        elapsed_ms(started), decision)
     return acquired

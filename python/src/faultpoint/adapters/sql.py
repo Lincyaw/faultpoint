@@ -17,7 +17,7 @@ from sqlglot.errors import ErrorLevel
 from faultpoint.actions import (BoundaryError, Crash, Delay, Drop, Duplicate, Empty, StoreFail, StoreFailAfter,
                                 StoreFailure)
 from faultpoint.adapters.store import StoreKind, StoreOutcome, read_actions, write_actions
-from faultpoint.observations import DetailKey, error_type
+from faultpoint.observations import DetailKey, elapsed_ms, error_type
 from faultpoint.rules import point_id
 from faultpoint.runtime import Decision, Runtime
 
@@ -95,13 +95,16 @@ class CursorStatement:
         self.point: str | None = None
         self.decision: Decision | None = None
         self.rows = 0
+        self.elapsed = 0.0
 
-    def start(self, kind: StoreKind, point: str, decision: Decision | None) -> None:
+    def start(self, kind: StoreKind, point: str, decision: Decision | None, elapsed: float) -> None:
+        """Begin the read of a statement that took `elapsed` milliseconds to execute."""
         self.end()
         self.action = None if decision is None else decision.action
         self.point = point if kind is StoreKind.READ else None
         self.decision = decision
         self.rows = 0
+        self.elapsed = elapsed
 
     @property
     def emptied(self) -> bool:
@@ -120,7 +123,7 @@ class CursorStatement:
     def end(self) -> None:
         if self.point is not None:
             self.runtime.observe(self.point, StoreOutcome.ROWS if self.rows else StoreOutcome.EMPTY, self.rows,
-                                 self.decision)
+                                 self.elapsed, self.decision)
             self.point = None
 
 
@@ -156,38 +159,40 @@ class Store:
             return kind, point, self.runtime.decide(point)
 
     def finish(self, statement: CursorStatement, kind: StoreKind, point: str, decision: Decision | None,
-               cursor: Any) -> None:
-        """Record what the statement did: a write at once, a read when its fetching ends."""
+               cursor: Any, started: float) -> None:
+        """Record what the statement did: a write at once, a read when its fetching ends; either took the time
+        since `started` to execute."""
         with self.runtime.own:
-            statement.start(kind, point, decision)
+            statement.start(kind, point, decision, elapsed_ms(started))
             if kind is StoreKind.WRITE:
                 rows = 1 if statement.dropped else max(cursor.rowcount, 0)
-                self.runtime.observe(point, StoreOutcome.OK, rows, decision)
+                self.runtime.observe(point, StoreOutcome.OK, rows, statement.elapsed, decision)
 
-    def failed(self, point: str, decision: Decision | None, error: Exception) -> None:
+    def failed(self, point: str, decision: Decision | None, error: Exception, started: float) -> None:
         with self.runtime.own:
-            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, error_detail(error))
+            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, elapsed_ms(started), decision, error_detail(error))
 
-    def completed(self, point: str, decision: Decision | None) -> Decision | None:
+    def completed(self, point: str, decision: Decision | None, started: float) -> Decision | None:
         """The decision of a statement that completed: the one made before it ran, or else a fail_after rule's,
         whose error is raised in place of the result."""
         if decision is None:
             decision = self.runtime.decide_completed(point)
         if decision is not None and isinstance(decision.action, StoreFailAfter):
             error = self.failure(decision)
-            self.failed(point, decision, error)
+            self.failed(point, decision, error, started)
             raise error
         return decision
 
     def run(self, statement: CursorStatement, sql: str, execute: Callable[[], Any], cursor: Any) -> Any:
         """Execute a statement at its point; the driver's result, or none for a dropped statement."""
+        started = time.monotonic()
         kind, point, decision = self.decide(statement, sql)
         try:
             result = self.perform(execute, decision)
         except Exception as error:
-            self.failed(point, decision, error)
+            self.failed(point, decision, error, started)
             raise
-        self.finish(statement, kind, point, self.completed(point, decision), cursor)
+        self.finish(statement, kind, point, self.completed(point, decision, started), cursor, started)
         return result
 
     def perform(self, execute: Callable[[], Any], decision: Decision | None) -> Any:
@@ -208,13 +213,14 @@ class Store:
 
     async def run_async(self, statement: CursorStatement, sql: str, execute: Callable[[], Awaitable[Any]],
                         cursor: Any) -> Any:
+        started = time.monotonic()
         kind, point, decision = self.decide(statement, sql)
         try:
             result = await self.perform_async(execute, decision)
         except Exception as error:
-            self.failed(point, decision, error)
+            self.failed(point, decision, error, started)
             raise
-        self.finish(statement, kind, point, self.completed(point, decision), cursor)
+        self.finish(statement, kind, point, self.completed(point, decision, started), cursor, started)
         return result
 
     async def perform_async(self, execute: Callable[[], Awaitable[Any]], decision: Decision | None) -> Any:
