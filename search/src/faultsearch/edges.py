@@ -14,8 +14,8 @@ from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, JsonValue
 
 from faultsearch.allocation import Assignment, Phase, Strategy
-from faultsearch.catalog import (DATA, FROZEN, RPC_CLIENT, RPC_SERVER, Catalog, Fault, Layer, implements, point_kind,
-                                 point_layer, point_scoped, point_service, point_symbol)
+from faultsearch.catalog import (DATA, FROZEN, RPC_CLIENT, RPC_SERVER, Catalog, Fault, Following, Layer, implements,
+                                 point_kind, point_layer, point_scoped, point_service, point_symbol)
 from faultsearch.counterfactual import EffectKey, Load, Scenarios, TreatmentRecord
 
 EFFECTS_FILE: Final = DATA / "effects.json"
@@ -382,11 +382,89 @@ def mismatched_counterparts(cause: Fault, effect: EffectKey, held_in: list[str],
         for scenario in held_in if (fault.key, scenario) in runs]) and not any(checks))
 
 
+class PointChange(BaseModel):
+    """An effect one fault caused, with its own counterparts, before they are made to reproduce the other changes at
+    the effect's point."""
+
+    model_config = FROZEN
+
+    effect: EffectKey
+    layer: Layer
+    held: tuple[Sighting, ...]
+    not_held: tuple[str, ...]
+    profile: EffectProfile
+    counterpart: Counterpart
+    faults: tuple[Fault, ...]
+
+    @property
+    def held_in(self) -> frozenset[str]:
+        return frozenset(sighting.scenario for sighting in self.held)
+
+    @property
+    def result(self) -> tuple[str, tuple[tuple[str, str], ...]]:
+        """The executions it is about: their outcome and detail, whichever metric changed."""
+        return self.effect.outcome, tuple(sorted(self.effect.detail.items()))
+
+
+def following_rules(change: PointChange, changes: list[PointChange], runs: list[TreatmentRecord],
+                    catalog: Catalog) -> tuple[Following, ...]:
+    """The rules after a counterpart's own that reproduce how the rest of its point's executions changed where its
+    effect held, measured there: the other outcomes that grew more frequent, most frequent first, by their own
+    counterpart's action, then those that grew slower, by a delay of the increase; each acts on its outcome's share of
+    the executions the rules before it left. None follows a rule that acts on every execution, none delays the
+    executions a failing rule stands for, and an increase is at least the smallest that counts as an effect, or the
+    comparison would not have shown it."""
+    held_runs = [run for run in runs if run.workload in change.held_in]
+    others = [(other, effect_profile(held_runs, [sighting for sighting in other.held
+                                                 if sighting.scenario in change.held_in], other.effect.key,
+                                     other.effect))
+              for other in changes if other.effect.point == change.effect.point and other.result != change.result
+              and change.held_in <= other.held_in]
+    failing = sorted(((other, profile) for other, profile in others
+                      if other.effect.metric == Metric.COUNT and other.faults),
+                     key=lambda measured: measured[1].rate, reverse=True)
+    failed = {change.result, *(other.result for other, _ in failing)}
+    ordered = [*failing, *sorted(((other, profile) for other, profile in others
+                                  if other.effect.metric == Metric.MEAN and other.result not in failed
+                                  and profile.increase >= 1), key=lambda measured: measured[1].rate, reverse=True)]
+    rules: list[Following] = []
+    left = 0.0 if counterpart_probability(change.layer, change.profile) == 1 else 1 - change.profile.rate
+    for other, profile in ordered:
+        action = other.faults[0].action if other.effect.metric == Metric.COUNT else Action.model_validate(
+            {"kind": ActionKind.DELAY, WAIT: int(rounded(profile.increase))})
+        if left > 0 and implements(catalog.narrower, change.effect.point, action):
+            rules.append(Following(action=action, probability=min(1.0, rounded(profile.rate / left))))
+            left -= profile.rate
+    return tuple(rules)
+
+
+def point_changes(runs: list[TreatmentRecord], shown: dict[str, dict[str, Effect]], effects: EffectMap,
+                  catalog: Catalog, kinds: KindTable, upstream: frozenset[str], services: dict[int, str],
+                  manifests: dict[str, Manifest]) -> list[PointChange]:
+    """Every effect a fault's runs showed, where it held and did not, and its own counterparts."""
+    changes = []
+    for key in dict.fromkeys(key for in_run in shown.values() for key in in_run):
+        held = [Sighting(scenario=name, effect=in_run[key]) for name, in_run in shown.items() if key in in_run]
+        effect = EffectKey.of(held[0].effect)
+        layer = point_layer(effect.point, upstream)
+        held_in = [sighting.scenario for sighting in held]
+        profile = effect_profile([run for run in runs if run.workload in held_in], held, key, effect)
+        counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, layer,
+                                           manifests.get(effect.point),
+                                           peer_effects(effect, [shown[name] for name in held_in], services),
+                                           effects, catalog, kinds, profile)
+        changes.append(PointChange(effect=effect, layer=layer, held=tuple(held),
+                                   not_held=tuple(run.workload for run in runs if run.workload not in held_in),
+                                   profile=profile, counterpart=counterpart, faults=faults))
+    return changes
+
+
 def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: EffectMap, catalog: Catalog,
                 kinds: KindTable, upstream: frozenset[str], targets: dict[str, str], services: dict[int, str],
                 manifests: dict[str, Manifest], min_count_increase: float, min_mean_increase: float,
                 acceptance: Acceptance) -> list[Edge]:
-    """Every (fault, effect) pair the exercised records show, over the scenarios each fault was tested in."""
+    """Every (fault, effect) pair the exercised records show, over the scenarios each fault was tested in, with
+    counterparts that reproduce every change at the effect's point."""
     by_fault: dict[str, list[TreatmentRecord]] = defaultdict(list)
     for record in records:
         if record.exercised:
@@ -394,27 +472,24 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
     by_run = {(record.fault.key, record.workload): record for runs in by_fault.values() for record in runs}
     edges = []
     for runs in by_fault.values():
+        cause = runs[0].fault
         shown = {run.workload: {EffectKey.of(effect).key: effect for effect in run.effects
                                 if holds(effect, min_count_increase)} for run in runs}
-        for key in dict.fromkeys(key for in_run in shown.values() for key in in_run):
-            held = [Sighting(scenario=name, effect=in_run[key]) for name, in_run in shown.items() if key in in_run]
-            effect = EffectKey.of(held[0].effect)
-            layer = point_layer(effect.point, upstream)
-            held_in = [sighting.scenario for sighting in held]
-            not_held = [run.workload for run in runs if run.workload not in held_in]
-            profile = effect_profile([run for run in runs if run.workload in held_in], held, key, effect)
-            counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, layer,
-                                               manifests.get(effect.point),
-                                               peer_effects(effect, [shown[name] for name in held_in], services),
-                                               effects, catalog, kinds, profile)
-            edges.append(Edge(cause=runs[0].fault, effect=effect, held=tuple(held), not_held=tuple(not_held),
-                              conditions=learn_conditions(held_in, not_held, scenarios), counterpart=counterpart,
-                              counterparts=faults, terminal=effects.terminal(effect), effect_layer=layer,
-                              injected=effects.injected(effect),
-                              mismatched=mismatched_counterparts(runs[0].fault, effect, held_in, faults, by_run,
-                                                                 services, min_count_increase, min_mean_increase,
-                                                                 acceptance),
-                              acts_on=None if runs[0].fault.scoped else targets[point_service(runs[0].fault.point)]))
+        changes = point_changes(runs, shown, effects, catalog, kinds, upstream, services, manifests)
+        for change in changes:
+            following = following_rules(change, changes, runs, catalog)
+            faults = tuple(fault.model_copy(update={"following": following}) for fault in change.faults)
+            edges.append(Edge(
+                cause=cause, effect=change.effect, held=change.held, not_held=change.not_held,
+                conditions=learn_conditions([sighting.scenario for sighting in change.held], list(change.not_held),
+                                            scenarios),
+                counterpart=Counterpart.OUTSIDE_CATALOG if following and faults else change.counterpart,
+                counterparts=faults,
+                terminal=effects.terminal(change.effect), effect_layer=change.layer,
+                injected=effects.injected(change.effect),
+                mismatched=mismatched_counterparts(cause, change.effect, list(change.held_in), faults, by_run,
+                                                   services, min_count_increase, min_mean_increase, acceptance),
+                acts_on=None if cause.scoped else targets[point_service(cause.point)]))
     return edges
 
 

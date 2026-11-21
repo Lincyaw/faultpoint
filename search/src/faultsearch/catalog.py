@@ -18,6 +18,8 @@ ACTIONS_FILE: Final = DATA / "actions.json"
 DELAY: Final = "delay"
 PROBABILITY: Final = "probability"
 """How a fault's key names the chance that its rule acts on an execution."""
+FOLLOWED_BY: Final = "then"
+"""How a fault's key joins the rules after its own."""
 KERNEL_KINDS: Final = frozenset({"syscall", "packet"})
 FUNCTION_KINDS: Final = frozenset({"call", "check"})
 """The kinds of the points the kernel agent places in an upstream component's functions."""
@@ -69,6 +71,21 @@ def point_scoped(point: str, layer: Layer, kinds: KindTable) -> bool:
     return kinds.kinds[point_kind(point)].scope and layer != Layer.UPSTREAM
 
 
+def action_text(action: Action, probability: float) -> str:
+    parameters = sorted(action.model_dump(exclude={"kind"}).items())
+    chance = [f"{PROBABILITY}={probability}"] if probability < 1 else []
+    return " ".join([action.kind, *(f"{name}={value}" for name, value in parameters), *chance])
+
+
+class Following(BaseModel):
+    """A rule after a fault's own at its point, acting on the executions the rules before it left."""
+
+    model_config = FROZEN
+
+    action: Action
+    probability: float = 1.0
+
+
 class Fault(BaseModel):
     """An action at a point: what one injection does, and, through the effect map, what an effect stands for."""
 
@@ -82,20 +99,25 @@ class Fault(BaseModel):
     probability: float = 1.0
     """The chance that the rule acts on each execution it could act on, below 1 for a counterpart standing for an
     effect seen on part of the executions."""
+    following: tuple[Following, ...] = ()
+    """For a counterpart, the rules after its own that reproduce how the rest of the point's executions changed."""
 
     @property
     def key(self) -> str:
-        parameters = sorted(self.action.model_dump(exclude={"kind"}).items())
-        chance = [f"{PROBABILITY}={self.probability}"] if self.probability < 1 else []
-        return " ".join([self.point, self.action.kind, *(f"{name}={value}" for name, value in parameters), *chance])
+        return f" {FOLLOWED_BY} ".join([f"{self.point} {action_text(self.action, self.probability)}",
+                                        *(action_text(rule.action, rule.probability) for rule in self.following)])
 
     @property
     def digest(self) -> str:
         return sha256(self.key.encode()).hexdigest()[:12]
 
+    def rule_ids(self) -> tuple[str, ...]:
+        """The ids of the fault's rules, its own first."""
+        return self.digest, *(f"{self.digest}-{index}" for index in range(1, len(self.following) + 1))
+
     @property
     def delays(self) -> bool:
-        return self.action.kind == DELAY
+        return DELAY in {self.action.kind, *(rule.action.kind for rule in self.following)}
 
     def instance_of(self, point: str, template: Action) -> bool:
         """Whether this fault is a template's action at a point: the same kind and every parameter the template names."""

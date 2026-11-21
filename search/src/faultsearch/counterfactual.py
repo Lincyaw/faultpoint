@@ -238,9 +238,12 @@ class Group(BaseModel):
 
     def ruleset(self, label: str) -> RuleSet:
         return RuleSet(experiment=label, rules=tuple(
-            Rule(id=fault.digest, point=fault.point, action=fault.action,
-                 scope={SCOPE_KEY: tenant} if fault.scoped else {}, trigger=Trigger(probability=fault.probability))
-            for fault, tenant in zip(self.faults, self.tenants(), strict=True)))
+            Rule(id=rule_id, point=fault.point, action=action, scope={SCOPE_KEY: tenant} if fault.scoped else {},
+                 trigger=Trigger(probability=probability))
+            for fault, tenant in zip(self.faults, self.tenants(), strict=True)
+            for rule_id, (action, probability) in zip(
+                fault.rule_ids(), [(fault.action, fault.probability),
+                                   *((rule.action, rule.probability) for rule in fault.following)], strict=True)))
 
 
 class Leak(BaseModel):
@@ -380,7 +383,7 @@ class Runner:
         for fault, tenant in zip(group.faults, group.tenants(), strict=True):
             comparison = self.comparison(control, labels, tenant)
             injected = [sum(injection.counts[index] for injection in (*comparison.injections, *unscoped.injections)
-                            if injection.rule == fault.digest) for index in range(len(labels))]
+                            if injection.rule in fault.rule_ids()) for index in range(len(labels))]
             shown = {(effect.point, effect.outcome, effect.metric) for effect in comparison.effects}
             beyond = tuple(effect for effect in unscoped.effects if len(group.faults) == 1
                            and (effect.point, effect.outcome, effect.metric) not in shown)
