@@ -32,11 +32,11 @@ var registryTemplate = template.Must(template.New("registry").Parse(`// Code gen
 
 package {{.Name}}
 
-import {{printf "%q" .Points}}
+import {{printf "%q" .Core}}
 
 func init() {
 {{- range .Variables}}
-	{{$.PointsName}}.RegisterError({{printf "%q" (print $.Path "." .)}}, {{.}})
+	{{$.CoreName}}.RegisterError({{printf "%q" (print $.Path "." .)}}, {{.}})
 {{- end}}
 }
 `))
@@ -361,7 +361,8 @@ func (p *placer) placeLoop(node ast.Node, body *ast.BlockStmt) {
 	body.List = append([]ast.Stmt{&ast.ExprStmt{X: p.call("Loop", point)}}, body.List...)
 }
 
-// errorRegistry is the source of a file that registers a package's error variables by name, or nil when it has none.
+// errorRegistry is the source of a file that registers a package's error variables by name in the core, which a
+// call fail rule returns and an observation names errors by, or nil when the package has none.
 func errorRegistry(pkg *packages.Package) []byte {
 	scope := pkg.Types.Scope()
 	variables := slices.DeleteFunc(scope.Names(), func(name string) bool {
@@ -373,7 +374,7 @@ func errorRegistry(pkg *packages.Package) []byte {
 	}
 	var source bytes.Buffer
 	err := registryTemplate.Execute(&source, map[string]any{"Name": pkg.Name, "Path": pkg.PkgPath, "Variables": variables,
-		"Points": pointsPackage, "PointsName": path.Base(pointsPackage)})
+		"Core": corePackage, "CoreName": path.Base(corePackage)})
 	if err != nil {
 		log.Fatal(err)
 	}

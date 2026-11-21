@@ -6,12 +6,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -110,14 +113,25 @@ func (c *ServerCall) FailureStatus() int {
 	return params.Status
 }
 
-// Finish observes the status the server answered.
-func (c *ServerCall) Finish(status int) {
-	faultpoint.Observe(c.Request.Context(), c.point, statusOutcome(status), milliseconds(c.started), c.Rule)
+// abandoned is whether the client went away before the server finished, which cancels the request's context.
+func (c *ServerCall) abandoned() string {
+	return strconv.FormatBool(errors.Is(c.Request.Context().Err(), context.Canceled))
 }
 
-// Panicked observes a request whose handler panicked.
-func (c *ServerCall) Panicked() {
-	faultpoint.Observe(c.Request.Context(), c.point, "error", milliseconds(c.started), c.Rule)
+// Finish observes the status the server answered.
+func (c *ServerCall) Finish(status int) {
+	faultpoint.Observe(c.Request.Context(), c.point, statusOutcome(status), milliseconds(c.started), c.Rule,
+		map[string]string{"status": strconv.Itoa(status), "abandoned": c.abandoned()})
+}
+
+// Panicked observes a request whose handler panicked with a value, named by its type or its registered name.
+func (c *ServerCall) Panicked(recovered any) {
+	name := fmt.Sprintf("%T", recovered)
+	if err, isError := recovered.(error); isError {
+		name = faultpoint.ErrorName(err)
+	}
+	faultpoint.Observe(c.Request.Context(), c.point, "error", milliseconds(c.started), c.Rule,
+		map[string]string{"error": name, "abandoned": c.abandoned()})
 }
 
 type server struct{ next http.Handler }
@@ -149,7 +163,7 @@ func (s server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			call.Panicked()
+			call.Panicked(recovered)
 			panic(recovered)
 		}
 	}()
@@ -212,14 +226,18 @@ func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, erro
 	return nil, action.PeerError(rule, params.Error)
 }
 
-// RoundTrip sends a request under the rule of its point.
+// RoundTrip sends a request under the rule of its point; a failure's detail tells whether the request was written
+// completely, that is whether the peer may have acted on it.
 func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	base := c.base
 	if base == nil {
 		base = http.DefaultTransport
 	}
 	ctx := request.Context()
-	request = request.Clone(ctx)
+	var wrote atomic.Bool
+	request = request.Clone(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) { wrote.Store(info.Err == nil) },
+	}))
 	propagator.Inject(ctx, propagation.HeaderCarrier(request.Header))
 	point := faultpoint.PointID(faultpoint.Service(), "rpc_client",
 		request.Method+" "+request.URL.Host+pathTemplate(request.URL.Path))
@@ -259,9 +277,14 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 		response, err = failure(request, rule)
 	}
 	if err != nil {
-		faultpoint.Observe(ctx, point, errorOutcome(err), milliseconds(started), rule)
+		faultpoint.Observe(ctx, point, errorOutcome(err), milliseconds(started), rule,
+			map[string]string{"error": faultpoint.ErrorName(err), "sent": strconv.FormatBool(wrote.Load())})
 		return nil, err
 	}
-	faultpoint.Observe(ctx, point, statusOutcome(response.StatusCode), milliseconds(started), rule)
+	detail := map[string]string{"status": strconv.Itoa(response.StatusCode)}
+	if kind == "fail" || kind == "fail_after" {
+		detail["sent"] = strconv.FormatBool(kind == "fail_after")
+	}
+	faultpoint.Observe(ctx, point, statusOutcome(response.StatusCode), milliseconds(started), rule, detail)
 	return response, nil
 }

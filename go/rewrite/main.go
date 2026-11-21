@@ -147,9 +147,8 @@ func instrumentPackage(service string, source module, copied string, config Conf
 			placed, used = append(placed, points...), append(used, imports...)
 		}
 	}
-	if registry := errorRegistry(pkg); registry != nil && slices.Contains(config.Plugins, pointsPlugin) && config.Placement.Errors {
+	if registry := errorRegistry(pkg); registry != nil && config.Placement.Errors {
 		writeFile(filepath.Join(copied, relativePath(source.dir, filepath.Dir(pkg.GoFiles[0])), registryFile), registry)
-		used = append(used, pointsPackage)
 	}
 	return placed, used
 }

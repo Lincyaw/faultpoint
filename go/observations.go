@@ -3,6 +3,7 @@ package faultpoint
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"strconv"
 	"sync"
@@ -10,7 +11,8 @@ import (
 )
 
 // Observation is Count executions of a point with one outcome and Total their summed quantity: one execution
-// from the core, or the counts a kernel program already aggregated.
+// from the core, or the counts a kernel program already aggregated. Detail tells apart executions of one outcome
+// by bounded values, such as an exact status or an error type, with the keys spec/kinds.json gives the kind.
 type Observation struct {
 	Experiment string
 	Point      string
@@ -20,6 +22,7 @@ type Observation struct {
 	Count      int
 	Total      float64
 	TraceID    string
+	Detail     map[string]string
 }
 
 // ObservationSink receives every observation; Flush writes what it holds, and the core calls it before
@@ -31,18 +34,19 @@ type ObservationSink interface {
 
 // ObservationRecord is one line of an observation file, as spec/observation.schema.json defines it.
 type ObservationRecord struct {
-	Experiment string   `json:"experiment"`
-	Service    string   `json:"service"`
-	Process    string   `json:"process"`
-	Start      float64  `json:"start"`
-	End        float64  `json:"end"`
-	Point      string   `json:"point"`
-	Outcome    string   `json:"outcome"`
-	Scope      string   `json:"scope"`
-	Rule       *string  `json:"rule"`
-	Count      int      `json:"count"`
-	Total      float64  `json:"total"`
-	Exemplars  []string `json:"exemplars"`
+	Experiment string            `json:"experiment"`
+	Service    string            `json:"service"`
+	Process    string            `json:"process"`
+	Start      float64           `json:"start"`
+	End        float64           `json:"end"`
+	Point      string            `json:"point"`
+	Outcome    string            `json:"outcome"`
+	Scope      string            `json:"scope"`
+	Rule       *string           `json:"rule"`
+	Count      int               `json:"count"`
+	Total      float64           `json:"total"`
+	Exemplars  []string          `json:"exemplars"`
+	Detail     map[string]string `json:"detail"`
 }
 
 // JSONLOptions are the options of the JSON Lines sink, given under "jsonl" in the configuration; a flush interval of
@@ -59,18 +63,20 @@ var DefaultJSONLOptions = JSONLOptions{FlushSeconds: 2, Exemplars: 5, ExemplarRa
 
 const exemplarBuckets = 10_000
 
+// tallyKey is what one record counts; detail is the detail in its canonical form, JSON with sorted keys.
 type tallyKey struct {
-	experiment, point, outcome, scope, rule string
+	experiment, point, outcome, scope, rule, detail string
 }
 
 type tally struct {
 	count     int
 	total     float64
 	exemplars []string
+	detail    map[string]string
 }
 
-// JSONLSink counts observations per experiment, point, outcome, scope and rule, and appends the counts of each
-// window to a JSON Lines file.
+// JSONLSink counts observations per experiment, point, outcome, scope, rule and detail, and appends the counts of
+// each window to a JSON Lines file.
 type JSONLSink struct {
 	path         string
 	service      string
@@ -109,12 +115,18 @@ func NewJSONLSink(path, service string, options JSONLOptions) (*JSONLSink, error
 
 // Add counts an observation.
 func (s *JSONLSink) Add(observation Observation) {
+	detail := map[string]string{}
+	maps.Copy(detail, observation.Detail)
+	canonical, err := json.Marshal(detail)
+	if err != nil {
+		panic(err)
+	}
 	key := tallyKey{experiment: observation.Experiment, point: observation.Point, outcome: observation.Outcome,
-		scope: observation.Scope, rule: observation.Rule}
+		scope: observation.Scope, rule: observation.Rule, detail: string(canonical)}
 	s.mu.Lock()
 	counted := s.tallies[key]
 	if counted == nil {
-		counted = &tally{}
+		counted = &tally{detail: detail}
 		s.tallies[key] = counted
 	}
 	counted.count += observation.Count
@@ -151,7 +163,7 @@ func (s *JSONLSink) Flush() {
 			Experiment: key.experiment, Service: s.service, Process: s.process,
 			Start: float64(start.UnixNano()) / 1e9, End: float64(end.UnixNano()) / 1e9,
 			Point: key.point, Outcome: key.outcome, Scope: key.scope, Count: counted.count,
-			Total: counted.total, Exemplars: append([]string{}, counted.exemplars...),
+			Total: counted.total, Exemplars: append([]string{}, counted.exemplars...), Detail: counted.detail,
 		}
 		if key.rule != "" {
 			record.Rule = &key.rule

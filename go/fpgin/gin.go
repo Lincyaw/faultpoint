@@ -39,7 +39,7 @@ func serve(c *gin.Context) {
 	c.Request = call.Request
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			call.Panicked()
+			call.Panicked(recovered)
 			panic(recovered)
 		}
 	}()

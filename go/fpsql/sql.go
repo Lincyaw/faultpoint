@@ -89,14 +89,14 @@ func exec(ctx context.Context, query string, run func() (driver.Result, error)) 
 		err = action.Failure(rule)
 	}
 	if err != nil {
-		faultpoint.Observe(ctx, point, "error", 0, rule)
+		faultpoint.Observe(ctx, point, "error", 0, rule, sqlpoint.ErrorDetail(err))
 		return nil, err
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
 		affected = 0
 	}
-	faultpoint.Observe(ctx, point, "ok", float64(affected), rule)
+	faultpoint.Observe(ctx, point, "ok", float64(affected), rule, nil)
 	return result, nil
 }
 
@@ -120,7 +120,7 @@ func read(ctx context.Context, sql string, run func() (driver.Rows, error)) (con
 		rows, err = run()
 	}
 	if err != nil {
-		faultpoint.Observe(ctx, point, "error", 0, rule)
+		faultpoint.Observe(ctx, point, "error", 0, rule, sqlpoint.ErrorDetail(err))
 		return ctx, nil, err
 	}
 	return context.WithValue(ctx, queryKey{}, &query{point: point, rule: rule, empty: kind == "empty"}), rows, nil
@@ -163,7 +163,7 @@ func (interceptor) RowsClose(ctx context.Context, rows driver.Rows) error {
 		if state.rows > 0 {
 			outcome = "rows"
 		}
-		faultpoint.Observe(ctx, state.point, outcome, float64(state.rows), state.rule)
+		faultpoint.Observe(ctx, state.point, outcome, float64(state.rows), state.rule, nil)
 	}
 	return rows.Close()
 }

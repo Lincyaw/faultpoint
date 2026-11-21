@@ -73,18 +73,21 @@ func (s statement) refuse(call string, actions ...string) {
 	}
 }
 
-// observe records an outcome: error, rows or empty for a read, ok for a write, with the rows read or affected.
+// observe records an outcome: error, with its name and SQLSTATE, rows or empty for a read, ok for a write, with the
+// rows read or affected.
 func (s statement) observe(rows int64, err error) {
+	if err != nil {
+		faultpoint.Observe(s.ctx, s.point, "error", 0, s.rule, sqlpoint.ErrorDetail(err))
+		return
+	}
 	outcome := "ok"
 	switch {
-	case err != nil:
-		outcome = "error"
 	case s.kind == "store_read" && rows > 0:
 		outcome = "rows"
 	case s.kind == "store_read":
 		outcome = "empty"
 	}
-	faultpoint.Observe(s.ctx, s.point, outcome, float64(rows), s.rule)
+	faultpoint.Observe(s.ctx, s.point, outcome, float64(rows), s.rule, nil)
 }
 
 type execer interface {

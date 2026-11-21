@@ -40,6 +40,9 @@ func Hold(rule *faultpoint.Rule) {
 // ErrInjected is the error of a store or broker whose fail rule names no peer error.
 var ErrInjected = errors.New("faultpoint: injected failure")
 
+// The injected error is registered, so that an observation names it as it names the sentinels of the service.
+func init() { faultpoint.RegisterError("faultpoint/internal/action.ErrInjected", ErrInjected) }
+
 // Failure is the error a fail or fail_after rule of a store or broker gives the caller: the peer error the rule
 // names, or ErrInjected.
 func Failure(rule *faultpoint.Rule) error {

@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
-	"sync"
 	"time"
 
 	"faultpoint"
@@ -22,12 +21,6 @@ var enabled = faultpoint.Register(faultpoint.Plugin{Name: "points", Actions: map
 	"clock":   {"shift", "delay", "crash"},
 	"acquire": {"fail", "delay", "crash"},
 }})
-
-var registeredErrors sync.Map
-
-// RegisterError names an error a call point returns when a fail rule names it, so that an injection returns a
-// sentinel the code really returns.
-func RegisterError(name string, err error) { registeredErrors.Store(name, err) }
 
 type injectedError struct{ point string }
 
@@ -47,12 +40,12 @@ func Branch(ctx context.Context, point string, taken bool) bool {
 	if taken {
 		outcome = "taken"
 	}
-	faultpoint.Observe(ctx, point, outcome, 0, rule)
+	faultpoint.Observe(ctx, point, outcome, 0, rule, nil)
 	return taken
 }
 
-// Failed observes the error a call returned and, under a fail rule, replaces it with the registered error the
-// rule names or an injected one; it reports whether the error is not nil.
+// Failed observes the error a call returned, with its name as the detail, and, under a fail rule, replaces it with
+// the registered error the rule names or an injected one; it reports whether the error is not nil.
 func Failed(ctx context.Context, point string, err *error) bool {
 	if !enabled {
 		return *err != nil
@@ -68,19 +61,19 @@ func Failed(ctx context.Context, point string, err *error) bool {
 		rule.DecodeParams(&params)
 		*err = &injectedError{point: point}
 		if params.Error != "" {
-			registered, found := registeredErrors.Load(params.Error)
+			registered, found := faultpoint.RegisteredError(params.Error)
 			if !found {
 				faultpoint.Abort("rule %s names unregistered error %q", rule.ID, params.Error)
 			}
-			*err = registered.(error)
+			*err = registered
 		}
 	}
-	outcome := "ok"
-	if *err != nil {
-		outcome = "error"
+	if *err == nil {
+		faultpoint.Observe(ctx, point, "ok", 0, rule, nil)
+		return false
 	}
-	faultpoint.Observe(ctx, point, outcome, 0, rule)
-	return *err != nil
+	faultpoint.Observe(ctx, point, "error", 0, rule, map[string]string{"error": faultpoint.ErrorName(*err)})
+	return true
 }
 
 // Check is the result of a detector, negated by a negate rule.
@@ -97,7 +90,7 @@ func Check(ctx context.Context, point string, result bool) bool {
 	if result {
 		outcome = "true"
 	}
-	faultpoint.Observe(ctx, point, outcome, 0, rule)
+	faultpoint.Observe(ctx, point, outcome, 0, rule, nil)
 	return result
 }
 
@@ -110,7 +103,7 @@ func Loop(ctx context.Context, point string) {
 	if rule != nil {
 		action.Hold(rule)
 	}
-	faultpoint.Observe(ctx, point, "iteration", 0, rule)
+	faultpoint.Observe(ctx, point, "iteration", 0, rule, nil)
 }
 
 // Value is a business value, replaced by a set rule or offset by a shift rule.
@@ -135,7 +128,7 @@ func Value[T any](ctx context.Context, point string, observed T) T {
 	if rule != nil && rule.Action.Kind == "shift" {
 		result = shifted(rule, result)
 	}
-	faultpoint.Observe(ctx, point, "observed", numeric(result), rule)
+	faultpoint.Observe(ctx, point, "observed", numeric(result), rule, nil)
 	return result
 }
 
@@ -188,7 +181,7 @@ func Clock(ctx context.Context, point string, reading time.Time) time.Time {
 		rule.DecodeParams(&params)
 		reading = reading.Add(time.Duration(params.Amount * float64(time.Second)))
 	}
-	faultpoint.Observe(ctx, point, "read", 0, rule)
+	faultpoint.Observe(ctx, point, "read", 0, rule, nil)
 	return reading
 }
 
@@ -206,6 +199,6 @@ func Acquire(ctx context.Context, point string, acquired bool) bool {
 	if acquired {
 		outcome = "acquired"
 	}
-	faultpoint.Observe(ctx, point, outcome, 0, rule)
+	faultpoint.Observe(ctx, point, outcome, 0, rule, nil)
 	return acquired
 }

@@ -161,19 +161,31 @@ func (c call) settle(cmd redis.Cmder, err error) error {
 		cmd.SetErr(err)
 	}
 	outcome, total := "ok", 0
+	var detail map[string]string
 	reads := c.command.Kind == "store_read" || c.command.Kind == "consume"
 	switch {
 	case reads && c.command.Empty == "nil" && errors.Is(err, redis.Nil):
 		outcome = "empty"
 	case err != nil:
-		outcome = "error"
+		outcome, detail = "error", errorDetail(err)
 	case reads && empty(cmd, c.command.Empty):
 		outcome = "empty"
 	case reads:
 		outcome, total = "rows", size(cmd)
 	}
-	faultpoint.Observe(c.ctx, c.point, outcome, float64(total), c.rule)
+	faultpoint.Observe(c.ctx, c.point, outcome, float64(total), c.rule, detail)
 	return err
+}
+
+// errorDetail is the detail of a failed command: the error's name and, for an error reply of Redis, its prefix,
+// such as WRONGTYPE or NOSCRIPT.
+func errorDetail(err error) map[string]string {
+	detail := map[string]string{"error": faultpoint.ErrorName(err)}
+	var reply redis.Error
+	if errors.As(err, &reply) {
+		detail["code"], _, _ = strings.Cut(reply.Error(), " ")
+	}
+	return detail
 }
 
 // Every typed go-redis command has Val and SetVal, through which the reply is read and replaced.

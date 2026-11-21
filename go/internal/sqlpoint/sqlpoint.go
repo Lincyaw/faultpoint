@@ -1,10 +1,13 @@
-// Package sqlpoint classifies SQL statements into the store points of the SQL adapter plugins.
+// Package sqlpoint classifies SQL statements into the store points of the SQL adapter plugins and describes their
+// failures.
 package sqlpoint
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -62,4 +65,19 @@ func (c *Classifier) Classify(query string) Point {
 	point.Locator = tables + "#" + hex.EncodeToString(digest[:])[:8]
 	c.points.Store(query, point)
 	return point
+}
+
+// ErrorDetail is the detail of a failed statement: the error's name and, when the driver reports one, its code: the
+// SQLSTATE of a PostgreSQL driver, or the numeric code of a driver such as SQLite's.
+func ErrorDetail(err error) map[string]string {
+	detail := map[string]string{"error": faultpoint.ErrorName(err)}
+	var state interface{ SQLState() string }
+	var numbered interface{ Code() int }
+	switch {
+	case errors.As(err, &state):
+		detail["code"] = state.SQLState()
+	case errors.As(err, &numbered):
+		detail["code"] = strconv.Itoa(numbered.Code())
+	}
+	return detail
 }

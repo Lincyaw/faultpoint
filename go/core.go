@@ -191,13 +191,14 @@ func (c *core) fires(state *ruleState, rule *Rule) bool {
 	return fires
 }
 
-// Observe hands one outcome of a point to the sink; rule is the rule that injected at this execution, or nil.
-func Observe(ctx context.Context, point, outcome string, total float64, rule *Rule) {
+// Observe hands one outcome of a point to the sink, with the detail of the kind; rule is the rule that injected at
+// this execution, or nil.
+func Observe(ctx context.Context, point, outcome string, total float64, rule *Rule, detail map[string]string) {
 	if !current.started.Load() || current.sink == nil {
 		return
 	}
 	observation := Observation{Experiment: current.state.Load().experiment, Point: point, Outcome: outcome,
-		Count: 1, Total: total}
+		Count: 1, Total: total, Detail: detail}
 	if rule != nil {
 		observation.Rule = rule.ID
 	}
