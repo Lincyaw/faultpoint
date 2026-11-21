@@ -166,19 +166,39 @@ pub fn acquire(point: &str, acquired: bool) -> bool {
     acquired
 }
 
-/// The result of a call, observed and, under a fail rule, replaced by an injected error.
-pub fn call<T, E: From<Injected>>(point: &str, result: Result<T, E>) -> Result<T, E> {
+/// What a call point decides before its call: under a fail rule the injected error takes the call's place and
+/// the call does not run; otherwise the call runs under the rule decided, if any.
+pub enum Before {
+    Fail(Rule, Injected),
+    Run(Option<Rule>),
+}
+
+/// Decide the rule of a call point before its call, so that delay and crash act before the call runs.
+pub fn before_call(point: &str) -> Before {
+    let core = core();
+    if !core.enabled {
+        return Before::Run(None);
+    }
+    let rule = core.decide(point);
+    if let Some(rule) = &rule {
+        hold(rule);
+    }
+    match rule {
+        Some(rule) if rule.action.kind == "fail" => Before::Fail(rule, Injected { point: point.into() }),
+        rule => Before::Run(rule),
+    }
+}
+
+/// Observe the result of a call under the rule decided before it; under a fail_after rule the call has run and
+/// its result is replaced by the injected error.
+pub fn after_call<T, E: From<Injected>>(point: &str, rule: Option<Rule>, result: Result<T, E>) -> Result<T, E> {
     let core = core();
     if !core.enabled {
         return result;
     }
-    let rule = core.decide(point);
     let result = match &rule {
-        Some(rule) => {
-            hold(rule);
-            if rule.action.kind == "fail" { Err(Injected { point: point.into() }.into()) } else { result }
-        }
-        None => result,
+        Some(rule) if rule.action.kind == "fail_after" => Err(Injected { point: point.into() }.into()),
+        _ => result,
     };
     match &result {
         Ok(_) => core.observe(point, "ok", 0.0, rule.as_ref(), Detail::new()),
@@ -192,7 +212,7 @@ inventory::submit! {
         name: "points",
         kinds: &[
             ("branch", &["fail", "delay", "crash"]),
-            ("call", &["fail", "delay", "crash"]),
+            ("call", &["fail", "fail_after", "delay", "crash"]),
             ("check", &["negate", "delay", "crash"]),
             ("loop", &["delay", "crash"]),
             ("value", &["set", "shift", "delay", "crash"]),

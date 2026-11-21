@@ -310,7 +310,15 @@ impl VisitMut for Placer<'_> {
             let Expr::Try(attempt) = node else { unreachable!() };
             visit_mut::visit_expr_mut(self, &mut attempt.expr);
             let inner = &attempt.expr;
-            *node = parse_quote!(::faultpoint::call(#id, (#inner).map_err(<#error as ::core::convert::From<_>>::from))?);
+            // A match, not a closure, decides before the call, so that an .await in the call stays legal; the names it
+            // binds are in scope while the call runs, so they are ones the call cannot mean.
+            *node = parse_quote!((match ::faultpoint::before_call(#id) {
+                ::faultpoint::Before::Fail(__faultpoint_rule, __faultpoint_injected) => ::faultpoint::after_call(#id,
+                    ::core::option::Option::Some(__faultpoint_rule),
+                    ::core::result::Result::Err(<#error as ::core::convert::From<_>>::from(__faultpoint_injected))),
+                ::faultpoint::Before::Run(__faultpoint_rule) => ::faultpoint::after_call(#id, __faultpoint_rule,
+                    (#inner).map_err(<#error as ::core::convert::From<_>>::from)),
+            })?);
             return;
         }
         visit_mut::visit_expr_mut(self, node);

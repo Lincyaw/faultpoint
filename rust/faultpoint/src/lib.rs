@@ -10,7 +10,7 @@ pub mod store;
 pub mod tower;
 
 pub use crate::core::core;
-pub use crate::points::{Injected, acquire, branch, call, check, clock, loop_iteration, value};
+pub use crate::points::{Before, Injected, acquire, after_call, before_call, branch, check, clock, loop_iteration, value};
 
 /// Write the pending observations; a process calls it before a graceful exit.
 pub fn flush() {
