@@ -134,7 +134,8 @@ orders 的超时由环境变量 `RESERVE_TIMEOUT_S` 给出，作用于它的整�
 | `branch` taken | 无：`fail` 也在自然的原因到不了的执行中强制走入分支，例如成功的请求；拼接经过它背后的原因的边界效果 |
 | `call` error（Python、Java、TypeScript、Rust 的服务） | `fail`，抛出细节中的错误类型，例如 Python 可导入的类；细节中没有类型时无对应 |
 | `call` error（Go 的服务） | 无：Go 调用点的 `fail` 在被调用者执行之后、`err != nil` 的判断处替换错误，使已经完成的工作失败，自然的错误不会这样；已登记的哨兵在同一处判断，也一样 |
-| `call` error（上游组件的原生函数） | `fail`，写入代理配置给出的、与自然失败相同的值 |
+| `call` error（上游组件的原生函数，失败说明它的客户端已经离开，目前是 `pq_getbyte` 的 EOF） | 无：这是客户端行为的结果，忠实的对应是客户端自己的失败，链本来就能到达它 |
+| `call` error（上游组件的其他原生函数，目前是 `lookupKey`） | `fail`，写入代理配置给出的、与自然失败相同的值 |
 | `check` 出现对照中没有的结果 | 无：`negate` 翻转每一次判断，也翻转自然的原因没有碰到的执行，例如 orders 对已成功的预留判断 `retryable`；拼接经过它背后的原因的边界效果 |
 | `loop` 迭代增加 | `delay`（解读为竞争） |
 | `rpc_client` timeout，请求没有完整发出（`sent=false`） | `fail` timeout |
@@ -142,6 +143,7 @@ orders 的超时由环境变量 `RESERVE_TIMEOUT_S` 给出，作用于它的整�
 | `rpc_client` timeout，请求已发出，服务端在调用方离开后答复 4xx 或 5xx | `fail` timeout：对端没有完成工作，`fail_after` 会让它完成 |
 | `rpc_client` timeout，请求已发出，没有这样的服务端效果 | 无：不知道对端是否完成了工作 |
 | `rpc_client`/`rpc_server` 4xx、5xx | `fail`，状态码取细节中的精确值：调用方按具体状态码分支（orders 只把 409 当作缺货） |
+| `rpc_server` 在调用方离开之后答复（`abandoned=true`）的任何结果，次数或均值 | 无：这是服务端注意到调用方已超时，是调用方的结果；`abandoned` 不在细节中时是未知，按前两行对应 |
 | `rpc_client` refused | `fail` refused（不在目录中） |
 | `rpc_client`/`rpc_server` 均值增加 | `delay` |
 | `store_read` empty / error | `empty` / `fail` |
@@ -331,14 +333,31 @@ orders 的超时由环境变量 `RESERVE_TIMEOUT_S` 给出，作用于它的整�
 
   - 包延迟起头的 3 条（上游 > 业务 > 业务 > 业务）在第 2 跳断开：期待 orders 对 `/reserve` 的调用收到 5xx `status=500`，实际是 timeout `error=httpx.ReadTimeout sent=true`，每次 15 次。inventory 的 500 在 orders 离开之后才答复（其中一条的第一跳就是 inventory 服务端的 5xx `abandoned=true status=500`），拼接却把它对应到立即答复的 `fail status=500`，或 inventory 存储上的 `fail`。
   - pgxpool、puddle 起头的 2 条（依赖库 > 上游 > 业务 > 业务）在第 2 跳断开：期待 inventory 的 `stock` 读取以 `*pgconn.ConnectError` 失败，实际以 `*fppoints.injectedError` 失败，每次 3 次，这是链首自己注入的错误。`pq_getbyte` 读到的 EOF 是 inventory 关闭连接的结果，不是原因，拼接把方向反了过来。
-- **结论**：两个预言都成立。之前的 1288 条链都经过这三类对应，去掉之后，shop 中几乎不剩只靠拼接的跨层链，忠实的对应拼出的链在单个场景中已经可见。剩下的 5 条被否定，原因是时机（服务端在调用方离开后才答复）和方向（上游的自然结果是业务服务行为的结果）。细节记下了前者（`abandoned=true`），效果映射对服务端的状态还没有用它；后者是效果的因果方向，观测不记录。
+- **结论**：两个预言都成立。之前的 1288 条链都经过这三类对应，去掉之后，shop 中几乎不剩只靠拼接的跨层链，忠实的对应拼出的链在单个场景中已经可见。剩下的 5 条被否定，原因是时机（服务端在调用方离开后才答复）和方向（上游的自然结果是业务服务行为的结果）。细节记下了前者（`abandoned=true`），这一次的效果映射对服务端的状态还没有用它；后者是效果的因果方向，观测不记录。
+
+第二次检验：实验 `runs/search/shop-faithful-counterparts/`，同一构建，沿用上一次检验的全部记录。
+
+- **假设**：剩下的两种否定是同一类：记下“对端已经离开”的观测是对端的结果，不是这一处的原因。inventory 的 5xx `abandoned=true` 是 inventory 注意到 orders 已离开；`pq_getbyte` 自然的 EOF 是 PostgreSQL 注意到 inventory 关闭了连接。忠实的对应在对端（orders 的超时、inventory 自己的失败），链本来就能到达。规则：服务端 `abandoned=true` 的效果没有对应；原生函数中表示客户端离开的结果没有对应，目前是 `pq_getbyte` 的 EOF，作为数据写在效果映射的按函数规则中。
+- **预言**：经过这两类对应的链消失；剩下的若被否定，原因不是对端已离开。
+- **代价**：0 次新的注入；验证全部沿用已有的记录，0 次新的重复。
+- **结果**：3781 条边、133437 条链。跨层、只靠拼接、终止于用户的链剩 4 条，全部在基线中、以 PostgreSQL 的包延迟起头、终止于 `/checkout` 502：包延迟 → inventory 的 `stock` 读或写以 `*errors.errorString` 失败 → 在这个存储点注入 `fail` → orders 对 `/reserve` 的调用收到 500，或 inventory 服务端答复 500 → 用户 502。它们只有一种（层，终点），按每对最多 3 条验证 3 条，另验证与上一次相同的 3 条阳性对照：
+
+  | 选取 | 条数 | 证实 | 否定 |
+  | --- | --- | --- | --- |
+  | 跨层、只靠拼接、终止于用户 | 3 | 0 | 3 |
+  | 阳性对照 | 3 | 3 | 0 |
+
+  3 条都在第 2 跳断开：期待 orders 收到 500，实际是 timeout `sent=true`，每次 15 次（2 条）；期待 inventory 服务端答复 5xx `abandoned=false status=500`，实际是 5xx `abandoned=true status=500`，每次 15 次（1 条）。
+- **结论**：第一个预言成立；第二个不成立：剩下的否定仍是对端已离开。包延迟使 orders 先超时离开，inventory 的存储调用随后才失败，`*errors.errorString` 也是 Go 的 `context.Canceled` 的类型；存储点的细节没有 `abandoned`，观测不说明这个失败发生在调用方离开之后，效果映射就把它当作原因。
 
 ## 7. 局限
+
+- **总的发现**：在 shop 中，对应故障忠实之后，跨层的链只经由 inventory 和 PostgreSQL 到达用户，而这些链在单个场景中已经可见。只靠拼接得到的跨层链，都经过不忠实的对应：取反、分支和 Go 调用点上改变了自然原因没有碰到的执行的注入，或把对端已离开的结果当作原因。
 
 - 一次实验、一个随机种子；随机分配与分阶段分配的比较只针对第一轮的这一次抽样。
 - 计数的下限是固定的 20%：上游后台工作随运行时长的增加大多在 5% 以内，被它去掉；低于 20% 的真实增加（例如 33 次 Redis 命令多出 3 次）也被去掉。按运行时长归一化范围之外的计数，可以不靠这个下限。
 - 效果映射不知道调用方看到失败时工作是否已经完成，所以 `check`、`branch`、Go 调用点和依赖库中的结果都不对应故障，拼接只经过边界效果（第 6.3 节）。
-- 服务端在调用方离开之后才答复的状态（`abandoned=true`）仍对应立即答复的 `fail`；上游组件的自然结果可能是业务服务行为的结果，拼接不知道效果的方向（第 6.3 节）。
+- 拼接不知道效果的因果方向：服务端的 `abandoned` 和 `pq_getbyte` 的 EOF 标出了“对端已经离开”，其他点上同样由对端离开引起的失败（例如 inventory 在 orders 离开之后的存储错误）没有这样的细节，仍被当作原因（第 6.3 节）。
 - 注入的错误以 SDK 自己的类型出现在下游的细节中（`faultpoint/internal/action.ErrInjected`、`*fppoints.injectedError`），与自然错误的类型不同，经过这类效果的拼接在键上就与自然的传播不一致。
 - 验证反馈按（效果，对应的故障，后果）三元组排除被否定的步，同一个不忠实的对应可以经由下一个后果再次出现；反馈只能逐步收敛，不能推广到同一类对应。
 - 依赖库中的热路径故障点没有延迟动作；库中的 `fail` 可能使连接池进入真实系统不会进入的状态，结论限于它实际表现出的行为。
