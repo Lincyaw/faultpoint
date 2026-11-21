@@ -10,7 +10,7 @@ import { ROOT_CONTEXT, context, defaultTextMapGetter, defaultTextMapSetter } fro
 import { z } from "zod";
 
 import { PROPAGATOR } from "./context.js";
-import { CORE, EVERY_LOCATOR, type Plugin, errorName } from "./core.js";
+import { ACTS_AFTER, ACTS_BEFORE, CORE, EVERY_LOCATOR, type Plugin, errorName } from "./core.js";
 import { type Rule, numberParameter, pointId, stringParameter } from "./rules.js";
 
 const DEFAULT_FAILURE_STATUS = 503;
@@ -79,7 +79,7 @@ class HttpBoundaries {
       }
       const url = new URL(request.url);
       const point = pointId(CORE.settings.service, "rpc_client", `${request.method} ${url.host}${this.pathTemplate(url.pathname)}`);
-      const rule = CORE.decide(point);
+      const rule = CORE.decideAmong(point, ACTS_BEFORE);
       const kind = rule?.action.kind;
       const started = performance.now();
       if (rule !== null) {
@@ -100,9 +100,11 @@ class HttpBoundaries {
           { error: errorName(error), sent: String(exchange.sent) });
         throw error;
       }
-      if (rule !== null && kind === "fail_after") {
+      // Only a request that got a response is one a fail_after rule replaces and counts.
+      const replacing = CORE.decideAmong(point, ACTS_AFTER);
+      if (replacing !== null) {
         await response.arrayBuffer();
-        return failFetch(point, rule, started);
+        return failFetch(point, replacing, started);
       }
       CORE.observe(point, statusOutcome(response.status), performance.now() - started, rule, { status: String(response.status) });
       return response;
@@ -122,11 +124,11 @@ class HttpBoundaries {
       const host = String(clientRequest.getHeader("host") ?? clientRequest.host);
       const point = pointId(CORE.settings.service, "rpc_client",
         `${clientRequest.method} ${host}${boundaries.pathTemplate(clientRequest.path)}`);
-      const rule = CORE.decide(point);
+      const rule = CORE.decideAmong(point, ACTS_BEFORE);
       const requestContext = context.active();
       const started = performance.now();
-      const observe = (outcome: string, detail: Record<string, string>): void => context.with(requestContext,
-        () => CORE.observe(point, outcome, performance.now() - started, rule, detail));
+      const observe = (outcome: string, detail: Record<string, string>, observed: Rule | null): void => context.with(requestContext,
+        () => CORE.observe(point, outcome, performance.now() - started, observed, detail));
       if (rule?.action.kind === "duplicate") {
         CORE.abort(`rule ${rule.id}: duplicate at ${point} needs fetch, since an http.request body cannot be sent twice`);
       }
@@ -140,18 +142,17 @@ class HttpBoundaries {
         answerInstead(clientRequest, rule, observe);
         return clientRequest;
       }
-      if (rule?.action.kind === "fail_after") {
-        replaceResponse(clientRequest, rule, observe);
-        return clientRequest;
-      }
       // A request finishes when its headers and body have been handed to the operating system.
-      let sent = false;
+      const exchange = { sent: false, replaced: false };
       clientRequest.once("finish", () => {
-        sent = true;
+        exchange.sent = true;
       });
-      clientRequest.once("response", (response: IncomingMessage) => observe(statusOutcome(response.statusCode ?? 0),
-        { status: String(response.statusCode ?? 0) }));
-      clientRequest.once("error", (error) => observe(errorOutcome(error), { error: errorName(error), sent: String(sent) }));
+      receiveResponse(clientRequest, rule, exchange, () => context.with(requestContext, () => CORE.decideAmong(point, ACTS_AFTER)), observe);
+      clientRequest.once("error", (error) => {
+        if (!exchange.replaced) {
+          observe(errorOutcome(error), { error: errorName(error), sent: String(exchange.sent) }, rule);
+        }
+      });
       return clientRequest;
     } as typeof http.request;
   }
@@ -255,36 +256,46 @@ function deferSending(clientRequest: ClientRequest, ms: number): void {
 }
 
 /** Answer a request without sending it: a synthetic status, or an error as if the peer failed. */
-function answerInstead(clientRequest: ClientRequest, rule: Rule, observe: (outcome: string, detail: Record<string, string>) => void): void {
+function answerInstead(clientRequest: ClientRequest, rule: Rule,
+                       observe: (outcome: string, detail: Record<string, string>, observed: Rule | null) => void): void {
   clientRequest.write = (() => true) as typeof clientRequest.write;
   clientRequest.end = (() => clientRequest) as typeof clientRequest.end;
   process.nextTick(() => {
     if (typeof rule.action.status === "number") {
-      observe(statusOutcome(rule.action.status), { status: String(rule.action.status), sent: "false" });
+      observe(statusOutcome(rule.action.status), { status: String(rule.action.status), sent: "false" }, rule);
       clientRequest.emit("response", syntheticResponse(rule.action.status));
       clientRequest.destroy();
       return;
     }
     const error = boundaryError(rule);
-    observe(errorOutcome(error), { error: errorName(error), sent: "false" });
+    observe(errorOutcome(error), { error: errorName(error), sent: "false" }, rule);
     clientRequest.destroy(error);
   });
 }
 
-/** Let a request reach its peer, then hide the real response behind a failure. */
-function replaceResponse(clientRequest: ClientRequest, rule: Rule, observe: (outcome: string, detail: Record<string, string>) => void): void {
+/** Let a request reach its peer and watch its response: a fail_after rule decided when the response comes, which only
+ * an answered request counts, hides it behind a failure; otherwise the response is observed and passed on. */
+function receiveResponse(clientRequest: ClientRequest, rule: Rule | null, exchange: { replaced: boolean },
+                         replacing: () => Rule | null, observe: (outcome: string, detail: Record<string, string>, observed: Rule | null) => void): void {
   const emit = clientRequest.emit;
   clientRequest.emit = function (this: ClientRequest, event: string | symbol, ...arguments_: unknown[]): boolean {
     if (event !== "response") {
       return emit.call(this, event, ...arguments_);
     }
-    (arguments_[0] as IncomingMessage).resume();
-    if (typeof rule.action.status === "number") {
-      observe(statusOutcome(rule.action.status), { status: String(rule.action.status), sent: "true" });
-      return emit.call(this, "response", syntheticResponse(rule.action.status));
+    const response = arguments_[0] as IncomingMessage;
+    const replacement = replacing();
+    if (replacement === null) {
+      observe(statusOutcome(response.statusCode ?? 0), { status: String(response.statusCode ?? 0) }, rule);
+      return emit.call(this, event, ...arguments_);
     }
-    const error = boundaryError(rule);
-    observe(errorOutcome(error), { error: errorName(error), sent: "true" });
+    exchange.replaced = true;
+    response.resume();
+    if (typeof replacement.action.status === "number") {
+      observe(statusOutcome(replacement.action.status), { status: String(replacement.action.status), sent: "true" }, replacement);
+      return emit.call(this, "response", syntheticResponse(replacement.action.status));
+    }
+    const error = boundaryError(replacement);
+    observe(errorOutcome(error), { error: errorName(error), sent: "true" }, replacement);
     this.destroy(error);
     return true;
   } as typeof clientRequest.emit;

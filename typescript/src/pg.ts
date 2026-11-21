@@ -5,7 +5,7 @@ import { context } from "@opentelemetry/api";
 import { fingerprintSync, hasSqlDetails, loadModule, parseSync } from "libpg-query";
 
 import { applicationModule } from "./config.js";
-import { CORE, type Plugin, errorName } from "./core.js";
+import { ACTS_AFTER, ACTS_BEFORE, CORE, type Plugin, errorName } from "./core.js";
 import { type Rule, numberParameter, pointId, pointParts, stringParameter } from "./rules.js";
 
 type StoreKind = "store_read" | "store_write";
@@ -88,11 +88,21 @@ function refusal(rule: Rule): string | null {
     || SQLSTATE.test(code) ? null : `code ${code} at ${rule.point} is not a SQLSTATE, five digits or upper-case letters`;
 }
 
-/** Run a query under its rule; a dropped write is acknowledged without reaching the database, and an injected failure
- * is an error response of the rule's SQLSTATE, or of 08006, connection_failure, when it names none. */
+/** The error a fail or fail_after rule raises: an error response of the rule's SQLSTATE, or of 08006,
+ * connection_failure, when it names none. */
+function injectedError(DatabaseError: DatabaseError, rule: Rule, message: string): Error {
+  return Object.assign(new DatabaseError(`faultpoint: ${message}`, 0, "error"),
+    { severity: "ERROR", code: stringParameter(rule, "code") ?? "08006" });
+}
+
+/** A failed statement's error and, for an error response of PostgreSQL, its SQLSTATE. */
+function failureDetail(error: unknown, DatabaseError: DatabaseError): Record<string, string> {
+  return error instanceof DatabaseError && typeof error.code === "string"
+    ? { error: errorName(error), code: error.code } : { error: errorName(error) };
+}
+
+/** Run a query under the rule decided before it; a dropped write is acknowledged without reaching the database. */
 async function execute(rule: Rule | null, run: () => Promise<unknown>, DatabaseError: DatabaseError): Promise<unknown> {
-  const injectedError = (failing: Rule, message: string) => Object.assign(new DatabaseError(`faultpoint: ${message}`, 0, "error"),
-    { severity: "ERROR", code: stringParameter(failing, "code") ?? "08006" });
   switch (rule?.action.kind) {
     case "delay":
       await sleep(numberParameter(rule, "ms"));
@@ -100,15 +110,12 @@ async function execute(rule: Rule | null, run: () => Promise<unknown>, DatabaseE
     case "crash":
       return CORE.crash(typeof rule.action.code === "number" ? rule.action.code : 1);
     case "fail":
-      throw injectedError(rule, "injected store failure");
+      throw injectedError(DatabaseError, rule, "injected store failure");
     case "drop":
       return { command: "", rowCount: 1, rows: [], fields: [] } satisfies QueryResult;
     case "duplicate":
       await run();
       return run();
-    case "fail_after":
-      await run();
-      throw injectedError(rule, "store failed after the statement ran");
     case "empty": {
       const result = await run();
       results(result).forEach((each) => Object.assign(each, { rows: [], rowCount: 0 }));
@@ -132,23 +139,29 @@ function instrumentQuery(original: Query, DatabaseError: DatabaseError): Query {
     const forwarded = typeof values === "function" ? [config] : [config, values];
     const statement = statementPoint(text);
     const point = pointId(CORE.settings.service, statement.kind, statement.locator);
-    const rule = CORE.decide(point);
+    const rule = CORE.decideAmong(point, ACTS_BEFORE);
     const requestContext = context.active();
     const started = performance.now();
-    const observe = (outcome: string, quantity: number, detail: Record<string, string>): void => context.with(requestContext,
-      () => CORE.observe(point, outcome, quantity, rule, detail));
+    const observe = (outcome: string, quantity: number, observed: Rule | null, detail: Record<string, string>): void =>
+      context.with(requestContext, () => CORE.observe(point, outcome, quantity, observed, detail));
     const result = execute(rule, () => original.apply(this, forwarded) as Promise<unknown>, DatabaseError).then((answer) => {
+      // Only a statement that ran and succeeded is one a fail_after rule replaces and counts.
+      const replacing = rule?.action.kind === "drop" ? null : context.with(requestContext, () => CORE.decideAmong(point, ACTS_AFTER));
+      if (replacing !== null) {
+        const error = injectedError(DatabaseError, replacing, "store failed after the statement ran");
+        observe("error", performance.now() - started, replacing, failureDetail(error, DatabaseError));
+        throw error;
+      }
       const each = results(answer);
       if (statement.kind === "store_read") {
         const rows = each.reduce((total, part) => total + (part?.rows?.length ?? 0), 0);
-        observe(rows > 0 ? "rows" : "empty", rows, {});
+        observe(rows > 0 ? "rows" : "empty", rows, rule, {});
       } else {
-        observe("ok", each.reduce((total, part) => total + (part?.rowCount ?? 0), 0), {});
+        observe("ok", each.reduce((total, part) => total + (part?.rowCount ?? 0), 0), rule, {});
       }
       return answer;
     }, (error: unknown) => {
-      observe("error", performance.now() - started, error instanceof DatabaseError && typeof error.code === "string"
-        ? { error: errorName(error), code: error.code } : { error: errorName(error) });
+      observe("error", performance.now() - started, rule, failureDetail(error, DatabaseError));
       throw error;
     });
     if (done === undefined) {

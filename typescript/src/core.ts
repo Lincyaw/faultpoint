@@ -55,6 +55,11 @@ function seededRandom(seed: string): () => number {
 /** The locators of every point of a kind, for a plugin that serves them all. */
 export const EVERY_LOCATOR = (): boolean => true;
 
+/** fail_after acts only on an operation that completed normally, so a point decides and counts it only then; every
+ * other action acts before the operation. */
+export const ACTS_AFTER = (action: string): boolean => action === "fail_after";
+export const ACTS_BEFORE = (action: string): boolean => action !== "fail_after";
+
 /** The kinds one plugin serves with the actions it implements there, at the points whose locators it serves. */
 interface Declaration {
   readonly kinds: Readonly<Record<string, readonly string[]>>;
@@ -147,8 +152,15 @@ export class Core {
 
   /** The first rule of a point whose scope matches the current request and whose trigger fires. */
   decide(point: string): Rule | null {
+    return this.decideAmong(point, () => true);
+  }
+
+  /** The first rule of a point among the rules of the given actions whose scope matches the current request and
+   * whose trigger fires. Only those rules are counted, so that a point deciding before and after its operation counts
+   * a rule only where it can act. */
+  decideAmong(point: string, actions: (action: string) => boolean): Rule | null {
     for (const rule of this.rules.get(point) ?? []) {
-      if (!Object.entries(rule.scope).every(([key, value]) => this.context?.baggage(key) === value)) {
+      if (!actions(rule.action.kind) || !Object.entries(rule.scope).every(([key, value]) => this.context?.baggage(key) === value)) {
         continue;
       }
       const seen = this.matches.get(rule.id) ?? 0;
