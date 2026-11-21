@@ -294,13 +294,20 @@ eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能
 
 本机有三个限制：完整性 lockdown 禁用了 `bpf_probe_write_user`，所以 uprobe 不能设置 errno，系统调用包装函数的失败要在系统调用处注入；BPF LSM 没有启用；内核没有编译故障注入框架，failslab 等都不存在。
 
+在这些限制下，fmod_ret 仍能改变 `security_*` 的结果，已实测：
+- **结果**：调用方原样收到注入的 errno。
+- **函数体跳过**：整个函数体被跳过，其中的每个 LSM 都不运行，操作也不会发生。例如注入 ECONNREFUSED 的连接没有发出任何连接。
+- **范围**：按 cgroup id 过滤，只影响目标容器自己的进程；同端口、同文件名的旁观容器和宿主机进程都不受影响。
+- **按参数注入**：可以在程序中按目标端口、地址或文件名判断，所以可以只拒绝某个目的地或某个路径。
+- **名单外的目标**：不在错误注入名单上、也不以 `security_` 开头的函数，加载时就被拒绝（“is not modifiable”）。`scan` 可以只加载、不挂载，以此确认每条记录的机制。
+
 - **目录是数据**：每条记录对应一个（目标，机制），给出 id、类别、层、注入和观测的机制、目标（文件、build-id、符号、入口和返回指令的地址、克隆）、签名（来自 DWARF 或 BTF）、允许的动作和取值、开销等级、陷入范围（内核点是整台主机，uprobe 是 inode）和安全说明。`spec/kinds.json` 仍是动作的上界，每条记录只列出其机制允许的子集，规则加载时代理按记录检查。
-- **取值带来源**：错误注入名单的类型（ERRNO 为负 errno，NULL 为 0）；LSM 的返回范围；对照运行中观测到的自然结果，这是首选（见第 6.5 节 Redis 断言的教训）；静态分析得到的常量，置信度较低。`bpf_override_return` 不检查取值，由代理按类型限定。
+- **取值带来源**：错误注入名单的类型（ERRNO 为负 errno，NULL 为 0）；LSM 的返回范围；对照运行中观测到的自然结果，这是首选（见第 6.5 节 Redis 断言的教训）；静态分析得到的常量，置信度较低。`bpf_override_return` 和 fmod_ret 都不检查取值（返回 1、-5000、0x7fffffff 的 fmod_ret 程序都能加载），由代理按类型限定。`security_*` 的自然结果总是 0，所以它的取值来自 LSM 的惯例（EACCES、EPERM），或来自调用方的操作本身可能产生的 errno，例如连接的 ECONNREFUSED。
 - **类别**：复用 `call`（整型、errno、指针返回）、`check`（布尔返回）、`branch`（用 ip 写强制条件跳转）、`syscall`、`packet`。非系统调用的内核名单函数和 `security_*` 记为内核层的 `call`。另加一个只观测的类别 `event`（outcome 为 `fired`，没有动作），用于 USDT 和 tracepoint，把上游组件内部的事件作为效果观测，例如 postgres 的 57 个 USDT 名字中有 `transaction__abort` `deadlock__found` `lock__wait__start`。
 - **生成**：eBPF 代理新增只读的 `scan`。它读服务进程映射的可执行文件（ELF 符号、DWARF、`.gopclntab`、`.note.stapsdt`，以及反汇编得到的返回指令和条件跳转）和宿主内核的清单（kallsyms、ftrace 函数表、错误注入名单、BTF），可选地按 build-id 匹配调试符号。选择哪些记录由配置 `ebpf.hooks` 给出，形式与 `placement.scope`（第 6.4 节）相同。
 - **先观测，并控制开销**：
   - 系统调用用一个按 cgroup 过滤的 raw_syscalls 退出程序统计（调用号，errno）。
-  - 其余内核候选用 fexit 只计数。
+  - 其余内核候选用 fexit 只计数。内核点作用于整台主机：`security_file_open` 上挂一对 fmod_ret 与 fexit，主机上每次打开文件约多付 0.1–0.2 µs。因此观测程序只在对照窗口中挂载，注入程序只在有规则需要时挂载。fexit 在函数体被跳过时也运行，并看到注入的值，所以观测要排除被注入的调用，这些调用只记在规则名下。
   - 用户态函数分批挂入口探针，在短时间窗口内记录命中，卸下后只重挂还没见过的函数。开销与执行过的不同函数数成正比，而不是与命中次数成正比。热点函数打上标记，只在低 `limit` 下注入。
 - **值得注入的点**同时满足：
   - 对照中执行过；
@@ -313,7 +320,6 @@ eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能
 - **接入搜索**：每条记录导出为清单中的 `PointEntry`，`build_catalog` 不变；层显式记录；取值域参数化动作模板，例如系统调用的 `fail` 使用该调用观测到的 errno，而不是固定的 EIO。
 
 **待验证**：
-- BPF LSM 未启用时，fmod_ret 能否作用于 `security_*`。从源码推断可以，未经运行验证。
 - `should_fail_bio` 的工作常在 kworker 中执行，要按 bio 的 blkcg 而不是当前进程过滤。
 - 按 pid 过滤的 uprobe 能否跟随 fork。
 - Go 的 `debug/dwarf` 能否读 dwz 补充文件。
