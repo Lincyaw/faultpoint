@@ -1,7 +1,7 @@
 from collections import Counter, defaultdict
 from enum import StrEnum
 from statistics import fmean
-from typing import Final, Self
+from typing import Final
 
 from faultpoint.observations import DetailItems
 from faultpoint.tools.analysis import Effect, Metric, natural_tallies
@@ -9,26 +9,35 @@ from faultpoint.tools.analysis import Selection as Repetition
 from pydantic import BaseModel
 
 from faultsearch.catalog import FROZEN, Layer
-from faultsearch.chains import Chain, Stitching
+from faultsearch.chains import Chain, Group, confidence
 from faultsearch.counterfactual import (EffectKey, NamedWorkload, Runner, Scenarios, TreatmentRecord,
                                         tenant_names)
 from faultsearch.edges import Condition, Edge, holds
+from faultsearch.evidence import ClassChecks, MappingCheck, step_classes
 
 VALIDATION_PREFIX: Final = "validate."
 UNSCOPED: Final = ""
 
-type Tallies = dict[tuple[str, str, DetailItems], tuple[int, float]]
+type ObservationTallies = dict[tuple[str, str, DetailItems], tuple[int, float]]
+type RunKey = tuple[str, str]
+"""A validation run: the key of the first fault it injects and the name of the merged workload it runs in."""
 
 
 class Selection(StrEnum):
     STITCHED_ONLY = "ranked-stitched-only"
+    """Recorded by validations that chose chains one by one."""
     SINGLE_SCENARIO = "ranked-single-scenario"
+    """Recorded by validations that chose chains one by one."""
     CROSS_LAYER = "ranked-cross-layer"
-    """Stitched only, with hops in more than one layer, ending in a failure the user sees."""
+    """Stitched only, with hops in more than one layer, ending in a failure the user sees: the chain that picked its
+    validation run."""
     SINGLE_SCENARIO_CROSS_LAYER = "ranked-single-scenario-cross-layer"
     """Shown end to end by one scenario, with hops in more than one layer, ending in a failure the user sees."""
     NAMED = "named"
     """Asked for by its key, outside the ranking."""
+    ADJUDICATED = "adjudicated-by-run"
+    """A kept chain no selection took whose first fault and merged workload a validation run had, checked against
+    that run, since one run decides every chain it could check."""
 
 
 class HopCheck(BaseModel):
@@ -63,50 +72,14 @@ class Validations(BaseModel):
     validations: tuple[Validation, ...]
 
 
-class MappingCheck(BaseModel):
-    """Where a validated chain's effect appeared, whether the consequence the chain expected of the fault the effect
-    was stitched to followed: a check of the effect map's correspondence, for that consequence, in that workload."""
-
-    model_config = FROZEN
-
-    effect: str
-    counterpart: str
-    consequence: str
-    confirmed: bool
-    chain: str
-    workload: str
-
-
-class MappingFeedback(BaseModel):
-    model_config = FROZEN
-
-    checks: tuple[MappingCheck, ...]
-
-    def refuted(self) -> frozenset[tuple[str, str, str]]:
-        """The (effect, counterpart, consequence) steps that validations refuted and never confirmed; a counterpart
-        can carry one consequence of an effect and not another, as negating orders' retryable carries more retries
-        but not retries that each reserve again."""
-        seen: dict[tuple[str, str, str], set[bool]] = defaultdict(set)
-        for check in self.checks:
-            seen[(check.effect, check.counterpart, check.consequence)].add(check.confirmed)
-        return frozenset(step for step, verdicts in seen.items() if verdicts == {False})
-
-    def merged(self, checks: list[MappingCheck]) -> Self:
-        """These checks with the new ones, a new check of the same chain in the same workload replacing the old."""
-        identity = {(check.effect, check.counterpart, check.consequence, check.chain, check.workload): check
-                    for check in (*self.checks, *checks)}
-        return self.model_validate({"checks": tuple(identity.values())})
-
-
 def mapping_checks(validations: Validations) -> list[MappingCheck]:
     """For every validated hop whose effect appeared, whether the next hop's effect followed."""
-    return [MappingCheck(effect=validation.chain.hops[index].effect.key,
-                         counterpart=validation.chain.hops[index + 1].cause.key,
-                         consequence=validation.chain.hops[index + 1].effect.key,
+    return [MappingCheck(effect=effect.key, counterpart=counterpart.key, consequence=consequence.key,
                          confirmed=validation.hops[index + 1].confirmed, chain=validation.chain.key,
-                         workload=validation.workload.name)
+                         workload=validation.workload.name, classes=step_classes(effect, counterpart, consequence))
             for validation in validations.validations if validation.record.exercised
-            for index in range(len(validation.chain.hops) - 1) if validation.hops[index].confirmed]
+            for index, (effect, counterpart, consequence) in enumerate(validation.chain.steps())
+            if validation.hops[index].confirmed]
 
 
 def merged_workload(condition: Condition, scenarios: Scenarios) -> NamedWorkload:
@@ -150,8 +123,8 @@ class Headroom(BaseModel):
     chains: tuple[ChainRoom, ...]
 
 
-def chain_room(chain: Chain, workload: NamedWorkload, tallies: dict[str, list[Tallies]], edges: dict[str, Edge],
-               min_count_increase: float) -> ChainRoom:
+def chain_room(chain: Chain, workload: NamedWorkload, tallies: dict[str, list[ObservationTallies]],
+               edges: dict[str, Edge], min_count_increase: float) -> ChainRoom:
     """Whether every count hop of a chain has headroom in its merged workload; the effects of upstream components are
     observed outside any scope, the others in the treated tenant's."""
     hops = []
@@ -171,7 +144,7 @@ def headroom(runner: Runner, chains: list[Chain], edges: list[Edge], scenarios: 
              min_count_increase: float) -> Headroom:
     """The headroom of every chain's count hops in its merged workload, whose controls run first where missing."""
     workloads = {chain.key: merged_workload(chain.condition, scenarios) for chain in chains}
-    tallies: dict[str, dict[str, list[Tallies]]] = {}
+    tallies: dict[str, dict[str, list[ObservationTallies]]] = {}
     for control in runner.controls(list({workload.name: workload for workload in workloads.values()}.values())):
         observations = {label: runner.observations(label) for label in control.labels}
         tallies[control.workload.name] = {
@@ -183,38 +156,45 @@ def headroom(runner: Runner, chains: list[Chain], edges: list[Edge], scenarios: 
                                             min_count_increase) for chain in chains))
 
 
-def capped(chains: list[Chain], count: int, per_pair: int) -> list[Chain]:
-    """The first count chains, at most per_pair of them with the same layer of the first fault and the same last
-    effect, so that one hub does not take every pick."""
-    taken: Counter[tuple[Layer, str]] = Counter()
-    picks = []
-    for chain in chains:
-        pair = (chain.hops[0].cause.layer, chain.hops[-1].effect.key)
-        if len(picks) < count and taken[pair] < per_pair:
-            taken[pair] += 1
-            picks.append(chain)
-    return picks
+def run_key(chain: Chain, scenarios: Scenarios) -> RunKey:
+    """The validation run that checks a chain: its first fault in the workload its conditions merge into."""
+    return chain.hops[0].cause.key, merged_workload(chain.condition, scenarios).name
 
 
-def selected(stitching: Stitching, stitched_only: int, single_scenario: int, single_scenario_cross_layer: int,
-             cross_layer: int, per_pair: int, named: list[str], validated: list[Chain],
-             roomy: frozenset[str]) -> list[tuple[Chain, Selection]]:
-    """Among the chains whose count hops all have headroom in their merged workloads, the best ranked that exist only
-    by stitching, a few that one scenario showed end to end, of any layers and across layers, and the best
-    stitched-only chains across layers not chosen already, at most per_pair of them alike; and the chains named by
-    their keys, which may also be chains validated before."""
-    by_key = {chain.key: chain for chain in (*validated, *stitching.top, *stitching.top_cross_layer)}
-    ranked = [chain for chain in stitching.top if chain.stitched_only and chain.key in roomy][:stitched_only]
-    chosen = {chain.key for chain in ranked}
-    across = capped([chain for chain in stitching.top_cross_layer
-                     if chain.stitched_only and chain.key not in chosen and chain.key in roomy], cross_layer, per_pair)
-    return ([(chain, Selection.STITCHED_ONLY) for chain in ranked]
-            + [(chain, Selection.SINGLE_SCENARIO) for chain in stitching.top
-               if chain.shown and chain.key in roomy][:single_scenario]
-            + [(chain, Selection.SINGLE_SCENARIO_CROSS_LAYER) for chain in stitching.top_cross_layer
-               if chain.shown and chain.key in roomy][:single_scenario_cross_layer]
-            + [(chain, Selection.CROSS_LAYER) for chain in across]
-            + [(by_key[key], Selection.NAMED) for key in named])
+def chosen_runs(candidates: list[Chain], scenarios: Scenarios, checked: dict[str, ClassChecks], count: int,
+                per_group: int, done: set[RunKey], picked: Counter[Group]) -> list[Chain]:
+    """The chains that pick the next validation runs. A run is worth the summed chance of confirmation of the
+    candidates it would check, since one run decides them all; the groups take turns, the group with the most valuable
+    run first, each picking through its likeliest candidate its most valuable run not yet taken, at most per_group runs
+    a group over all batches, so that one causal path does not take every run."""
+    worth: dict[RunKey, float] = defaultdict(float)
+    for chain in candidates:
+        worth[run_key(chain, scenarios)] += confidence(chain.steps(), checked)
+    best: dict[Group, dict[RunKey, Chain]] = defaultdict(dict)
+    for chain in sorted(candidates, key=lambda chain: confidence(chain.steps(), checked), reverse=True):
+        if run_key(chain, scenarios) not in done:
+            best[chain.group].setdefault(run_key(chain, scenarios), chain)
+    groups = sorted(best, key=lambda group: max(worth[key] for key in best[group]), reverse=True)
+    queues = {group: sorted(best[group].items(), key=lambda item: worth[item[0]], reverse=True)[
+        :max(0, per_group - picked[group])] for group in groups}
+    unique: dict[RunKey, Chain] = {}
+    for key, chain in (queues[group][turn] for turn in range(per_group) for group in groups
+                       if turn < len(queues[group])):
+        unique.setdefault(key, chain)
+    return list(unique.values())[:count]
+
+
+def adjudications(validations: Validations, kept: list[Chain], scenarios: Scenarios,
+                  min_count_increase: float) -> tuple[Validation, ...]:
+    """Every kept chain that no validation took and whose first fault and merged workload a validation run had,
+    checked against that run's record."""
+    runs = {(validation.record.fault.key, validation.workload.name): validation
+            for validation in validations.validations}
+    taken = {validation.chain.key for validation in validations.validations}
+    return tuple(Validation(chain=chain, selection=Selection.ADJUDICATED, workload=run.workload, record=run.record,
+                            hops=hop_checks(chain, run.record, min_count_increase))
+                 for chain in kept if chain.key not in taken and (run := runs.get(run_key(chain, scenarios)))
+                 is not None)
 
 
 def hop_checks(chain: Chain, record: TreatmentRecord, min_count_increase: float) -> tuple[HopCheck, ...]:

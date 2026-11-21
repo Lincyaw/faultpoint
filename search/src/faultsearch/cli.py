@@ -1,3 +1,4 @@
+from collections import Counter
 from pathlib import Path
 from typing import Annotated, Final
 
@@ -22,8 +23,9 @@ from faultsearch.report import render, summarise
 from faultsearch.store import (ACTIONS_INPUT, ALLOCATION_SETTINGS, CATALOG, EFFECTS_INPUT, HEADROOM, INPUTS,
                                MAPPING_FEEDBACK, REPORT, RUN_SETTINGS, SCENARIOS_INPUT, VALIDATIONS, Store,
                                allocation_file, chains_file, edges_file)
-from faultsearch.validation import (Headroom, MappingFeedback, Validations, headroom, mapping_checks, merged_workload,
-                                    selected, validate)
+from faultsearch.evidence import MappingFeedback
+from faultsearch.validation import (Headroom, Selection, Validations, adjudications, chosen_runs, headroom,
+                                    mapping_checks, merged_workload, validate)
 
 app = typer.Typer(no_args_is_help=True, help=(
     "Causal stitching over faultpoint: inject faults into named workloads, stitch the causal edges across "
@@ -151,8 +153,9 @@ def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
                         store.load(Catalog, CATALOG), KindTable.installed(), UPSTREAM_SERVICES, UNSCOPED_TARGETS,
                         services_by_port(system), point_manifests(system.manifests), min_count_increase)
     store.save(EdgeSet(strategy=strategy, edges=tuple(edges)), edges_file(strategy))
-    refuted = store.load(MappingFeedback, MAPPING_FEEDBACK).refuted() if store.has(MAPPING_FEEDBACK) else frozenset()
-    stitching = stitch(edges, allocation, records, width, max_hops, kept, min_count_increase, refuted)
+    feedback = store.load(MappingFeedback, MAPPING_FEEDBACK) if store.has(MAPPING_FEEDBACK) \
+        else MappingFeedback(checks=())
+    stitching = stitch(edges, allocation, records, width, max_hops, kept, min_count_increase, feedback)
     store.save(stitching, chains_file(strategy))
     needed = counterpart_assignments(edges, {assignment.fault.key for assignment in allocation.assignments})
     typer.echo(f"{strategy}: {len(edges)} edges, {stitching.chains} chains ({stitching.stitched_only} stitched only, "
@@ -208,43 +211,68 @@ def chains_command(experiment: Experiment,
 
 @app.command("validate")
 def validate_command(experiment: Experiment,
-                     stitched_only: Annotated[int, typer.Option(help="Best chains that exist only by stitching.")] = 10,
-                     single_scenario: Annotated[int, typer.Option(help="Best chains one scenario showed.")] = 3,
+                     runs: Annotated[int, typer.Option(help="Validation runs the ranked chains choose.")] = 10,
+                     batch: Annotated[int, typer.Option(
+                         help="Runs chosen at once, before their checks update the chances that rank the "
+                              "candidates.")] = 5,
+                     per_group: Annotated[int, typer.Option(help="Most runs one group of chains chooses.")] = 3,
                      single_scenario_cross_layer: Annotated[int, typer.Option(
-                         help="Best chains across layers one scenario showed.")] = 0,
-                     cross_layer: Annotated[int, typer.Option(
-                         help="Best stitched-only chains across layers, besides those chosen already.")] = 0,
-                     per_pair: Annotated[int, typer.Option(
-                         help="Most of those chains with the same layer of the first fault and the same last "
-                              "effect.")] = 3,
+                         help="Best chains across layers one scenario showed, validated as controls.")] = 3,
                      chain: Annotated[list[str], typer.Option(help="A chain to validate besides, by its key.")] = []
                      ) -> None:
-    """Inject only the first fault of the best chains of the phased allocation, among those whose count hops all have
-    headroom, in the workload their conditions merge into, and keep what each validated hop says about the effect
-    map's correspondences."""
+    """Validate in batches of runs. A run injects the first fault of the chain that chose it in the workload its
+    conditions merge into, and decides every kept chain with the same first fault and workload. The candidates are
+    the stitched-only chains across layers ending in a failure the user sees whose count hops have headroom and that
+    no natural witness contradicts; every batch's checks update the chances that rank the next batch's runs."""
     store = Store(experiment)
     stitching = store.load(Stitching, chains_file(Strategy.PHASED))
-    validated = [validation.chain for validation in store.load(Validations, VALIDATIONS).validations] \
-        if store.has(VALIDATIONS) else []
     runner = recorded_runner(store)
     scenarios = recorded_scenarios(store, runner.system)
-    candidates = list({kept.key: kept for kept in (*stitching.top, *stitching.top_cross_layer)}.values())
-    room = headroom(runner, candidates, list(store.load(EdgeSet, edges_file(Strategy.PHASED)).edges), scenarios,
+    order = {key: rank for rank, key in enumerate(stitching.keys)}
+    kept = sorted({kept.key: kept for kept in (*stitching.top, *stitching.top_cross_layer)}.values(),
+                  key=lambda kept: order[kept.key])
+    room = headroom(runner, kept, list(store.load(EdgeSet, edges_file(Strategy.PHASED)).edges), scenarios,
                     stitching.min_count_increase)
     store.save(room, HEADROOM)
     roomy = frozenset(chain_room.chain for chain_room in room.chains if chain_room.room)
-    validations = validate(runner,
-                           selected(stitching, stitched_only, single_scenario, single_scenario_cross_layer, cross_layer,
-                                    per_pair, chain, validated, roomy),
-                           scenarios, stitching.min_count_increase)
-    store.save(validations, VALIDATIONS)
+    across = [kept_chain for kept_chain in kept if kept_chain.crosses_layers and kept_chain.terminal
+              and kept_chain.key in roomy]
+    candidates = [kept_chain for kept_chain in across if kept_chain.stitched_only and not kept_chain.contradicted]
+    by_key = {kept_chain.key: kept_chain for kept_chain in kept}
+    besides = ([(kept_chain, Selection.SINGLE_SCENARIO_CROSS_LAYER) for kept_chain in across
+                if kept_chain.shown][:single_scenario_cross_layer] + [(by_key[key], Selection.NAMED) for key in chain])
+    validations = list(store.load(Validations, VALIDATIONS).validations) if store.has(VALIDATIONS) else []
     feedback = store.load(MappingFeedback, MAPPING_FEEDBACK) if store.has(MAPPING_FEEDBACK) \
         else MappingFeedback(checks=())
-    store.save(feedback.merged(mapping_checks(validations)), MAPPING_FEEDBACK)
-    for validation in validations.validations:
-        typer.echo(f"{'confirmed' if validation.confirmed else 'refuted'} {validation.selection} in "
-                   f"{validation.workload.name}: {''.join('+' if hop.confirmed else '-' for hop in validation.hops)} "
-                   f"{validation.chain.key}")
+    for start in range(0, runs, batch):
+        picks = chosen_runs(candidates, scenarios, feedback.class_checks(), min(batch, runs - start), per_group,
+                            {(validation.record.fault.key, validation.workload.name) for validation in validations},
+                            Counter(validation.chain.group for validation in validations
+                                    if validation.selection == Selection.CROSS_LAYER))
+        chosen = validate(runner, [(pick, Selection.CROSS_LAYER) for pick in picks] + (besides if start == 0 else []),
+                          scenarios, stitching.min_count_increase).validations
+        decided = adjudications(Validations(validations=(*validations, *chosen)), kept, scenarios,
+                                stitching.min_count_increase)
+        validations += [*chosen, *decided]
+        feedback = feedback.merged(mapping_checks(Validations(validations=(*chosen, *decided))))
+        store.save(Validations(validations=tuple(validations)), VALIDATIONS)
+        store.save(feedback, MAPPING_FEEDBACK)
+    for validation in validations:
+        if validation.selection != Selection.ADJUDICATED:
+            witness = f" contradicted at hops {list(validation.chain.contradicted)}" if validation.chain.contradicted \
+                else ""
+            hops = "".join("+" if hop.confirmed else "-" for hop in validation.hops)
+            typer.echo(f"{'confirmed' if validation.confirmed else 'refuted'} {validation.selection} in "
+                       f"{validation.workload.name}: {hops}{witness} {validation.chain.key}")
+    for label, members in (("ranked", [validation for validation in validations
+                                       if validation.selection == Selection.CROSS_LAYER]),
+                           ("adjudicated by run, stitched-only across layers to the user",
+                            [validation for validation in validations if validation.selection == Selection.ADJUDICATED
+                             and validation.chain.stitched_only and validation.chain.crosses_layers
+                             and validation.chain.terminal]),
+                           ("adjudicated by run, all", [validation for validation in validations
+                                                        if validation.selection == Selection.ADJUDICATED])):
+        typer.echo(f"{label}: {sum(validation.confirmed for validation in members)} of {len(members)} confirmed")
 
 
 class Trial(BaseModel):

@@ -11,7 +11,8 @@ from faultsearch.counterfactual import ControlRecord, EffectKey, Leak, RunSettin
 from faultsearch.edges import Edge, EdgeSet, EffectMap
 from faultsearch.store import (CATALOG, CONTROLS, EFFECTS_INPUT, INPUTS, LEAKS, MAPPING_FEEDBACK, REPETITIONS,
                                RUN_SETTINGS, TREATMENTS, VALIDATIONS, Store, allocation_file, chains_file, edges_file)
-from faultsearch.validation import VALIDATION_PREFIX, MappingFeedback, Selection, Validations
+from faultsearch.evidence import MappingFeedback
+from faultsearch.validation import VALIDATION_PREFIX, Selection, Validations
 
 EXAMPLES_PER_CONDITION: Final = 2
 CROSS_LAYER_SHOWN: Final = 15
