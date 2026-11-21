@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import { type Settings, settingsFromEnvironment } from "./config.js";
 import { type Rule, type RuleSet, pointParts } from "./rules.js";
 
-const INVALID_RULES_EXIT = 70;
+/** The exit status of a process faultpoint stops, for rules it cannot obey or an error of its own. */
+const ABORT_EXIT = 70;
 
 /** One execution of a point, as the core hands it to the observation sink; the detail tells executions of one outcome
  * apart by bounded values under the keys spec/kinds.json gives the kind. */
@@ -190,11 +191,32 @@ export class Core {
     process.exit(code);
   }
 
-  /** End the process when rules cannot be obeyed, so that no experiment runs under rules it did not ask for. */
+  /** End the process when rules cannot be obeyed, so that no experiment runs under rules it did not ask for; what was
+   * observed is written first, and the process stops even when writing it fails. */
   abort(reason: string): never {
-    console.error(`faultpoint: ${reason}; stopping the process`);
-    this.sink?.flush();
-    process.exit(INVALID_RULES_EXIT);
+    try {
+      this.sink?.flush();
+    } finally {
+      console.error(`faultpoint: ${reason}; stopping the process`);
+      process.exit(ABORT_EXIT);
+    }
+  }
+
+  /** End the process for an error of faultpoint's own code, which ran inside the application, so that the error
+   * neither changes what the application does nor leaves its points silently inert. */
+  internalError(error: unknown): never {
+    console.error(error);
+    return this.abort(`internal error: ${String(error)}`);
+  }
+
+  /** Run faultpoint's own work where the application's code runs: what it throws is an error of faultpoint, never one
+   * the application should meet, so it stops the process. */
+  own<T>(work: () => T): T {
+    try {
+      return work();
+    } catch (error) {
+      return this.internalError(error);
+    }
   }
 }
 

@@ -123,12 +123,12 @@ function failureDetail(error: unknown, DatabaseError: DatabaseError): Record<str
 async function execute(rule: Rule | null, run: () => Promise<unknown>, DatabaseError: DatabaseError): Promise<unknown> {
   switch (rule?.action.kind) {
     case "delay":
-      await sleep(numberParameter(rule, "ms"));
+      await sleep(CORE.own(() => numberParameter(rule, "ms")));
       return run();
     case "crash":
       return CORE.crash(typeof rule.action.code === "number" ? rule.action.code : 1);
     case "fail":
-      throw injectedError(DatabaseError, rule, "injected store failure");
+      throw CORE.own(() => injectedError(DatabaseError, rule, "injected store failure"));
     case "drop":
       return { command: "", rowCount: 1, rows: [], fields: [] } satisfies QueryResult;
     case "duplicate":
@@ -136,7 +136,7 @@ async function execute(rule: Rule | null, run: () => Promise<unknown>, DatabaseE
       return run();
     case "empty": {
       const result = await run();
-      results(result).forEach((each) => Object.assign(each, { rows: [], rowCount: 0 }));
+      CORE.own(() => results(result).forEach((each) => Object.assign(each, { rows: [], rowCount: 0 })));
       return result;
     }
   }
@@ -144,7 +144,8 @@ async function execute(rule: Rule | null, run: () => Promise<unknown>, DatabaseE
 }
 
 /** Client.prototype.query, which Pool.query also goes through, made the store point of each statement; the
- * promise and callback forms both keep their contract. */
+ * promise and callback forms both keep their contract. The query's own errors reach the application, and everything
+ * around the query is faultpoint's own work. */
 function instrumentQuery(original: Query, DatabaseError: DatabaseError): Query {
   return function (this: unknown, ...arguments_: unknown[]) {
     const [config, values, callback] = arguments_;
@@ -155,31 +156,39 @@ function instrumentQuery(original: Query, DatabaseError: DatabaseError): Query {
     }
     const done = typeof values === "function" ? values : typeof callback === "function" ? callback : undefined;
     const forwarded = typeof values === "function" ? [config] : [config, values];
-    const statement = statementPoint(text);
-    const point = pointId(CORE.settings.service, statement.kind, statement.locator);
-    const rule = CORE.decideAmong(point, ACTS_BEFORE);
+    const { statement, point, rule } = CORE.own(() => {
+      const found = statementPoint(text);
+      const id = pointId(CORE.settings.service, found.kind, found.locator);
+      return { statement: found, point: id, rule: CORE.decideAmong(id, ACTS_BEFORE) };
+    });
     const requestContext = context.active();
     const started = performance.now();
     const observe = (outcome: string, quantity: number, observed: Rule | null, detail: Record<string, string>): void =>
       context.with(requestContext, () => CORE.observe(point, outcome, quantity, observed, detail));
     const result = execute(rule, () => original.apply(this, forwarded) as Promise<unknown>, DatabaseError).then((answer) => {
       // Only a statement that ran and succeeded is one a fail_after rule replaces and counts.
-      const replacing = rule?.action.kind === "drop" ? null : context.with(requestContext, () => CORE.decideAmong(point, ACTS_AFTER));
-      if (replacing !== null) {
-        const error = injectedError(DatabaseError, replacing, "store failed after the statement ran");
-        observe("error", performance.now() - started, replacing, failureDetail(error, DatabaseError));
-        throw error;
-      }
-      const each = results(answer);
-      if (statement.kind === "store_read") {
-        const rows = each.reduce((total, part) => total + (part?.rows?.length ?? 0), 0);
-        observe(rows > 0 ? "rows" : "empty", rows, rule, {});
-      } else {
-        observe("ok", each.reduce((total, part) => total + (part?.rowCount ?? 0), 0), rule, {});
+      const replaced = CORE.own(() => {
+        const replacing = rule?.action.kind === "drop" ? null : context.with(requestContext, () => CORE.decideAmong(point, ACTS_AFTER));
+        if (replacing !== null) {
+          const error = injectedError(DatabaseError, replacing, "store failed after the statement ran");
+          observe("error", performance.now() - started, replacing, failureDetail(error, DatabaseError));
+          return error;
+        }
+        const each = results(answer);
+        if (statement.kind === "store_read") {
+          const rows = each.reduce((total, part) => total + (part?.rows?.length ?? 0), 0);
+          observe(rows > 0 ? "rows" : "empty", rows, rule, {});
+        } else {
+          observe("ok", each.reduce((total, part) => total + (part?.rowCount ?? 0), 0), rule, {});
+        }
+        return null;
+      });
+      if (replaced !== null) {
+        throw replaced;
       }
       return answer;
     }, (error: unknown) => {
-      observe("error", performance.now() - started, rule, failureDetail(error, DatabaseError));
+      CORE.own(() => observe("error", performance.now() - started, rule, failureDetail(error, DatabaseError)));
       throw error;
     });
     if (done === undefined) {

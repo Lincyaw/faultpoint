@@ -3,7 +3,7 @@ import { hostname } from "node:os";
 
 import { z } from "zod";
 
-import type { Observation, ObservationSink } from "./core.js";
+import { CORE, type Observation, type ObservationSink } from "./core.js";
 
 /** One line of an observation file, as spec/observation.schema.json defines. */
 export interface ObservationRecord {
@@ -36,7 +36,8 @@ export class JsonlSink implements ObservationSink {
   windowStart = Date.now() / 1000;
 
   constructor(readonly path: string, readonly service: string, readonly options: z.infer<typeof JsonlOptions>) {
-    setInterval(() => this.flush(), options.flush_seconds * 1000).unref();
+    // A timer's error would reach the application's uncaughtException handler, which may keep the process running without its observations.
+    setInterval(() => CORE.own(() => this.flush()), options.flush_seconds * 1000).unref();
     process.on("exit", () => this.flush());
   }
 

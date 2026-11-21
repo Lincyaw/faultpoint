@@ -31,12 +31,13 @@ const loadHookPlugin: Plugin = {
         if (!url.startsWith("file:") || !javascript || result.source === undefined || result.source === null) {
           return result;
         }
-        const target = targetOf(fileURLToPath(url).split(sep).join("/"), root.split(sep).join("/"), config.placement);
-        if (target === null) {
-          return result;
-        }
-        const { code } = instrumentModule(result.source.toString(), `${target.prefix}${target.path}`, service,
-          config.placement, target.kinds);
+        const source = result.source.toString();
+        // The module loads inside the application's import or require, so placing its points runs as faultpoint's own work.
+        const code = core.own(() => {
+          const target = targetOf(fileURLToPath(url).split(sep).join("/"), root.split(sep).join("/"), config.placement);
+          return target === null ? null
+            : instrumentModule(source, `${target.prefix}${target.path}`, service, config.placement, target.kinds).code;
+        });
         return code === null ? result : { ...result, source: code };
       },
     });

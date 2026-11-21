@@ -125,42 +125,47 @@ function instrumentSendCommand(original: SendCommand, identifier: RegExp, ReplyE
       return original.call(this, command, stream);
     }
     command[HANDLED] = true;
-    const key = keyOf(spec.key, command.args);
-    const point = pointId(CORE.settings.service, spec.kind, key === null ? name : `${name} ${key.replace(identifier, "{}")}`);
-    const rule = CORE.decide(point);
-    const requestContext = context.active();
-    const started = performance.now();
-    command.promise.then((reply) => context.with(requestContext, () => CORE.observe(point,
-      spec.empty === undefined ? "ok" : empty(spec.empty, reply) ? "empty" : "rows", performance.now() - started, rule, {})),
-    (error: unknown) => context.with(requestContext, () => CORE.observe(point, "error", performance.now() - started, rule,
-      failureDetail(error, ReplyError))));
-    switch (rule?.action.kind) {
-      case "fail": {
-        // With a code the error is the one ioredis makes for that error reply, which carries the command.
-        const code = stringParameter(rule, "code");
-        command.reject(code === undefined ? new Error("faultpoint: injected Redis failure")
-          : Object.assign(new ReplyError(`${code} faultpoint: injected Redis failure`), { command: { name: command.name, args: command.args } }));
-        return command.promise;
-      }
-      case "empty":
-        if (spec.empty === "never") {
-          CORE.abort(`rule ${rule.id}: ${name} has no empty reply`);
+    // The client sends the command and its errors reach the application; whether and how it is answered instead is
+    // faultpoint's own work, as is observing the reply.
+    const answered = CORE.own(() => {
+      const key = keyOf(spec.key, command.args);
+      const point = pointId(CORE.settings.service, spec.kind, key === null ? name : `${name} ${key.replace(identifier, "{}")}`);
+      const rule = CORE.decide(point);
+      const requestContext = context.active();
+      const started = performance.now();
+      command.promise.then((reply) => CORE.own(() => context.with(requestContext, () => CORE.observe(point,
+        spec.empty === undefined ? "ok" : empty(spec.empty, reply) ? "empty" : "rows", performance.now() - started, rule, {}))),
+      (error: unknown) => CORE.own(() => context.with(requestContext, () => CORE.observe(point, "error",
+        performance.now() - started, rule, failureDetail(error, ReplyError)))));
+      switch (rule?.action.kind) {
+        case "fail": {
+          // With a code the error is the one ioredis makes for that error reply, which carries the command.
+          const code = stringParameter(rule, "code");
+          command.reject(code === undefined ? new Error("faultpoint: injected Redis failure")
+            : Object.assign(new ReplyError(`${code} faultpoint: injected Redis failure`), { command: { name: command.name, args: command.args } }));
+          return true;
         }
-        command.resolve(emptyReply(name, spec.empty, command.args));
-        return command.promise;
-      case "drop":
-        command.resolve("OK");
-        return command.promise;
-      case "delay":
-        setTimeout(() => original.call(this, command, stream), numberParameter(rule, "ms"));
-        return command.promise;
-      case "crash":
-        return CORE.crash(typeof rule.action.code === "number" ? rule.action.code : 1);
-      case "fail_after":
-      case "duplicate":
-        return CORE.abort(`rule ${rule.id}: ${rule.action.kind} at ${point} cannot resend an ioredis command`);
-    }
-    return original.call(this, command, stream);
+        case "empty":
+          if (spec.empty === "never") {
+            CORE.abort(`rule ${rule.id}: ${name} has no empty reply`);
+          }
+          command.resolve(emptyReply(name, spec.empty, command.args));
+          return true;
+        case "drop":
+          command.resolve("OK");
+          return true;
+        case "delay":
+          setTimeout(() => original.call(this, command, stream), numberParameter(rule, "ms"));
+          return true;
+        case "crash":
+          return CORE.crash(typeof rule.action.code === "number" ? rule.action.code : 1);
+        case "fail_after":
+        case "duplicate":
+          return CORE.abort(`rule ${rule.id}: ${rule.action.kind} at ${point} cannot resend an ioredis command`);
+      }
+      return false;
+    });
+    return answered ? command.promise : original.call(this, command, stream);
   };
 }
 

@@ -118,6 +118,9 @@ export const pointsPlugin: Plugin = {
       clock: ["shift", "delay", "crash"],
       acquire: ["fail", "delay", "crash"],
     }, EVERY_LOCATOR);
-    (globalThis as Record<symbol, unknown>)[Symbol.for(POINTS_SYMBOL)] = { branch, check, loop, value, clock, acquire };
+    // Placed code calls the point functions inline, so each runs as faultpoint's own work.
+    const functions: Record<string, (...arguments_: never[]) => unknown> = { branch, check, loop, value, clock, acquire };
+    (globalThis as Record<symbol, unknown>)[Symbol.for(POINTS_SYMBOL)] = Object.fromEntries(Object.entries(functions)
+      .map(([name, point]) => [name, (...arguments_: never[]) => core.own(() => point(...arguments_))]));
   },
 };
