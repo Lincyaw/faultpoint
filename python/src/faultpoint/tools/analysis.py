@@ -43,7 +43,8 @@ class Effect(BaseModel):
 
     point: str
     outcome: str
-    detail: dict[str, str]
+    detail: dict[str, str] = {}
+    """Empty for outcomes recorded without detail, as observation records default it."""
     metric: Metric
     verdict: Verdict
     control: tuple[float, ...]
