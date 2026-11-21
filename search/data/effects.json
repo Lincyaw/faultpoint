@@ -1,5 +1,4 @@
 {
-  "entry_service": "gateway",
   "terminal_outcomes": ["4xx", "5xx", "error"],
   "rules": [
     {"kind": "branch", "outcomes": ["taken"], "metric": "count", "layers": ["business"], "faults": [],
@@ -17,8 +16,12 @@
     {"kind": "call", "outcomes": ["error"], "metric": "count", "layers": ["business"],
      "languages": ["python", "java", "typescript", "rust"], "parameters": {"error": "error"}, "faults": [{"kind": "fail"}],
      "reason": "An error of a type returned from a call is what fail raising that type substitutes there, such as the importable class at a Python call point. Without the type, fail raises what the call site's first handler names, which may take another path; where an SDK cannot know the type, nothing is known to correspond."},
-    {"kind": "call", "outcomes": ["error"], "metric": "count", "layers": ["business"], "languages": ["go"], "faults": [],
-     "reason": "A Go call fail replaces the error at the err != nil check after the callee has run, so it fails work already done, which a natural error does not; a registered sentinel sits at the same check."},
+    {"kind": "call", "outcomes": ["error"], "metric": "count", "layers": ["business"], "languages": ["go"],
+     "registration": "registered", "parameters": {"error": "error"}, "faults": [{"kind": "fail"}],
+     "reason": "A registered sentinel returned from a Go call, or an error wrapping it, is what fail returning that sentinel substitutes: fail skips the callee, and Go callers tell sentinels apart with errors.Is."},
+    {"kind": "call", "outcomes": ["error"], "metric": "count", "layers": ["business"], "languages": ["go"],
+     "registration": "unregistered", "faults": [{"kind": "fail"}],
+     "reason": "Go code by convention tells only registered sentinels apart and otherwise checks that the error is not nil, so any other error is taken to be what fail, which skips the callee, substitutes; validation tests this assumption."},
     {"kind": "call", "outcomes": ["error"], "metric": "count", "layers": ["upstream"], "functions": ["pq_getbyte"], "faults": [],
      "reason": "EOF at pq_getbyte is PostgreSQL noticing that its client closed the connection, a consequence of the client, whose own failure the chain reaches anyway."},
     {"kind": "call", "outcomes": ["error"], "metric": "count", "layers": ["upstream"], "functions": ["lookupKey"], "faults": [{"kind": "fail"}],

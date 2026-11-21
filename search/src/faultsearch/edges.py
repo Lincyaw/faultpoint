@@ -1,3 +1,4 @@
+import json
 from collections import defaultdict
 from enum import StrEnum
 from pathlib import Path
@@ -10,12 +11,11 @@ from faultpoint.rules import Action
 from faultpoint.tools.analysis import Effect, Metric, Verdict
 from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, JsonValue
-from shop.workload import Scenarios
 
 from faultsearch.allocation import Assignment, Phase, Strategy
-from faultsearch.catalog import (DATA, FROZEN, Catalog, Fault, Layer, point_kind, point_layer, point_scoped,
-                                 point_service, point_symbol)
-from faultsearch.counterfactual import EffectKey, TreatmentRecord
+from faultsearch.catalog import (DATA, FROZEN, Catalog, Fault, Layer, implements, point_kind, point_layer,
+                                 point_scoped, point_service, point_symbol)
+from faultsearch.counterfactual import EffectKey, Scenarios, TreatmentRecord
 
 EFFECTS_FILE: Final = DATA / "effects.json"
 RPC_CLIENT: Final = "rpc_client"
@@ -123,13 +123,14 @@ class EffectMap(BaseModel):
     model_config = FROZEN
 
     entry_service: str
-    """The service whose responses the user sees."""
+    """The service whose responses the user sees, which the explored system names."""
     terminal_outcomes: tuple[str, ...]
     rules: tuple[EffectRule, ...]
 
     @classmethod
-    def read(cls, path: Path = EFFECTS_FILE) -> Self:
-        return cls.model_validate_json(path.read_text(encoding="utf-8"))
+    def read(cls, entry_service: str, path: Path = EFFECTS_FILE) -> Self:
+        """The effect map of the file, which holds what does not depend on the system, for a system's entry service."""
+        return cls.model_validate({**json.loads(path.read_text(encoding="utf-8")), "entry_service": entry_service})
 
     def terminal(self, effect: EffectKey) -> bool:
         """Whether an effect is a failure the user sees: a non-2xx response of the entry service."""
@@ -196,8 +197,8 @@ class EdgeSet(BaseModel):
 def learn_conditions(held: list[str], not_held: list[str], scenarios: Scenarios) -> tuple[Condition, ...]:
     """The fewest parameter values shared by the scenarios an edge held in that set apart every scenario tested where
     it did not, and the baseline unless it held there; when no such values exist, each held scenario's changes."""
-    values = {name: scenarios.workload(name).model_dump(mode="json") for name in (*held, *not_held)}
-    baseline = scenarios.baseline.model_dump(mode="json")
+    values = {name: scenarios.workload(name) for name in (*held, *not_held)}
+    baseline = scenarios.baseline
     shared = {name: value for name, value in values[held[0]].items()
               if all(values[scenario][name] == value for scenario in held)}
     opponents = [values[name] for name in not_held]
@@ -235,10 +236,10 @@ def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, manife
                  peer_effects: list[EffectKey], effects: EffectMap, catalog: Catalog,
                  kinds: KindTable) -> tuple[Counterpart, tuple[Fault, ...]]:
     """The faults that, injected at an effect's point, produce the effect: the catalog's instances of every action
-    the effect map names for it, or the action itself where the catalog has none."""
+    the effect map names for it and the point implements, or the action itself where the catalog has none."""
     rules = [rule for rule in effects.rules if rule.covers(effect, verdicts, layer, manifest, peer_effects)]
     found = [([fault for fault in catalog.faults if fault.instance_of(effect.point, action)], action)
-             for rule in rules for action in rule.actions(effect)]
+             for rule in rules for action in rule.actions(effect) if implements(catalog.narrower, effect.point, action)]
     faults = {fault.key: fault for instances, action in found
               for fault in instances or [Fault(point=effect.point, action=action, layer=layer,
                                                scoped=point_scoped(effect.point, layer, kinds))]}

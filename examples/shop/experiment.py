@@ -97,7 +97,7 @@ def main() -> None:
     sdk = arguments.sdk_root.resolve()
     commit = verified_build(sdk) if arguments.skip_build else build(sdk)
     print(f"SDK commit {commit} from {sdk}", flush=True)
-    workload = Scenarios.read().workload(arguments.scenario)
+    workload = Scenarios.read().workload(arguments.scenario).model_dump(mode="json")
     controls = [f"control-{index}" for index in range(arguments.repetitions)]
     for label in controls:
         print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": []}, sdk), flush=True)

@@ -4,11 +4,10 @@ from typing import Final, Self
 
 from faultpoint.tools.analysis import Effect
 from pydantic import BaseModel
-from shop.workload import Scenarios
 
 from faultsearch.catalog import FROZEN, Layer
 from faultsearch.chains import Chain, Stitching
-from faultsearch.counterfactual import EffectKey, NamedWorkload, Runner, TreatmentRecord
+from faultsearch.counterfactual import EffectKey, NamedWorkload, Runner, Scenarios, TreatmentRecord
 from faultsearch.edges import Condition, holds
 
 VALIDATION_PREFIX: Final = "validate."
@@ -104,8 +103,7 @@ def mapping_checks(validations: Validations) -> list[MappingCheck]:
 def merged_workload(condition: Condition, scenarios: Scenarios) -> NamedWorkload:
     name = "+".join(f"{parameter}={'-'.join(map(str, value)) if isinstance(value, list) else value}"
                     for parameter, value in sorted(condition.items()))
-    return NamedWorkload(name=f"{VALIDATION_PREFIX}{name or 'baseline'}",
-                         workload=scenarios.baseline.with_changes(condition))
+    return NamedWorkload(name=f"{VALIDATION_PREFIX}{name or 'baseline'}", workload={**scenarios.baseline, **condition})
 
 
 def capped(chains: list[Chain], count: int, per_pair: int) -> list[Chain]:

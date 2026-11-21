@@ -9,10 +9,8 @@ import numpy as np
 from pydantic import BaseModel, Field
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
-from shop.workload import Scenarios
-
 from faultsearch.catalog import FROZEN, Catalog, Fault
-from faultsearch.counterfactual import EffectKey, NamedWorkload, Runner, TreatmentRecord
+from faultsearch.counterfactual import EffectKey, NamedWorkload, Runner, Scenarios, TreatmentRecord
 
 
 class Strategy(StrEnum):

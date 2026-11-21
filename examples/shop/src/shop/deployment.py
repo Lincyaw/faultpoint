@@ -11,6 +11,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final
@@ -19,7 +20,7 @@ from pydantic import BaseModel, JsonValue
 
 from shop.upstream import (HOST_FROM_NAMESPACE, UPSTREAM_FILE, Upstream, remove_containers, start_agent,
                            start_upstream, stop_agent)
-from shop.workload import FROZEN, SHOP, Workload
+from shop.workload import FROZEN, SCENARIOS, SHOP, Workload
 
 ROOT: Final = SHOP.parent.parent
 RUNS: Final = ROOT / "runs" / "shop"
@@ -99,13 +100,18 @@ def sdk_commit(sdk: Path) -> str:
     return commit
 
 
-def verified_build(sdk: Path) -> str:
-    """The commit of an SDK checkout whose build the services use, which the last build must have been made from."""
+def built_commit(sdk: Path, built_from: Path) -> str:
+    """The commit of an SDK checkout whose build a system's services use, which the file where its last build wrote
+    its commit must name."""
     commit = sdk_commit(sdk)
-    built = BUILT_FROM.read_text().strip()
+    built = built_from.read_text().strip()
     if built != commit:
         raise RuntimeError(f"the services were built from {built}, not from {commit} in {sdk}")
     return commit
+
+
+def verified_build(sdk: Path) -> str:
+    return built_commit(sdk, BUILT_FROM)
 
 
 def write_config(path: Path, config: dict[str, JsonValue]) -> Path:
@@ -193,10 +199,9 @@ def services(directory: Path, sdk: Path, workload: Workload, upstream: Upstream)
                 environment={**orders_attachment, "ORDERS_DATABASE": str(directory / "orders.db"),
                              "RESERVE_TIMEOUT_S": str(workload.reserve_timeout_s),
                              "PRICE_CACHE_TTL_S": str(workload.price_cache_ttl_s),
-                             "REDIS_URL": upstream.environment()["REDIS_URL"], **urls}),
+                             "REDIS_URL": upstream.redis_url, **urls}),
         Service(name="inventory", port=PORTS["inventory"], command=[str(BUILD / "inventory-bin")], directory=directory,
-                config={"options": {"http": routes}},
-                environment={"INVENTORY_DATABASE": upstream.environment()["INVENTORY_DATABASE"]}),
+                config={"options": {"http": routes}}, environment={"INVENTORY_DATABASE": upstream.database}),
         Service(name="pricing", port=PORTS["pricing"],
                 command=[str(BUILD / "pricing" / "target" / "release" / "pricing")], directory=directory,
                 config={"options": {"tower": routes}}),
@@ -317,9 +322,10 @@ def wait_for_namespace(pid: int) -> None:
         time.sleep(0.01)
 
 
-def namespaced_run(directory: Path, sdk: Path) -> None:
-    """Run serve_and_load in a fresh user and network namespace that slirp4netns connects to the host."""
-    child = subprocess.Popen([*NETWORK_NAMESPACE, sys.executable, "-m", "shop.deployment", str(directory), str(sdk)])
+def namespaced_run(directory: Path, sdk: Path, module: str) -> None:
+    """Run a system's deployment module, which serves and loads the repetition's directory, in a fresh user and network
+    namespace that slirp4netns connects to the host."""
+    child = subprocess.Popen([*NETWORK_NAMESPACE, sys.executable, "-m", module, str(directory), str(sdk)])
     wait_for_namespace(child.pid)
     with (directory / "slirp4netns.log").open("wb") as log:
         slirp = subprocess.Popen(["slirp4netns", "--configure", "--mtu=65520", str(child.pid), "tap0"], stdout=log,
@@ -342,9 +348,11 @@ def refusal(directory: Path) -> str | None:
     return (directory / REFUSAL_FILE).read_text() if (directory / REFUSAL_FILE).exists() else None
 
 
-def repetition(directory: Path, workload: Workload, rules: dict[str, Any], sdk: Path) -> Statuses:
-    """One run of the whole shop under a rule set, with fresh databases, a fresh cache and the kernel agent watching
-    the upstream containers; its observations stay in its directory."""
+def isolated_repetition(directory: Path, workload: BaseModel, rules: dict[str, Any], sdk: Path, sql: str,
+                        redis_commands: list[str], module: str) -> Statuses:
+    """One run of a system's services under a rule set, with a fresh database and cache seeded as given and the kernel
+    agent watching the upstream containers; the system's deployment module serves and loads it in a namespace of its
+    own, and its observations stay in its directory."""
     shutil.rmtree(directory, ignore_errors=True)
     directory.mkdir(parents=True)
     (directory / WORKLOAD_FILE).write_text(workload.model_dump_json())
@@ -352,14 +360,47 @@ def repetition(directory: Path, workload: Workload, rules: dict[str, Any], sdk: 
     prefix = f"fp-{sha256(str(directory).encode()).hexdigest()[:12]}"
     remove_containers(prefix)
     try:
-        upstream = start_upstream(prefix, workload)
+        upstream = start_upstream(prefix, sql, redis_commands)
         (directory / UPSTREAM_FILE).write_text(upstream.model_dump_json())
         agent = start_agent(directory, directory / RULES_FILE, upstream, sdk, prefix, FLUSH_SECONDS)
-        namespaced_run(directory, sdk)
+        namespaced_run(directory, sdk, module)
         stop_agent(agent, directory)
     finally:
         remove_containers(prefix)
     return Statuses.model_validate_json((directory / STATUSES_FILE).read_text())
+
+
+def stock_sql(workload: Workload) -> str:
+    """Inventory's stock: every SKU of every tenant with the workload's stock."""
+    stock = ", ".join(f"('{sku}', {workload.stock_per_sku})"
+                      for tenant in workload.tenant_names() for sku in workload.skus(tenant))
+    return f"CREATE TABLE stock (sku TEXT PRIMARY KEY, available INTEGER); INSERT INTO stock VALUES {stock};"
+
+
+def repetition(directory: Path, workload: dict[str, JsonValue], rules: dict[str, Any], sdk: Path) -> Statuses:
+    """One run of the whole shop under a rule set, with inventory's stock in PostgreSQL and an empty price cache."""
+    shop = Workload.model_validate(workload)
+    return isolated_repetition(directory, shop, rules, sdk, stock_sql(shop), [], "shop.deployment")
+
+
+class System(BaseModel):
+    """A system the search explores: its scenarios and manifests, the service whose responses the user sees, the port
+    each service listens on, and how to build it and run one repetition of it under a rule set."""
+
+    model_config = FROZEN
+
+    name: str
+    scenarios: Path
+    manifests: Path
+    entry_service: str
+    ports: dict[str, int]
+    build: Callable[[Path], str]
+    verified_build: Callable[[Path], str]
+    repetition: Callable[[Path, dict[str, JsonValue], dict[str, Any], Path], Statuses]
+
+
+SYSTEM: Final = System(name="shop", scenarios=SCENARIOS, manifests=MANIFESTS, entry_service="gateway", ports=PORTS,
+                       build=build, verified_build=verified_build, repetition=repetition)
 
 
 if __name__ == "__main__":

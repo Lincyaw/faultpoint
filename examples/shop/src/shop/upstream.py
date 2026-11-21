@@ -8,7 +8,7 @@ from typing import Any, Final
 
 from pydantic import BaseModel
 
-from shop.workload import FROZEN, Workload
+from shop.workload import FROZEN
 
 REDIS: Final = "redis"
 POSTGRES: Final = "postgres"
@@ -78,10 +78,15 @@ class Upstream(BaseModel):
     redis: Container
     postgres: Container
 
-    def environment(self) -> dict[str, str]:
-        return {"REDIS_URL": f"redis://{HOST_FROM_NAMESPACE}:{self.redis.port}/0",
-                "INVENTORY_DATABASE": f"host={HOST_FROM_NAMESPACE} port={self.postgres.port} user=postgres "
-                                      f"password={POSTGRES_PASSWORD} dbname=postgres sslmode=disable"}
+    @property
+    def redis_url(self) -> str:
+        return f"redis://{HOST_FROM_NAMESPACE}:{self.redis.port}/0"
+
+    @property
+    def database(self) -> str:
+        """The connection string of the PostgreSQL database as libpq and pgx read it."""
+        return (f"host={HOST_FROM_NAMESPACE} port={self.postgres.port} user=postgres password={POSTGRES_PASSWORD} "
+                "dbname=postgres sslmode=disable")
 
 
 def docker(*arguments: str, stdin: str | None = None) -> str:
@@ -113,18 +118,16 @@ def wait_until_ready(container: Container, *command: str) -> None:
         time.sleep(0.2)
 
 
-def start_upstream(prefix: str, workload: Workload) -> Upstream:
-    """Redis for orders' price cache and PostgreSQL with inventory's stock, seeded from the workload."""
+def start_upstream(prefix: str, sql: str, redis_commands: list[str]) -> Upstream:
+    """A fresh Redis and PostgreSQL, the database seeded by running sql and the cache by the Redis commands."""
     upstream = Upstream(
         redis=start_container(REDIS, f"{prefix}-{REDIS}", REDIS_IMAGE, REDIS_PORT),
         postgres=start_container(POSTGRES, f"{prefix}-{POSTGRES}", POSTGRES_IMAGE, POSTGRES_PORT,
                                  "-e", f"POSTGRES_PASSWORD={POSTGRES_PASSWORD}", "--tmpfs", "/var/lib/postgresql/data"))
     wait_until_ready(upstream.redis, "redis-cli", "ping")
     wait_until_ready(upstream.postgres, "pg_isready", "-h", "127.0.0.1", "-U", "postgres")
-    stock = ", ".join(f"('{sku}', {workload.stock_per_sku})"
-                      for tenant in workload.tenant_names() for sku in workload.skus(tenant))
-    docker("exec", "-i", upstream.postgres.name, "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1",
-           stdin=f"CREATE TABLE stock (sku TEXT PRIMARY KEY, available INTEGER); INSERT INTO stock VALUES {stock};")
+    docker("exec", "-i", upstream.postgres.name, "psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", stdin=sql)
+    docker("exec", "-i", upstream.redis.name, "redis-cli", stdin="\n".join(redis_commands))
     return upstream
 
 

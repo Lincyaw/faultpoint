@@ -1,0 +1,27 @@
+{
+  "baseline": {
+    "tenants": 4,
+    "quotes_per_tenant": 21,
+    "sku_numbers": [1, 2, 3],
+    "cached_sku_numbers": [1, 2],
+    "concurrency": 1,
+    "guaranteed": false
+  },
+  "scenarios": [
+    {
+      "name": "baseline",
+      "reason": "Ordinary quoting: customers ask one at a time and accept an estimate when no live price is at hand.",
+      "changes": {}
+    },
+    {
+      "name": "flash-sale",
+      "reason": "A flash sale: many customers ask for quotes at once, twenty-four in flight.",
+      "changes": {"concurrency": 24}
+    },
+    {
+      "name": "price-guarantee",
+      "reason": "Corporate customers whose quotes guarantee their price, so that only a live price will do.",
+      "changes": {"guaranteed": true}
+    }
+  ]
+}

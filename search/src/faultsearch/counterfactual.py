@@ -3,21 +3,60 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from string import ascii_lowercase
 from typing import Final, Self
 
 from faultpoint.observations import ObservationRecord, read_records
 from faultpoint.rules import Rule, RuleSet
 from faultpoint.tools.analysis import Comparison, Effect, Metric, Selection, compare
 from faultpoint.tools.kinds import KindTable
-from pydantic import BaseModel, Field
-from shop.deployment import REFUSAL_FILE, SCOPE_KEY, STATUSES_FILE, Statuses, refusal, repetition
-from shop.workload import Workload
+from pydantic import BaseModel, Field, JsonValue
+from shop.deployment import REFUSAL_FILE, SCOPE_KEY, STATUSES_FILE, Statuses, System, refusal
 
 from faultsearch.catalog import FROZEN, Fault
 from faultsearch.store import CONTROLS, LEAKS, TREATMENTS, Store
 
 UNSCOPED: Final = ""
 """The scope of observations no request baggage reached, such as the kernel's."""
+TENANTS: Final = "tenants"
+"""The workload parameter every system has: how many tenants, named a, b, c and on, send requests."""
+
+type Workload = dict[str, JsonValue]
+"""A workload's parameters, as the system that runs it validates them."""
+
+
+def tenant_names(workload: Workload) -> list[str]:
+    tenants = workload[TENANTS]
+    if not isinstance(tenants, int):
+        raise TypeError(f"the workload parameter {TENANTS} is {tenants!r}, not a number of tenants")
+    return list(ascii_lowercase[:tenants])
+
+
+class Scenario(BaseModel):
+    """A business situation that changes a system's baseline workload."""
+
+    model_config = FROZEN
+
+    name: str = Field(pattern=r"^[a-z0-9-]+$")
+    reason: str
+    changes: Workload
+
+
+class Scenarios(BaseModel):
+    model_config = FROZEN
+
+    baseline: Workload
+    scenarios: tuple[Scenario, ...]
+
+    @classmethod
+    def read(cls, path: Path) -> Self:
+        return cls.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def named(self, name: str) -> Scenario:
+        return {scenario.name: scenario for scenario in self.scenarios}[name]
+
+    def workload(self, name: str) -> Workload:
+        return {**self.baseline, **self.named(name).changes}
 
 
 class RunSettings(BaseModel):
@@ -32,6 +71,8 @@ class RunSettings(BaseModel):
     pack_tenants: bool = True
     """Whether faults share repetitions in different tenants; off when upstream components are observed, since no
     tenant scope separates their observations."""
+    system: str = "shop"
+    """The system the experiment explores, by name."""
 
 
 class NamedWorkload(BaseModel):
@@ -118,10 +159,11 @@ class Group(BaseModel):
     def tenants(self) -> list[str]:
         """Every other tenant, since the load interleaves the tenants and a fault can break the request after its own;
         a fault no rule can scope reaches every tenant, and the first stands for them."""
-        return self.workload.workload.tenant_names()[::2][:len(self.faults)]
+        return tenant_names(self.workload.workload)[::2][:len(self.faults)]
 
     def untreated(self) -> list[str]:
-        return [tenant for tenant in self.workload.workload.tenant_names() if self.scoped and tenant not in self.tenants()]
+        return [tenant for tenant in tenant_names(self.workload.workload)
+                if self.scoped and tenant not in self.tenants()]
 
     def ruleset(self, label: str) -> RuleSet:
         return RuleSet(experiment=label, rules=tuple(
@@ -158,7 +200,7 @@ def pack(pairs: list[tuple[Fault, NamedWorkload]]) -> list[Group]:
     groups = []
     for name, faults in by_workload.items():
         workload = workloads[name]
-        capacity = workload.workload.tenants // 2
+        capacity = len(tenant_names(workload.workload)) // 2
         shared = [fault for fault in faults if not fault.delays and fault.scoped]
         groups += [Group(workload=workload, faults=(fault,)) for fault in faults if fault.delays or not fault.scoped]
         groups += [Group(workload=workload, faults=tuple(shared[start:start + capacity]))
@@ -170,9 +212,10 @@ class Runner:
     """Runs repetitions side by side and turns them into control and treatment records, keeping every record so that
     a repeated request reads it instead of running again."""
 
-    def __init__(self, store: Store, settings: RunSettings) -> None:
+    def __init__(self, store: Store, settings: RunSettings, system: System) -> None:
         self.store = store
         self.settings = settings
+        self.system = system
         self.kinds = KindTable.installed()
         self.cache: dict[str, list[ObservationRecord]] = {}
 
@@ -202,7 +245,7 @@ class Runner:
         label, workload, ruleset = job
         directory = self.store.repetition(label)
         try:
-            return repetition(directory, workload, ruleset.model_dump(mode="json"), self.settings.sdk)
+            return self.system.repetition(directory, workload, ruleset.model_dump(mode="json"), self.settings.sdk)
         except subprocess.CalledProcessError:
             reason = refusal(directory)
             if reason is None:

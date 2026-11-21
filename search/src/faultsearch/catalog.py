@@ -136,6 +136,9 @@ class Catalog(BaseModel):
     faults: tuple[Fault, ...]
     uses: tuple[PointUse, ...]
     excluded: tuple[Exclusion, ...]
+    narrower: dict[str, tuple[str, ...]] = {}
+    """The actions a point implements when its manifest lists fewer than its kind's, such as a Go call point kept at
+    its check, which implements no fail."""
 
     @cached_property
     def executions(self) -> dict[str, dict[str, float]]:
@@ -180,9 +183,12 @@ def point_manifests(manifests: Path) -> dict[str, Manifest]:
 def build_catalog(manifests: Path, executions: dict[str, dict[str, float]], configured: list[str],
                   actions: ActionTable, kinds: KindTable, upstream: frozenset[str]) -> Catalog:
     """Every point the manifests list, a control observed or the deployment configures, times the actions its kind
-    takes in its layer; the points no control executed where a rule reaches them are excluded."""
-    placed = {entry.id for path in sorted(manifests.glob("*.json"))
-              for entry in Manifest.model_validate_json(path.read_text(encoding="utf-8")).points}
+    takes in its layer that the point implements; the points no control executed where a rule reaches them are
+    excluded."""
+    entries = [entry for path in sorted(manifests.glob("*.json"))
+               for entry in Manifest.model_validate_json(path.read_text(encoding="utf-8")).points]
+    placed = {entry.id for entry in entries}
+    narrower = {entry.id: entry.actions for entry in entries if entry.actions is not None}
     points = sorted(placed | set(configured) | {point for per_point in executions.values() for point in per_point})
     uses = tuple(PointUse(point=point, executions={
         scenario: CONFIGURED_EXECUTIONS if point in configured else per_point.get(point, 0.0)
@@ -197,5 +203,11 @@ def build_catalog(manifests: Path, executions: dict[str, dict[str, float]], conf
     faults = tuple(Fault(point=use.point, action=action, layer=point_layer(use.point, upstream),
                          scoped=point_scoped(use.point, point_layer(use.point, upstream), kinds))
                    for use in uses if use.point not in skipped
-                   for action in actions.actions(use.point, point_layer(use.point, upstream)) or ())
-    return Catalog(faults=faults, uses=uses, excluded=tuple(excluded))
+                   for action in actions.actions(use.point, point_layer(use.point, upstream)) or ()
+                   if implements(narrower, use.point, action))
+    return Catalog(faults=faults, uses=uses, excluded=tuple(excluded), narrower=narrower)
+
+
+def implements(narrower: dict[str, tuple[str, ...]], point: str, action: Action) -> bool:
+    """Whether a point implements an action: every action of its kind, unless its manifest lists fewer."""
+    return point not in narrower or action.kind in narrower[point]
