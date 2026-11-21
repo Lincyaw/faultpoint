@@ -71,47 +71,47 @@ func (l *libraryCopies) of(found *packages.Module) string {
 }
 
 // instrumentLibrary places the points of a dependency package as far as its scope entry allows, writes its rewritten
-// files and its error registry into the copy of its module, and returns the points.
-func instrumentLibrary(service string, placement Placement, entry ScopeEntry, copies *libraryCopies, pkg *packages.Package) []PointEntry {
+// files and its error registry into the copy of its module, and adds its points and registered errors to the
+// manifest.
+func instrumentLibrary(service string, placement Placement, entry ScopeEntry, copies *libraryCopies, pkg *packages.Package, manifest *Manifest) {
 	limited := placement.limitedTo(entry.Kinds)
 	prefix := versionedPrefix(pkg.Module)
-	var placed []PointEntry
 	for _, file := range pkg.Syntax {
 		relative := relativePath(pkg.Module.Dir, pkg.Fset.Position(file.Pos()).Filename)
 		points := placePoints(service, prefix+relative, limited, pkg, file)
 		if len(points) > 0 {
 			writeFile(filepath.Join(copies.of(pkg.Module), relative), rewriteFile(pkg, file, []string{pointsPackage}))
-			placed = append(placed, points...)
+			manifest.Points = append(manifest.Points, points...)
 		}
 	}
-	if registry := errorRegistry(pkg); registry != nil && limited.Errors {
+	if registry, names := errorRegistry(pkg); registry != nil && limited.Errors {
 		directory := relativePath(pkg.Module.Dir, filepath.Dir(pkg.GoFiles[0]))
 		writeFile(filepath.Join(copies.of(pkg.Module), directory, registryFile), registry)
+		manifest.Errors = append(manifest.Errors, names...)
 	}
-	return placed
 }
 
-// copyLibraries instruments the dependency packages in scope as the copy of the service resolves them, and returns
-// their points and the copies that replace their modules.
-func copyLibraries(service string, placement Placement, libraries map[string]ScopeEntry, copied, target string) ([]PointEntry, map[string]string) {
+// copyLibraries instruments the dependency packages in scope as the copy of the service resolves them, adds their
+// points and registered errors to the manifest, and returns the copies that replace their modules.
+func copyLibraries(service string, placement Placement, libraries map[string]ScopeEntry, copied, target string, manifest *Manifest) map[string]string {
 	copies := &libraryCopies{dir: filepath.Join(target, librariesDir), modules: map[string]string{}}
-	var placed []PointEntry
 	for _, pkg := range loadPackages(copied, slices.Sorted(maps.Keys(libraries))...) {
-		placed = append(placed, instrumentLibrary(service, placement, libraries[pkg.PkgPath], copies, pkg)...)
+		instrumentLibrary(service, placement, libraries[pkg.PkgPath], copies, pkg, manifest)
 	}
-	return placed, copies.modules
+	return copies.modules
 }
 
-// scanLibraries lists the points of the dependency packages in scope without writing anything, as instrumentLibrary
-// places them.
-func scanLibraries(service, dir string, placement Placement, libraries map[string]ScopeEntry) []PointEntry {
-	var placed []PointEntry
+// scanLibraries adds the points and registered errors of the dependency packages in scope to a manifest without
+// writing anything, as instrumentLibrary places them.
+func scanLibraries(service, dir string, placement Placement, libraries map[string]ScopeEntry, manifest *Manifest) {
 	for _, pkg := range loadPackages(dir, slices.Sorted(maps.Keys(libraries))...) {
 		limited := placement.limitedTo(libraries[pkg.PkgPath].Kinds)
 		for _, file := range pkg.Syntax {
 			relative := relativePath(pkg.Module.Dir, pkg.Fset.Position(file.Pos()).Filename)
-			placed = append(placed, placePoints(service, versionedPrefix(pkg.Module)+relative, limited, pkg, file)...)
+			manifest.Points = append(manifest.Points, placePoints(service, versionedPrefix(pkg.Module)+relative, limited, pkg, file)...)
+		}
+		if _, names := errorRegistry(pkg); limited.Errors {
+			manifest.Errors = append(manifest.Errors, names...)
 		}
 	}
-	return placed
 }

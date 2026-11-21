@@ -35,8 +35,8 @@ package {{.Name}}
 import {{printf "%q" .Core}}
 
 func init() {
-{{- range .Variables}}
-	{{$.CoreName}}.RegisterError({{printf "%q" (print $.Path "." .)}}, {{.}})
+{{- range .Errors}}
+	{{$.CoreName}}.RegisterError({{printf "%q" .Name}}, {{.Variable}})
 {{- end}}
 }
 `))
@@ -89,11 +89,13 @@ type PointEntry struct {
 	Code     string `json:"code"`
 }
 
-// Manifest lists every point placed in a service.
+// Manifest lists every point placed in a service and the error names its build registers, which a fail rule may
+// name.
 type Manifest struct {
 	Service  string       `json:"service"`
 	Language string       `json:"language"`
 	Points   []PointEntry `json:"points"`
+	Errors   []string     `json:"errors"`
 }
 
 // qualifiedName is path.Name of a named type, or empty for any other type.
@@ -374,20 +376,32 @@ func (p *placer) placeLoop(node ast.Node, body *ast.BlockStmt) {
 	body.List = append([]ast.Stmt{&ast.ExprStmt{X: p.call("Loop", point)}}, body.List...)
 }
 
+// registeredError is an error variable of a package with the name a registry registers it under.
+type registeredError struct {
+	Name     string
+	Variable string
+}
+
 // errorRegistry is the source of a file that registers a package's error variables by name in the core, which a
-// call fail rule returns and an observation names errors by, or nil when the package has none.
-func errorRegistry(pkg *packages.Package) []byte {
+// call fail rule returns and an observation names errors by, and the names it registers; nil when the package has
+// none.
+func errorRegistry(pkg *packages.Package) ([]byte, []string) {
 	scope := pkg.Types.Scope()
-	variables := slices.DeleteFunc(scope.Names(), func(name string) bool {
-		variable, ok := scope.Lookup(name).(*types.Var)
-		return !ok || !types.Identical(variable.Type(), errorType)
-	})
-	if len(variables) == 0 {
-		return nil
+	var errors []registeredError
+	var names []string
+	for _, variable := range scope.Names() {
+		found, ok := scope.Lookup(variable).(*types.Var)
+		if ok && types.Identical(found.Type(), errorType) {
+			errors = append(errors, registeredError{Name: pkg.PkgPath + "." + variable, Variable: variable})
+			names = append(names, pkg.PkgPath+"."+variable)
+		}
+	}
+	if len(errors) == 0 {
+		return nil, nil
 	}
 	var source bytes.Buffer
-	err := registryTemplate.Execute(&source, map[string]any{"Name": pkg.Name, "Path": pkg.PkgPath, "Variables": variables,
-		"Core": corePackage, "CoreName": path.Base(corePackage)})
+	err := registryTemplate.Execute(&source, map[string]any{"Name": pkg.Name, "Errors": errors, "Core": corePackage,
+		"CoreName": path.Base(corePackage)})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -395,5 +409,5 @@ func errorRegistry(pkg *packages.Package) []byte {
 	if err != nil {
 		log.Fatal(err)
 	}
-	return formatted
+	return formatted, names
 }
