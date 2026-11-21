@@ -25,20 +25,26 @@ const (
 // count towards a fail_after rule.
 var Before = []string{"fail", "drop", "duplicate", "empty", "delay", "crash"}
 
-// Hold holds an execution of a point inside the process as its rule says, the contention a delay models outlasting
-// any caller: a delay, and the ms of a fail, block the calling goroutine, a crash ends the process with its code.
+// Hold holds an execution as its rule says where the wait outlasts any caller, as the contention inside the process
+// or a server slow before it handles a request does: a delay, and the ms of a fail, block the calling goroutine, a
+// crash ends the process with its code.
 func Hold(rule *faultpoint.Rule) {
 	defer faultpoint.Guard()
-	time.Sleep(pause(rule))
+	time.Sleep(Pause(rule))
 }
 
-// Wait holds an execution of a boundary point as its rule says, where a delay, and the ms of a fail, model a slow
+// Wait holds an execution of a client of a peer as its rule says, where a delay, and the ms of a fail, model a slow
 // peer: a caller that gives up ends the wait as it ends a wait for a peer, and Wait returns the context's error
 // then, nil once the wait is over. A crash rule ends the process with its code.
 func Wait(ctx context.Context, rule *faultpoint.Rule) error {
 	defer faultpoint.Guard()
-	duration := pause(rule)
-	if duration == 0 {
+	return Sleep(ctx, Pause(rule))
+}
+
+// Sleep waits for a duration unless the caller gives up first, and returns the context's error then, nil once the
+// duration is over or when it is zero.
+func Sleep(ctx context.Context, duration time.Duration) error {
+	if duration <= 0 {
 		return nil
 	}
 	timer := time.NewTimer(duration)
@@ -51,9 +57,9 @@ func Wait(ctx context.Context, rule *faultpoint.Rule) error {
 	}
 }
 
-// pause is how long a rule holds an execution before it acts, the ms of a delay or of a fail; a crash rule ends the
+// Pause is how long a rule holds an execution before it acts, the ms of a delay or of a fail; a crash rule ends the
 // process instead.
-func pause(rule *faultpoint.Rule) time.Duration {
+func Pause(rule *faultpoint.Rule) time.Duration {
 	var wait struct {
 		MS int `json:"ms"`
 	}

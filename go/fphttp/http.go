@@ -77,9 +77,9 @@ type ServerCall struct {
 }
 
 // Take takes a request at its rpc_server point: it restores the caller's trace and baggage, decides the rule that
-// acts before the handler runs and performs its wait or crash. A client that gives up ends the wait, which models a
-// server slow before it handles the request, and the request then goes on with its context canceled, as net/http
-// still runs the handler of a request whose client went away. Take returns nil when a server point around this one
+// acts before the handler runs and performs its wait or crash. The wait models a server slow before it handles the
+// request, which stays slow when the client gives up, and the handler then runs as net/http runs the handler of a
+// request whose client went away, with the context canceled. Take returns nil when a server point around this one
 // already took the request, as when a wrapped http.Server serves an instrumented framework, so that a request is
 // one execution of one point.
 func Take(request *http.Request) *ServerCall {
@@ -92,8 +92,7 @@ func Take(request *http.Request) *ServerCall {
 		point: faultpoint.PointID(faultpoint.Service(), "rpc_server", request.Method+" "+pathTemplate(request.URL.Path))}
 	call.Rule = faultpoint.Decide(ctx, call.point, action.Before...)
 	if call.Rule != nil {
-		// The handler sees the canceled context itself, so the wait's error is not the request's result.
-		_ = action.Wait(ctx, call.Rule)
+		action.Hold(call.Rule)
 	}
 	return call
 }

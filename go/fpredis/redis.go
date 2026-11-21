@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -72,10 +74,36 @@ func commandLocator(locator string) bool {
 // it is.
 func Instrument[C interface{ AddHook(redis.Hook) }](client C) C {
 	defer faultpoint.Guard()
-	if enabled {
-		client.AddHook(hook{})
+	if !enabled {
+		return client
 	}
+	instrumented := hook{}
+	if single, isSingle := any(client).(*redis.Client); isSingle {
+		instrumented.readTimeout = single.Options().ReadTimeout
+		instrumented.server = serverAddress(single.Options().Addr)
+	}
+	client.AddHook(instrumented)
 	return client
+}
+
+// serverAddress is the TCP address of a Redis server as a read error names it.
+type serverAddress string
+
+func (a serverAddress) Network() string { return "tcp" }
+func (a serverAddress) String() string  { return string(a) }
+
+// wait holds a command as its rule says, as a slow server holds its reply: a caller that gives up ends the wait with
+// its context's error, and, but for a consume, whose read the command's own block bounds, a wait longer than the
+// client's read timeout fails once the timeout is over with the error of a timed-out read.
+func (h hook) wait(ctx context.Context, rule *faultpoint.Rule, kind string) error {
+	pause := action.Pause(rule)
+	if h.readTimeout <= 0 || kind == "consume" || pause <= h.readTimeout {
+		return action.Sleep(ctx, pause)
+	}
+	if err := action.Sleep(ctx, h.readTimeout); err != nil {
+		return err
+	}
+	return &net.OpError{Op: "read", Net: "tcp", Addr: h.server, Err: os.ErrDeadlineExceeded}
 }
 
 // key is the key of a command by the table's key position: an index among the arguments after the command name,
@@ -117,7 +145,7 @@ type call struct {
 
 // decide finds a command in the table, decides its rule that acts before it is sent and performs the rule's wait or
 // crash; a command outside the table is not a point.
-func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
+func (h hook) decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 	defer faultpoint.Guard()
 	started := time.Now()
 	name := strings.ToUpper(cmd.Name())
@@ -133,7 +161,7 @@ func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 		started: started}
 	c.rule = faultpoint.Decide(ctx, c.point, action.Before...)
 	if c.rule != nil {
-		c.ended = action.Wait(ctx, c.rule)
+		c.ended = h.wait(ctx, c.rule, known.Kind)
 		c.action = c.rule.Action.Kind
 	}
 	if c.action == "empty" && known.Empty == "never" {
@@ -277,14 +305,19 @@ func size(cmd redis.Cmder) int {
 	return 1
 }
 
-type hook struct{}
+// hook makes the commands of one client points, with the read timeout and the server of a single client, which are
+// zero for other clients, whose injected waits only their callers end.
+type hook struct {
+	readTimeout time.Duration
+	server      serverAddress
+}
 
 func (hook) DialHook(next redis.DialHook) redis.DialHook { return next }
 
-func (hook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+func (h hook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) (err error) {
 		defer faultpoint.Guard()
-		c, known := decide(ctx, cmd)
+		c, known := h.decide(ctx, cmd)
 		if !known {
 			faultpoint.Outside(func() { err = next(ctx, cmd) })
 			return err
@@ -303,14 +336,14 @@ func (hook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 
 // ProcessPipelineHook sends the commands no rule keeps back in one round trip, as the caller asked; a duplicate
 // would leave the pipeline or its transaction, so a pipeline cannot duplicate.
-func (hook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+func (h hook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) (err error) {
 		defer faultpoint.Guard()
 		calls := make([]call, len(cmds))
 		known := make([]bool, len(cmds))
 		sent := make([]redis.Cmder, 0, len(cmds))
 		for index, cmd := range cmds {
-			calls[index], known[index] = decide(ctx, cmd)
+			calls[index], known[index] = h.decide(ctx, cmd)
 			if known[index] && calls[index].action == "duplicate" {
 				faultpoint.Abort("rule %s: a pipeline cannot duplicate %s", calls[index].rule.ID, calls[index].point)
 			}
