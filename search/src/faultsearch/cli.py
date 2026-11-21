@@ -1,3 +1,4 @@
+import math
 from collections import Counter
 from pathlib import Path
 from typing import Annotated, Final
@@ -18,7 +19,8 @@ from faultsearch.catalog import (FROZEN, ActionTable, Catalog, Fault, build_cata
 from faultsearch.chains import Stitching, stitch
 from faultsearch.counterfactual import (EffectKey, NamedWorkload, Runner, RunSettings, Scenarios, tenant_names,
                                         treatment_record)
-from faultsearch.edges import Condition, EdgeSet, EffectMap, build_edges, counterpart_assignments, holds
+from faultsearch.edges import (Acceptance, Condition, EdgeSet, EffectMap, build_edges, counterpart_assignments,
+                               holds)
 from faultsearch.report import render, summarise
 from faultsearch.store import (ACTIONS_INPUT, ALLOCATION_SETTINGS, CATALOG, EFFECTS_INPUT, HEADROOM, INPUTS,
                                MAPPING_FEEDBACK, REPORT, RUN_SETTINGS, SCENARIOS_INPUT, VALIDATIONS, Store,
@@ -36,6 +38,8 @@ SdkRoot = Annotated[Path, typer.Option(help="A clean checkout of the SDK commit 
 Rebuild = Annotated[bool, typer.Option(help="Build the SDK and the system first.")]
 SYSTEMS: Final = {system.name: system for system in (SHOP, *STITCH_MECHANISM_BUILDS)}
 Explored = Annotated[str, typer.Option(help=f"The system to explore, one of {', '.join(SYSTEMS)}.")]
+MaxLoad = Annotated[float, typer.Option(
+    help="The host's 1-minute load above which no new repetition starts while others still run.")]
 
 
 def services_by_port(system: System) -> dict[int, str]:
@@ -50,12 +54,12 @@ def recorded_scenarios(store: Store, system: System) -> Scenarios:
     return store.record_input(Scenarios.read(system.scenarios), INPUTS, SCENARIOS_INPUT)
 
 
-def recorded_runner(store: Store) -> Runner:
+def recorded_runner(store: Store, max_load: float) -> Runner:
     settings = store.load(RunSettings, RUN_SETTINGS)
     system = SYSTEMS[settings.system]
     if system.verified_build(settings.sdk) != settings.commit:
         raise RuntimeError(f"the services are not built from {settings.commit}")
-    return Runner(store, settings, system)
+    return Runner(store, settings, system, max_load)
 
 
 def scenario_catalog(store: Store, runner: Runner, scenarios: Scenarios) -> Catalog:
@@ -94,7 +98,7 @@ def explore(experiment: Experiment, sdk_root: SdkRoot, strategy: Chosen = Strate
             pack_tenants: Annotated[bool, typer.Option(
                 help="Let faults share repetitions in different tenants; off when upstream components are "
                      "observed.")] = True,
-            rebuild: Rebuild = False, system: Explored = SHOP.name) -> None:
+            rebuild: Rebuild = False, system: Explored = SHOP.name, max_load: MaxLoad = math.inf) -> None:
     """Run the controls of every scenario, build the fault catalog, and spend the budget with one strategy."""
     store = Store(experiment)
     sdk = sdk_root.resolve()
@@ -102,7 +106,7 @@ def explore(experiment: Experiment, sdk_root: SdkRoot, strategy: Chosen = Strate
     commit = explored.build(sdk) if rebuild else explored.verified_build(sdk)
     runner = Runner(store, store.record_input(RunSettings(
         sdk=sdk, commit=commit, repetitions=repetitions, alpha=alpha, min_mean_increase=min_mean_increase,
-        workers=workers, pack_tenants=pack_tenants, system=system), RUN_SETTINGS), explored)
+        workers=workers, pack_tenants=pack_tenants, system=system), RUN_SETTINGS), explored, max_load)
     exploration = catalog_exploration(store, runner, AllocationSettings(
         budget=budget, seed=seed, round_robin_share=round_robin_share, cluster_distance=cluster_distance,
         epsilon=epsilon, batch=batch))
@@ -114,7 +118,7 @@ def explore(experiment: Experiment, sdk_root: SdkRoot, strategy: Chosen = Strate
 @app.command()
 def replay(experiment: Experiment,
            source: Annotated[str, typer.Option(help="The experiment whose phased assignments to run again.")],
-           sdk_root: SdkRoot, rebuild: Rebuild = False) -> None:
+           sdk_root: SdkRoot, rebuild: Rebuild = False, max_load: MaxLoad = math.inf) -> None:
     """Run another experiment's phased assignments again with another SDK build, under that experiment's scenarios
     and settings, then every fault of the catalog they leave out once, such as those of a new fault source."""
     store = Store(experiment)
@@ -123,7 +127,7 @@ def replay(experiment: Experiment,
     system = recorded_system(recorded)
     commit = system.build(sdk) if rebuild else system.verified_build(sdk)
     runner = Runner(store, store.record_input(recorded.load(RunSettings, RUN_SETTINGS).model_copy(
-        update={"sdk": sdk, "commit": commit}), RUN_SETTINGS), system)
+        update={"sdk": sdk, "commit": commit}), RUN_SETTINGS), system, max_load)
     store.record_input(recorded.load(Scenarios, INPUTS, SCENARIOS_INPUT), INPUTS, SCENARIOS_INPUT)
     exploration = catalog_exploration(store, runner, recorded.load(AllocationSettings, ALLOCATION_SETTINGS))
     assignments = recorded.load(Allocation, allocation_file(Strategy.PHASED)).assignments
@@ -141,44 +145,66 @@ def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
                    max_hops: int = 4,
                    kept: Annotated[int, typer.Option(help="Ranked chains written in full.")] = 300,
                    min_count_increase: Annotated[float, typer.Option(
-                       help="The smallest relative increase of a count that counts as an effect.")] = 0.2) -> None:
+                       help="The smallest relative increase of a count that counts as an effect.")] = 0.2,
+                   acceptance: Annotated[Acceptance, typer.Option(
+                       help="How a substitute run is compared with the natural run it stands for.")]
+                   = Acceptance.BEHAVIOUR) -> None:
     """Learn the edges of a strategy's injections and stitch them into ranked chains and cycles, leaving out the
     steps from an effect through a counterpart to a consequence that validations refuted."""
     store = Store(experiment)
     system = recorded_system(store)
     allocation = store.load(Allocation, allocation_file(strategy))
     records = [treatment_record(store, assignment.fault, assignment.scenario) for assignment in allocation.assignments]
+    catalog = store.load(Catalog, CATALOG)
     edges = build_edges(records, recorded_scenarios(store, system),
                         store.record_input(EffectMap.read(system.entry_service), INPUTS, EFFECTS_INPUT),
-                        store.load(Catalog, CATALOG), KindTable.installed(), UPSTREAM_SERVICES, UNSCOPED_TARGETS,
+                        catalog, KindTable.installed(), UPSTREAM_SERVICES, UNSCOPED_TARGETS,
                         services_by_port(system), point_manifests(system.manifests), min_count_increase,
-                        store.load(RunSettings, RUN_SETTINGS).min_mean_increase)
-    store.save(EdgeSet(strategy=strategy, edges=tuple(edges)), edges_file(strategy))
+                        store.load(RunSettings, RUN_SETTINGS).min_mean_increase, acceptance)
+    store.save(EdgeSet(strategy=strategy, edges=tuple(edges), acceptance=acceptance), edges_file(strategy))
     feedback = store.load(MappingFeedback, MAPPING_FEEDBACK) if store.has(MAPPING_FEEDBACK) \
         else MappingFeedback(checks=())
     stitching = stitch(edges, allocation, records, width, max_hops, kept, min_count_increase, feedback)
     store.save(stitching, chains_file(strategy))
-    needed = counterpart_assignments(edges, {assignment.fault.key for assignment in allocation.assignments})
+    needed = counterpart_assignments(edges, {(assignment.fault.key, assignment.scenario)
+                                             for assignment in allocation.assignments}, catalog)
     typer.echo(f"{strategy}: {len(edges)} edges, {stitching.chains} chains ({stitching.stitched_only} stitched only, "
                f"{stitching.single_scenario} shown end to end by one scenario, {stitching.undetermined} undetermined), "
                f"{len(stitching.cycles)} cycles; {len(needed)} counterpart injections not yet run")
 
 
 @app.command()
-def complete(experiment: Experiment) -> None:
-    """Inject, each where its effect appeared, the faults that correspond to the effects of the last stitching's edges
-    and that no assignment of the phased allocation tried, so that the next stitching continues through them."""
+def complete(experiment: Experiment, max_load: MaxLoad = math.inf) -> None:
+    """Inject the faults that correspond to the effects of the last stitching's edges in the scenarios that execute
+    their points and that no assignment of the phased allocation tried, so that the next stitching continues through
+    them."""
     store = Store(experiment)
     allocation = store.load(Allocation, allocation_file(Strategy.PHASED))
+    catalog = store.load(Catalog, CATALOG)
     needed = counterpart_assignments(list(store.load(EdgeSet, edges_file(Strategy.PHASED)).edges),
-                                     {assignment.fault.key for assignment in allocation.assignments})
-    runner = recorded_runner(store)
-    exploration = Exploration(runner, store.load(Catalog, CATALOG), recorded_scenarios(store, runner.system),
+                                     {(assignment.fault.key, assignment.scenario)
+                                      for assignment in allocation.assignments}, catalog)
+    runner = recorded_runner(store, max_load)
+    exploration = Exploration(runner, catalog, recorded_scenarios(store, runner.system),
                               store.load(AllocationSettings, ALLOCATION_SETTINGS))
     completed = extended_allocation(exploration, Strategy.PHASED, [*allocation.assignments, *needed])
     store.save(completed, allocation_file(Strategy.PHASED))
     typer.echo(f"{len(needed)} counterpart injections: {len(completed.assignments)} injections, "
                f"{len(completed.clusters)} clusters")
+
+
+@app.command()
+def rerecord(experiment: Experiment) -> None:
+    """Record every injection of the phased allocation again from the repetitions it ran, without running any, so
+    that records written before a newer record kept a measure gain it."""
+    store = Store(experiment)
+    runner = recorded_runner(store, math.inf)
+    scenarios = recorded_scenarios(store, runner.system)
+    assignments = store.load(Allocation, allocation_file(Strategy.PHASED)).assignments
+    runner.rerecord([(assignment.fault, NamedWorkload(name=assignment.scenario,
+                                                      workload=scenarios.workload(assignment.scenario)))
+                     for assignment in assignments])
+    typer.echo(f"{len(assignments)} injections recorded again")
 
 
 @app.command("chains")
@@ -219,15 +245,15 @@ def validate_command(experiment: Experiment,
                      per_group: Annotated[int, typer.Option(help="Most runs one group of chains chooses.")] = 3,
                      single_scenario_cross_layer: Annotated[int, typer.Option(
                          help="Best chains across layers one scenario showed, validated as controls.")] = 3,
-                     chain: Annotated[list[str], typer.Option(help="A chain to validate besides, by its key.")] = []
-                     ) -> None:
+                     chain: Annotated[list[str], typer.Option(help="A chain to validate besides, by its key.")] = [],
+                     max_load: MaxLoad = math.inf) -> None:
     """Validate in batches of runs. A run injects the first fault of the chain that chose it in the workload its
     conditions merge into, and decides every kept chain with the same first fault and workload. The candidates are
     the stitched-only chains across layers ending in a failure the user sees whose count hops have headroom and that
     no natural witness contradicts; every batch's checks update the chances that rank the next batch's runs."""
     store = Store(experiment)
     stitching = store.load(Stitching, chains_file(Strategy.PHASED))
-    runner = recorded_runner(store)
+    runner = recorded_runner(store, max_load)
     scenarios = recorded_scenarios(store, runner.system)
     order = {key: rank for rank, key in enumerate(stitching.keys)}
     kept = sorted({kept.key: kept for kept in (*stitching.top, *stitching.top_cross_layer)}.values(),
@@ -293,7 +319,8 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
           system: Explored = SHOP.name, repetitions: int = 3, workers: int = 6, alpha: float = 0.1,
           min_mean_increase: float = 0.5,
           min_count_increase: Annotated[float, typer.Option(
-              help="The smallest relative increase of a count that counts as an effect.")] = 0.2) -> None:
+              help="The smallest relative increase of a count that counts as an effect.")] = 0.2,
+          max_load: MaxLoad = math.inf) -> None:
     """Inject given faults alone in given workloads, against controls of those workloads, and show every tenant's
     statuses and every effect: a check of what a constructed system does, before a search explores it."""
     store = Store(experiment)
@@ -301,7 +328,7 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
     runner = Runner(store, store.record_input(RunSettings(
         sdk=sdk_root.resolve(), commit=explored.verified_build(sdk_root.resolve()), repetitions=repetitions,
         alpha=alpha, min_mean_increase=min_mean_increase, workers=workers, pack_tenants=False, system=system),
-        RUN_SETTINGS), explored)
+        RUN_SETTINGS), explored, max_load)
     scenarios = recorded_scenarios(store, explored)
     pairs = [(Fault(point=item.point, action=item.action, layer=point_layer(item.point, UPSTREAM_SERVICES),
                     scoped=point_scoped(item.point, point_layer(item.point, UPSTREAM_SERVICES), runner.kinds)),

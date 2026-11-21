@@ -1,13 +1,15 @@
+import os
 import subprocess
+import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
 from string import ascii_lowercase
 from typing import Final, Self
 
 from faultpoint.observations import ObservationRecord, read_records
-from faultpoint.rules import Rule, RuleSet
+from faultpoint.rules import Rule, RuleSet, Trigger
 from faultpoint.tools.analysis import Comparison, Effect, Metric, Selection, compare
 from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, Field, JsonValue
@@ -17,6 +19,8 @@ from faultsearch.catalog import BOUNDARY_KINDS, FROZEN, Fault, point_kind
 from faultsearch.store import CONTROLS, LEAKS, TREATMENTS, Store
 
 UNSCOPED: Final = ""
+LOAD_POLL_S: Final = 2.0
+"""How often a repetition held back by the host's load checks it again."""
 """The scope of observations no request baggage reached, such as the kernel's."""
 TENANTS: Final = "tenants"
 """The workload parameter every system has: how many tenants, named a, b, c and on, send requests."""
@@ -121,6 +125,20 @@ def effects_elapsed(records: list[ObservationRecord], labels: list[str], scopes:
     return elapsed
 
 
+def effects_rates(records: list[ObservationRecord], labels: list[str], scopes: set[str],
+                  effects: tuple[Effect, ...]) -> dict[str, float]:
+    """The share of its point's natural executions that each effect's outcome and detail had, in the repetitions and
+    scopes the effect was compared in: how often a counterpart must act to stand for it."""
+    outcomes: dict[tuple[str, str, tuple[tuple[str, str], ...]], int] = defaultdict(int)
+    executions: dict[str, int] = defaultdict(int)
+    for record in records:
+        if record.rule is None and record.experiment in labels and record.scope in scopes:
+            outcomes[(record.point, record.outcome, tuple(sorted(record.detail.items())))] += record.count
+            executions[record.point] += record.count
+    return {EffectKey.of(effect).key: outcomes[(effect.point, effect.outcome, tuple(sorted(effect.detail.items())))]
+            / executions[effect.point] for effect in effects if executions.get(effect.point)}
+
+
 def boundary_loads(records: list[ObservationRecord], labels: list[str], scope: str) -> dict[str, dict[str, Load]]:
     """Every rpc_server and rpc_client point of a scope, by outcome, with its executions per repetition and the mean
     of their totals, injected executions included, since the boundary is what callers see."""
@@ -158,6 +176,9 @@ class TreatmentRecord(BaseModel):
     boundary: dict[str, dict[str, Load]] = {}
     """How the treated tenant's service boundaries behaved, by rpc_server or rpc_client point and outcome, which tells
     whether a substitute run behaves as the natural run it stands for; records from before have none."""
+    rates: dict[str, float] = {}
+    """The share of its point's natural executions each effect's outcome had in the treatment repetitions; records
+    from before it was kept have none."""
 
     @property
     def exercised(self) -> bool:
@@ -218,7 +239,7 @@ class Group(BaseModel):
     def ruleset(self, label: str) -> RuleSet:
         return RuleSet(experiment=label, rules=tuple(
             Rule(id=fault.digest, point=fault.point, action=fault.action,
-                 scope={SCOPE_KEY: tenant} if fault.scoped else {})
+                 scope={SCOPE_KEY: tenant} if fault.scoped else {}, trigger=Trigger(probability=fault.probability))
             for fault, tenant in zip(self.faults, self.tenants(), strict=True)))
 
 
@@ -262,12 +283,20 @@ class Runner:
     """Runs repetitions side by side and turns them into control and treatment records, keeping every record so that
     a repeated request reads it instead of running again."""
 
-    def __init__(self, store: Store, settings: RunSettings, system: System) -> None:
+    def __init__(self, store: Store, settings: RunSettings, system: System, max_load: float) -> None:
         self.store = store
         self.settings = settings
         self.system = system
+        self.max_load = max_load
+        """The host's 1-minute load above which no new repetition starts while others still run."""
         self.kinds = KindTable.installed()
         self.cache: dict[str, list[ObservationRecord]] = {}
+
+    def wait_for_load(self, started: list[Future[Statuses]]) -> None:
+        """Wait, while a repetition still runs, until the host's load falls under the limit, so that a loaded host
+        does not slow the repetitions whose timing the faults depend on."""
+        while any(not future.done() for future in started) and os.getloadavg()[0] > self.max_load:
+            time.sleep(LOAD_POLL_S)
 
     def observations(self, label: str) -> list[ObservationRecord]:
         if label not in self.cache:
@@ -286,8 +315,17 @@ class Runner:
             if violations:
                 raise ValueError(f"{ruleset.experiment}: {violations}")
         with ThreadPoolExecutor(self.settings.workers) as pool:
-            for label, statuses in zip([job[0] for job in pending], pool.map(self.repetition, pending), strict=True):
-                print(label, statuses.tenants, flush=True)
+            started: list[Future[Statuses]] = []
+            for job in pending:
+                self.wait_for_load(started)
+                started.append(pool.submit(self.repetition, job))
+            for (label, _, _), future in zip(pending, started, strict=True):
+                print(label, future.result().tenants, flush=True)
+
+    def rerecord(self, pairs: list[tuple[Fault, NamedWorkload]]) -> None:
+        """Record again, from the repetitions they ran, the treatments of faults in workloads, which runs only the
+        repetitions missing, so that records gain what a newer record keeps."""
+        self.run_groups([Group(workload=workload, faults=(fault,)) for fault, workload in pairs])
 
     def repetition(self, job: tuple[str, Workload, RuleSet]) -> Statuses:
         """One repetition; a service refusing a rule ends it, which is recorded so that the fault counts as never
@@ -352,7 +390,8 @@ class Runner:
                 packed_with=tuple(other.key for other in group.faults if other != fault), injected=tuple(injected),
                 statuses=tuple(self.statuses(label).tenants[tenant] for label in labels), effects=effects,
                 leakage=leakage, elapsed=effects_elapsed(observed, labels, {tenant, UNSCOPED}, effects),
-                boundary=boundary_loads(observed, labels, tenant)))
+                boundary=boundary_loads(observed, labels, tenant),
+                rates=effects_rates(observed, labels, {tenant, UNSCOPED}, effects)))
         return records
 
     def run_groups(self, groups: list[Group]) -> list[Group]:

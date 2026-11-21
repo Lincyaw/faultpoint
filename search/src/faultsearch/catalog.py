@@ -16,6 +16,8 @@ FROZEN: Final = ConfigDict(frozen=True, extra="forbid")
 DATA: Final = Path(__file__).resolve().parents[2] / "data"
 ACTIONS_FILE: Final = DATA / "actions.json"
 DELAY: Final = "delay"
+PROBABILITY: Final = "probability"
+"""How a fault's key names the chance that its rule acts on an execution."""
 KERNEL_KINDS: Final = frozenset({"syscall", "packet"})
 FUNCTION_KINDS: Final = frozenset({"call", "check"})
 """The kinds of the points the kernel agent places in an upstream component's functions."""
@@ -77,11 +79,15 @@ class Fault(BaseModel):
     layer: Layer = Layer.BUSINESS
     scoped: bool = True
     """Whether a rule can limit the fault to a tenant; kernel points see no request baggage."""
+    probability: float = 1.0
+    """The chance that the rule acts on each execution it could act on, below 1 for a counterpart standing for an
+    effect seen on part of the executions."""
 
     @property
     def key(self) -> str:
         parameters = sorted(self.action.model_dump(exclude={"kind"}).items())
-        return " ".join([self.point, self.action.kind, *(f"{name}={value}" for name, value in parameters)])
+        chance = [f"{PROBABILITY}={self.probability}"] if self.probability < 1 else []
+        return " ".join([self.point, self.action.kind, *(f"{name}={value}" for name, value in parameters), *chance])
 
     @property
     def digest(self) -> str:

@@ -21,8 +21,8 @@ from faultsearch.counterfactual import EffectKey, Load, Scenarios, TreatmentReco
 EFFECTS_FILE: Final = DATA / "effects.json"
 WAIT: Final = "ms"
 """The action parameter of how long a fail waits or a delay lasts."""
-WAIT_DIGITS: Final = 2
-"""The significant digits of a counterpart's time, so that near times share one fault."""
+PARAMETER_DIGITS: Final = 2
+"""The significant digits of a counterpart's measured time and probability, so that near values share one fault."""
 COUNT_SLACK: Final = 1.0
 """The executions per repetition two runs may differ by however few there are, below which a fraction says nothing."""
 ABSENT: Final = Load(count=0, mean=0)
@@ -222,11 +222,22 @@ class Edge(BaseModel):
         return f"[{self.cause.key}] {self.effect.key}"
 
 
+class Acceptance(StrEnum):
+    """How a substitute run is compared with the natural run it stands for."""
+
+    BEHAVIOUR = "behaviour"
+    """Executions per repetition and their mean time, at every outcome."""
+    TIMING = "timing"
+    """Only the mean time of the outcomes both runs had: a looser check, kept to measure what the counts add."""
+
+
 class EdgeSet(BaseModel):
     model_config = FROZEN
 
     strategy: Strategy
     edges: tuple[Edge, ...]
+    acceptance: Acceptance = Acceptance.BEHAVIOUR
+    """How the substitute runs were compared with the natural runs; edge sets from before compared counts too."""
 
 
 def learn_conditions(held: list[str], not_held: list[str], scenarios: Scenarios) -> tuple[Condition, ...]:
@@ -267,33 +278,60 @@ def peer_effects(effect: EffectKey, runs: list[dict[str, Effect]], services: dic
             if found.point == peer and all(key in run for run in runs)]
 
 
-def timed(action: Action, effect: EffectKey, layer: Layer, elapsed: float, increase: float) -> Action:
+class EffectProfile(BaseModel):
+    """What the natural executions behind an effect were like where it held, which a counterpart reproduces."""
+
+    model_config = FROZEN
+
+    elapsed: float
+    """Their mean time, in ms."""
+    increase: float
+    """For a slower mean, how much it grew, in ms."""
+    rate: float
+    """The share of the point's executions that had the effect's outcome."""
+
+
+def timed(action: Action, effect: EffectKey, layer: Layer, profile: EffectProfile) -> Action:
     """A counterpart's action with the time of the effect it stands for, so that its timing is faithful too: a fail
     waits as long as the natural failure took, and a delay for a slower mean adds the increase seen; a kernel point
     keeps the action as it is, since kernel points carry no elapsed time."""
-    wait = (elapsed if action.kind == ActionKind.FAIL and effect.metric == Metric.COUNT
-            else increase if action.kind == ActionKind.DELAY and effect.metric == Metric.MEAN else 0.0)
+    wait = (profile.elapsed if action.kind == ActionKind.FAIL and effect.metric == Metric.COUNT
+            else profile.increase if action.kind == ActionKind.DELAY and effect.metric == Metric.MEAN else 0.0)
     if layer == Layer.UPSTREAM or wait < 1:
         return action
-    return Action.model_validate({**action.model_dump(), WAIT: int(float(f"{wait:.{WAIT_DIGITS}g}"))})
+    return Action.model_validate({**action.model_dump(), WAIT: two_digits(wait)})
+
+
+def two_digits(value: float) -> float:
+    """A measured parameter rounded to two significant digits, so that near values share one fault."""
+    return float(f"{value:.{PARAMETER_DIGITS}g}")
+
+
+def counterpart_probability(layer: Layer, profile: EffectProfile) -> float:
+    """How often a counterpart acts, so that it fails or slows as large a share of its point's executions as the effect
+    had: 1 for an effect on every execution, and for a kernel point, whose rules this search does not thin out."""
+    return 1.0 if layer == Layer.UPSTREAM or not 0 < profile.rate < 1 else min(1.0, two_digits(profile.rate))
 
 
 def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, manifest: Manifest | None,
                  peer_effects: list[EffectKey], effects: EffectMap, catalog: Catalog, kinds: KindTable,
-                 elapsed: float, increase: float) -> tuple[Counterpart, tuple[Fault, ...]]:
+                 profile: EffectProfile) -> tuple[Counterpart, tuple[Fault, ...]]:
     """The faults that, injected at an effect's point, produce the effect: the catalog's instances of every action
-    the effect map names for it, timed as the effect, and the point implements, or the action itself where the
-    catalog has none; none for an effect of a caller leaving."""
+    the effect map names for it, timed and as frequent as the effect, and the point implements, or the action itself
+    where the catalog has none; none for an effect of a caller leaving."""
     if effects.caller_left(effect):
         return Counterpart.NONE, ()
+    probability = counterpart_probability(layer, profile)
     rules = [rule for rule in effects.rules if rule.covers(effect, verdicts, layer, manifest, peer_effects)]
-    found = [([fault for fault in catalog.faults if fault.instance_of(effect.point, action)], action)
-             for rule in rules for action in (timed(template, effect, layer, elapsed, increase)
+    found = [([fault for fault in catalog.faults if fault.instance_of(effect.point, action)
+               and fault.probability == probability], action)
+             for rule in rules for action in (timed(template, effect, layer, profile)
                                               for template in rule.actions(effect))
              if implements(catalog.narrower, effect.point, action)]
     faults = {fault.key: fault for instances, action in found
               for fault in instances or [Fault(point=effect.point, action=action, layer=layer,
-                                               scoped=point_scoped(effect.point, layer, kinds))]}
+                                               scoped=point_scoped(effect.point, layer, kinds),
+                                               probability=probability)]}
     if not rules:
         return Counterpart.UNMAPPED, ()
     if not found:
@@ -302,45 +340,51 @@ def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, manife
             tuple(faults.values()))
 
 
-def effect_time(held_runs: list[TreatmentRecord], held: list[Sighting], key: str,
-                effect: EffectKey) -> tuple[float, float]:
-    """How long the natural executions behind an effect took where it held, and for a slower mean how much it grew."""
+def effect_profile(held_runs: list[TreatmentRecord], held: list[Sighting], key: str,
+                   effect: EffectKey) -> EffectProfile:
+    """The natural executions behind an effect where it held: their mean time, for a slower mean how much it grew, and
+    their share of the point's executions; a record from before a measure was kept leaves it out."""
     times = [run.elapsed[key] for run in held_runs if key in run.elapsed]
+    rates = [run.rates[key] for run in held_runs if key in run.rates]
     increase = fmean(fmean(sighting.effect.treatment) - fmean(sighting.effect.control) for sighting in held) \
         if effect.metric == Metric.MEAN else 0.0
-    return (fmean(times) if times else 0.0), increase
+    return EffectProfile(elapsed=fmean(times) if times else 0.0, increase=increase,
+                         rate=fmean(rates) if rates else 1.0)
 
 
 def behaves_alike(natural: TreatmentRecord, substitute: TreatmentRecord, service: str, services: dict[int, str],
-                  min_count_increase: float, min_mean_increase: float) -> bool:
+                  min_count_increase: float, min_mean_increase: float, acceptance: Acceptance) -> bool:
     """Whether a substitute run behaves as the natural run it stands for where callers see it: at the server points of
     the effect's service and at the client points that call them, every outcome within the smallest change that
-    counts as an effect, in executions per repetition and in their mean."""
+    counts as an effect, in executions per repetition unless only timing is compared, and in their mean."""
     points = {point for point in (*natural.boundary, *substitute.boundary)
               if (point_kind(point) == RPC_SERVER and point_service(point) == service)
               or (point_kind(point) == RPC_CLIENT and point_service(peer_point(point, services)) == service)}
     seen_points = {point: (natural.boundary.get(point, {}), substitute.boundary.get(point, {})) for point in points}
     loads = [(seen.get(outcome, ABSENT), stand.get(outcome, ABSENT))
              for seen, stand in seen_points.values() for outcome in {*seen, *stand}]
-    return all(abs(seen.count - stand.count) <= max(COUNT_SLACK, min_count_increase * seen.count)
+    return all((acceptance == Acceptance.TIMING
+                or abs(seen.count - stand.count) <= max(COUNT_SLACK, min_count_increase * seen.count))
                and (not seen.count or not stand.count or abs(seen.mean - stand.mean) <= min_mean_increase * seen.mean)
                for seen, stand in loads)
 
 
 def mismatched_counterparts(cause: Fault, effect: EffectKey, held_in: list[str], faults: tuple[Fault, ...],
                             runs: dict[tuple[str, str], TreatmentRecord], services: dict[int, str],
-                            min_count_increase: float, min_mean_increase: float) -> tuple[str, ...]:
+                            min_count_increase: float, min_mean_increase: float,
+                            acceptance: Acceptance) -> tuple[str, ...]:
     """The counterparts whose substitute runs behaved unlike the natural run in every scenario where the edge held and
     both ran, which no chain continues the edge with; a counterpart no such scenario ran is not judged."""
     return tuple(fault.key for fault in faults if (checks := [
         behaves_alike(runs[(cause.key, scenario)], runs[(fault.key, scenario)], point_service(effect.point), services,
-                      min_count_increase, min_mean_increase)
+                      min_count_increase, min_mean_increase, acceptance)
         for scenario in held_in if (fault.key, scenario) in runs]) and not any(checks))
 
 
 def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: EffectMap, catalog: Catalog,
                 kinds: KindTable, upstream: frozenset[str], targets: dict[str, str], services: dict[int, str],
-                manifests: dict[str, Manifest], min_count_increase: float, min_mean_increase: float) -> list[Edge]:
+                manifests: dict[str, Manifest], min_count_increase: float, min_mean_increase: float,
+                acceptance: Acceptance) -> list[Edge]:
     """Every (fault, effect) pair the exercised records show, over the scenarios each fault was tested in."""
     by_fault: dict[str, list[TreatmentRecord]] = defaultdict(list)
     for record in records:
@@ -357,25 +401,30 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
             layer = point_layer(effect.point, upstream)
             held_in = [sighting.scenario for sighting in held]
             not_held = [run.workload for run in runs if run.workload not in held_in]
-            elapsed, increase = effect_time([run for run in runs if run.workload in held_in], held, key, effect)
+            profile = effect_profile([run for run in runs if run.workload in held_in], held, key, effect)
             counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, layer,
                                                manifests.get(effect.point),
                                                peer_effects(effect, [shown[name] for name in held_in], services),
-                                               effects, catalog, kinds, elapsed, increase)
+                                               effects, catalog, kinds, profile)
             edges.append(Edge(cause=runs[0].fault, effect=effect, held=tuple(held), not_held=tuple(not_held),
                               conditions=learn_conditions(held_in, not_held, scenarios), counterpart=counterpart,
                               counterparts=faults, terminal=effects.terminal(effect), effect_layer=layer,
                               injected=effects.injected(effect),
                               mismatched=mismatched_counterparts(runs[0].fault, effect, held_in, faults, by_run,
-                                                                 services, min_count_increase, min_mean_increase),
+                                                                 services, min_count_increase, min_mean_increase,
+                                                                 acceptance),
                               acts_on=None if runs[0].fault.scoped else targets[point_service(runs[0].fault.point)]))
     return edges
 
 
-def counterpart_assignments(edges: list[Edge], assigned: set[str]) -> list[Assignment]:
-    """The faults no assignment tried that correspond to an effect a chain could continue from, each in the scenarios
-    where the effect appeared."""
+def counterpart_assignments(edges: list[Edge], assigned: set[tuple[str, str]],
+                            catalog: Catalog) -> list[Assignment]:
+    """The (fault, scenario) pairs no assignment tried for the faults that correspond to an effect a chain could
+    continue from: every scenario whose controls executed the fault's point, and those where the effect appeared, so
+    that a counterpart's consequences are seen in the scenarios a chain may need them in."""
     return list({(fault.key, scenario): Assignment(fault=fault, scenario=scenario, phase=Phase.COUNTERPART)
                  for edge in edges if not edge.terminal
-                 for fault in edge.counterparts if fault.key not in assigned
-                 for scenario in sorted(edge.held_in)}.values())
+                 for fault in edge.counterparts
+                 for scenario in sorted({*edge.held_in, *(name for name, count in
+                                                         catalog.executions.get(fault.point, {}).items() if count)})
+                 if (fault.key, scenario) not in assigned}.values())
