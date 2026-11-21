@@ -405,6 +405,6 @@ eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能
 | 原生函数中的故障点（第 6.5 节） | — | — | — | — | — | 已实现：`call`（`fail` `crash`）、`check`（`negate` `crash`），仅 x86-64，内核 6.18 及以上 |
 | eBPF 可挂载点目录（第 6.6 节） | — | — | — | — | — | 已实现：只读的 `scan`、`event` 类别、由记录生成原生函数点、`merge`、观测全部系统调用、`security_*` 的内核函数点（带端口、地址、文件名条件）；`should_fail_bio` 不提供，`__filemap_add_folio` 暂缓 |
 | 接入 | 导入钩子 | 构建副本，自动装配边界 | `--import` 加载钩子 | `-javaagent` | 构建副本 | 特权进程 |
-| 未覆盖 | 非 uvicorn 运行的 ASGI 应用 | 依赖内部创建的服务端和客户端；pgx 的 `CopyFrom` `Commit` `Rollback` | 直接使用 undici | WebClient、Feign、Apache HttpClient、OkHttp | reqwest、`query!` 宏、类型化的 Redis 命令方法 | 自然丢包、32 位兼容系统调用、IPv6（未验证） |
+| 未覆盖 | 非 uvicorn 运行的 ASGI 应用 | 依赖内部创建的服务端和客户端；pgx 的 `CopyFrom` `Commit` `Rollback` | 直接使用 undici | WebClient、Feign、Apache HttpClient、OkHttp；Spring MVC 和异步 Servlet 的服务端 `fail_after`（应答在 `service` 返回前已经写出，来不及替换，不生效也不计数） | reqwest、`query!` 宏、类型化的 Redis 命令方法 | 自然丢包、32 位兼容系统调用、IPv6（未验证） |
 | 只重放置候选故障点（第 6.4 节第 3 步） | 未实现 | 未实现 | 未实现 | 未实现 | 未实现 | — |
 | Kafka、RabbitMQ、NATS | 规划中 | 规划中 | 规划中 | 规划中 | 规划中 | — |
