@@ -6,7 +6,7 @@ import { fingerprintSync, hasSqlDetails, loadModule, parseSync } from "libpg-que
 
 import { applicationModule } from "./config.js";
 import { CORE, type Plugin, errorName } from "./core.js";
-import { type Rule, numberParameter, pointId } from "./rules.js";
+import { type Rule, numberParameter, pointId, pointParts, stringParameter } from "./rules.js";
 
 type StoreKind = "store_read" | "store_write";
 
@@ -28,6 +28,9 @@ type Query = (this: unknown, ...arguments_: unknown[]) => unknown;
 type DatabaseError = new (message: string, length: number, name: string) => Error & { code?: string };
 
 const STATEMENTS = new Map<string, Statement>();
+/** The locators statementPoint makes. */
+const STATEMENT_LOCATOR = /^[^ ]+#[0-9a-f]{8}$/;
+const SQLSTATE = /^[0-9A-Z]{5}$/;
 
 /** The tables of a parse tree: every range variable, which is the node that carries a relname. */
 function relations(tree: unknown, found: Set<string>): Set<string> {
@@ -72,10 +75,19 @@ function results(result: unknown): QueryResult[] {
   return (Array.isArray(result) ? result : [result]) as QueryResult[];
 }
 
+/** Why a rule at a statement point cannot be obeyed: a code that is not a SQLSTATE, which PostgreSQL never reports. */
+function refusal(rule: Rule): string | null {
+  const { kind, locator } = pointParts(rule.point);
+  const code = stringParameter(rule, "code");
+  return code === undefined || (kind !== "store_read" && kind !== "store_write") || !STATEMENT_LOCATOR.test(locator)
+    || SQLSTATE.test(code) ? null : `code ${code} at ${rule.point} is not a SQLSTATE, five digits or upper-case letters`;
+}
+
 /** Run a query under its rule; a dropped write is acknowledged without reaching the database, and an injected failure
- * is an error response with SQLSTATE 08006, connection_failure. */
+ * is an error response of the rule's SQLSTATE, or of 08006, connection_failure, when it names none. */
 async function execute(rule: Rule | null, run: () => Promise<unknown>, DatabaseError: DatabaseError): Promise<unknown> {
-  const injectedError = (message: string) => Object.assign(new DatabaseError(`faultpoint: ${message}`, 0, "error"), { code: "08006" });
+  const injectedError = (failing: Rule, message: string) => Object.assign(new DatabaseError(`faultpoint: ${message}`, 0, "error"),
+    { severity: "ERROR", code: stringParameter(failing, "code") ?? "08006" });
   switch (rule?.action.kind) {
     case "delay":
       await sleep(numberParameter(rule, "ms"));
@@ -83,7 +95,7 @@ async function execute(rule: Rule | null, run: () => Promise<unknown>, DatabaseE
     case "crash":
       return CORE.crash(typeof rule.action.code === "number" ? rule.action.code : 1);
     case "fail":
-      throw injectedError("injected store failure");
+      throw injectedError(rule, "injected store failure");
     case "drop":
       return { command: "", rowCount: 1, rows: [], fields: [] } satisfies QueryResult;
     case "duplicate":
@@ -91,7 +103,7 @@ async function execute(rule: Rule | null, run: () => Promise<unknown>, DatabaseE
       return run();
     case "fail_after":
       await run();
-      throw injectedError("store failed after the statement ran");
+      throw injectedError(rule, "store failed after the statement ran");
     case "empty": {
       const result = await run();
       results(result).forEach((each) => Object.assign(each, { rows: [], rowCount: 0 }));
@@ -155,6 +167,7 @@ export const pgPlugin: Plugin = {
       store_read: ["fail", "empty", "delay", "crash"],
       store_write: ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
     });
+    core.check(refusal);
     pg.Client.prototype.query = instrumentQuery(pg.Client.prototype.query, pg.DatabaseError);
   },
 };

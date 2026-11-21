@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import { applicationModule } from "./config.js";
 import { CORE, type Plugin, errorName } from "./core.js";
-import { numberParameter, pointId } from "./rules.js";
+import { type Rule, numberParameter, pointId, pointParts, stringParameter } from "./rules.js";
 
 /** spec/redis-commands.json, which the build copies next to this module. */
 const RedisCommand = z.object({
@@ -89,14 +89,30 @@ function emptyReply(name: string, rule: RedisCommand["empty"], args: unknown[]):
   }
 }
 
+/** ioredis's error for an error reply of Redis, whose message is the reply. */
+type ReplyError = new (message: string) => Error;
+
+/** The prefix of an error reply, which Redis writes as an upper-case word. */
+const REPLY_CODE = /^[A-Z][A-Z0-9_]*$/;
+
 /** A failed command's error and, for an error reply of Redis, its prefix, the word before the first space. */
-function failureDetail(error: unknown, ReplyError: new () => Error): Record<string, string> {
+function failureDetail(error: unknown, ReplyError: ReplyError): Record<string, string> {
   return error instanceof ReplyError
     ? { error: errorName(error), code: error.message.split(" ")[0] }
     : { error: errorName(error) };
 }
 
-function instrumentSendCommand(original: SendCommand, identifier: RegExp, ReplyError: new () => Error): SendCommand {
+/** Why a rule at a Redis point cannot be obeyed: a code that is not an upper-case word, which is not the prefix of an
+ * error reply. */
+function refusal(rule: Rule): string | null {
+  const { kind, locator } = pointParts(rule.point);
+  const code = stringParameter(rule, "code");
+  const spec = TABLE.commands[locator.split(" ")[0]];
+  return code === undefined || spec === undefined || spec.kind !== kind || REPLY_CODE.test(code) ? null
+    : `code ${code} at ${rule.point} is not the prefix of a Redis error reply, an upper-case word`;
+}
+
+function instrumentSendCommand(original: SendCommand, identifier: RegExp, ReplyError: ReplyError): SendCommand {
   return function (this: unknown, command: Command, stream?: unknown) {
     const name = command.name.toUpperCase();
     const spec = TABLE.commands[name];
@@ -114,9 +130,13 @@ function instrumentSendCommand(original: SendCommand, identifier: RegExp, ReplyE
     (error: unknown) => context.with(requestContext, () => CORE.observe(point, "error", performance.now() - started, rule,
       failureDetail(error, ReplyError))));
     switch (rule?.action.kind) {
-      case "fail":
-        command.reject(new Error("faultpoint: injected Redis failure"));
+      case "fail": {
+        // With a code the error is the one ioredis makes for that error reply, which carries the command.
+        const code = stringParameter(rule, "code");
+        command.reject(code === undefined ? new Error("faultpoint: injected Redis failure")
+          : Object.assign(new ReplyError(`${code} faultpoint: injected Redis failure`), { command: { name: command.name, args: command.args } }));
         return command.promise;
+      }
       case "empty":
         if (spec.empty === "never") {
           CORE.abort(`rule ${rule.id}: ${name} has no empty reply`);
@@ -143,7 +163,7 @@ export const ioredisPlugin: Plugin = {
   name: "ioredis",
   install(core, options) {
     const ioredis = applicationModule<{
-      Redis: { prototype: { sendCommand: SendCommand } }; Cluster?: { prototype: { sendCommand: SendCommand } }; ReplyError: new () => Error;
+      Redis: { prototype: { sendCommand: SendCommand } }; Cluster?: { prototype: { sendCommand: SendCommand } }; ReplyError: ReplyError;
     }>(core.settings.sourceRoot, "ioredis");
     if (ioredis === null) {
       return;
@@ -155,6 +175,7 @@ export const ioredisPlugin: Plugin = {
       publish: ["fail", "drop", "delay", "crash"],
       consume: ["fail", "empty", "delay", "crash"],
     });
+    core.check(refusal);
     for (const client of [ioredis.Redis, ioredis.Cluster]) {
       if (client !== undefined) {
         client.prototype.sendCommand = instrumentSendCommand(client.prototype.sendCommand, identifier, ioredis.ReplyError);

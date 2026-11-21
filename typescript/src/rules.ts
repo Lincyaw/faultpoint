@@ -17,12 +17,12 @@ export function pointId(service: string, kind: string, locator: string): string 
 }
 
 /** The service and kind of a point id, which is <service>:<kind>:<locator>. */
-export function pointParts(point: string): { service: string; kind: string } {
+export function pointParts(point: string): { service: string; kind: string; locator: string } {
   const [service, kind, ...locator] = point.split(":");
   if (!service || !kind || locator.length === 0) {
     throw new Error(`a point id is <service>:<kind>:<locator>: ${point}`);
   }
-  return { service, kind };
+  return { service, kind, locator: locator.join(":") };
 }
 
 export const Trigger = z.strictObject({

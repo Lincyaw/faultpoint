@@ -55,6 +55,8 @@ function seededRandom(seed: string): () => number {
 export class Core {
   readonly enabled: boolean;
   readonly declared = new Map<string, ReadonlySet<string>>();
+  /** Each answers why its plugin cannot obey a rule, or null; a plugin passes over the kinds it does not serve. */
+  readonly checks: Array<(rule: Rule) => string | null> = [];
   experiment = "";
   rules = new Map<string, Rule[]>();
   matches = new Map<string, number>();
@@ -78,6 +80,12 @@ export class Core {
       const known = this.declared.get(kind);
       this.declared.set(kind, new Set(known === undefined ? actions : actions.filter((action) => known.has(action))));
     }
+  }
+
+  /** A check of every rule of this service when its rule set loads, for what an action's parameters ask that a plugin
+   * cannot do, so that the rule set is refused rather than one point failing to obey it. */
+  check(refusal: (rule: Rule) => string | null): void {
+    this.checks.push(refusal);
   }
 
   useRuleSource(source: RuleSource): void {
@@ -108,6 +116,12 @@ export class Core {
       }
       if (!actions.has(rule.action.kind)) {
         this.abort(`rule ${rule.id}: not every plugin of this process serving it implements ${rule.action.kind} at a ${kind} point`);
+      }
+      for (const check of this.checks) {
+        const refusal = check(rule);
+        if (refusal !== null) {
+          this.abort(`rule ${rule.id}: ${refusal}`);
+        }
       }
       rules.set(rule.point, [...(rules.get(rule.point) ?? []), rule]);
     }
