@@ -26,7 +26,6 @@ const (
 	errorInjectionPrefix = "_eil_addr_"
 	securityPrefix       = "security_"
 	lsmHookPrefix        = "bpf_lsm_"
-	syscallExitGroup     = "syscalls:" + syscallExitPrefix
 	maxErrno             = 4095
 )
 
@@ -85,7 +84,6 @@ type kernelSyscall struct {
 	name       string
 	entry      string
 	injectable bool
-	exitEvent  bool
 }
 
 // kernelSummary is what a catalog reports of the host kernel, in the hook survey's terms so that the two compare: the
@@ -171,7 +169,7 @@ func readKernel() (kernelInventory, error) {
 		}
 	}
 	inventory.addSecurity(functions, traceable)
-	inventory.addSyscalls(addresses, functions, declared, events)
+	inventory.addSyscalls(addresses, functions, declared)
 	return inventory, nil
 }
 
@@ -364,15 +362,14 @@ func lsmValues(hook string, declaration *btf.Func) []valueRange {
 // addSyscalls adds the syscalls with an entry function of this architecture in kallsyms; the agent injects at the entry
 // when ALLOW_ERROR_INJECTION declares it.
 func (inventory *kernelInventory) addSyscalls(addresses map[kernelSymbol]uint64, functions map[string]*btf.Func,
-	declared map[kernelSymbol]bool, events map[string]bool) {
+	declared map[kernelSymbol]bool) {
 	prefix := syscallEntryPrefixes[runtime.GOARCH]
 	for _, symbol := range slices.SortedFunc(maps.Keys(addresses), compareSymbols) {
 		name, isEntry := strings.CutPrefix(symbol.name, prefix)
 		if !isEntry || symbol.module != "" {
 			continue
 		}
-		syscall := kernelSyscall{name: name, entry: symbol.name, injectable: declared[symbol],
-			exitEvent: events[syscallExitGroup+name]}
+		syscall := kernelSyscall{name: name, entry: symbol.name, injectable: declared[symbol]}
 		_, inBTF := functions[symbol.name]
 		inventory.summary.SyscallEntries++
 		inventory.summary.SyscallEntriesInBTF += boolCount(inBTF)

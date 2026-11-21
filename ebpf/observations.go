@@ -17,8 +17,14 @@ import (
 func (a *agent) collect() error {
 	err := countSince(a.kernel.objects.Natural, a.natural, func(key pointsNaturalKey, delta uint64) {
 		name := a.services[key.Service].name
-		a.sinks[name].Add(faultpoint.Observation{Experiment: a.experiment, Outcome: syscallOutcome(key.Error),
-			Point: faultpoint.PointID(name, kindSyscall, a.syscalls[key.Syscall]), Count: int(delta)})
+		syscallName, named := a.syscallNames[int(key.Syscall)]
+		if !named {
+			syscallName = strconv.Itoa(int(key.Syscall))
+		}
+		if a.observedSyscalls == nil || a.observedSyscalls[syscallName] {
+			a.sinks[name].Add(faultpoint.Observation{Experiment: a.experiment, Outcome: syscallOutcome(key.Error),
+				Point: faultpoint.PointID(name, kindSyscall, syscallName), Count: int(delta)})
+		}
 	})
 	if err != nil {
 		return fmt.Errorf("cannot read the natural counts: %w", err)

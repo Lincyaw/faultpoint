@@ -8,6 +8,7 @@ import (
 	"maps"
 	"math"
 	"net/netip"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"faultpoint"
 
+	"github.com/elastic/go-seccomp-bpf/arch"
 	"golang.org/x/sys/unix"
 )
 
@@ -55,7 +57,28 @@ var errnos = func() map[string]syscall.Errno {
 	return byName
 }()
 
-// syscallTable numbers the syscalls the agent attaches to; a number never changes, since counts are keyed by it.
+// observedSyscalls returns this architecture's syscall names by number, since the observation of every syscall counts
+// them by number, and the syscalls the configuration lists for the observations to report, nil to report every one.
+func observedSyscalls(configured []string) (map[int]string, map[string]bool, error) {
+	architecture, err := arch.GetInfo(runtime.GOARCH)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(configured) == 0 {
+		return architecture.SyscallNumbers, nil, nil
+	}
+	observed := map[string]bool{}
+	for _, name := range configured {
+		if _, known := architecture.SyscallNames[name]; !known {
+			return nil, nil, fmt.Errorf("options.%s.syscalls names %q, which is no syscall of %s", optionsName, name,
+				runtime.GOARCH)
+		}
+		observed[name] = true
+	}
+	return architecture.SyscallNumbers, observed, nil
+}
+
+// syscallTable numbers the syscalls the agent injects at; a number never changes, since a rule set's maps use it.
 type syscallTable []string
 
 func (table *syscallTable) number(name string) uint32 {

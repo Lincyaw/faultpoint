@@ -18,9 +18,9 @@ import (
 )
 
 const (
-	syscallTracepointGroup = "syscalls"
-	syscallExitPrefix      = "sys_exit_"
-	qdiscFq                = "fq"
+	rawSyscallsGroup = "raw_syscalls"
+	rawSyscallsExit  = "sys_exit"
+	qdiscFq          = "fq"
 )
 
 // syscallEntryPrefixes name the syscall entry functions of each architecture, which are on the kernel's error
@@ -32,7 +32,7 @@ var syscallEntryPrefixes = map[string]string{"amd64": "__x64_sys_", "arm64": "__
 type kernel struct {
 	spec    *ebpf.CollectionSpec
 	objects struct {
-		ObserveSyscall    *ebpf.Program `ebpf:"observe_syscall"`
+		ObserveSyscalls   *ebpf.Program `ebpf:"observe_syscalls"`
 		LeaveNative       *ebpf.Program `ebpf:"leave_native"`
 		ObserveUsdt       *ebpf.Program `ebpf:"observe_usdt"`
 		ObserveTracepoint *ebpf.Program `ebpf:"observe_tracepoint"`
@@ -105,16 +105,14 @@ func loadKernel(services []service) (*kernel, error) {
 	return loaded, nil
 }
 
-// observe counts the natural outcomes of syscalls at their exit; the cookie is the syscall's number in the table.
-func (k *kernel) observe(syscalls syscallTable) error {
-	for number, name := range syscalls {
-		attached, err := link.Tracepoint(syscallTracepointGroup, syscallExitPrefix+name, k.objects.ObserveSyscall,
-			&link.TracepointOptions{Cookie: uint64(number)})
-		if err != nil {
-			return fmt.Errorf("observing syscall %s: %w", name, err)
-		}
-		k.links = append(k.links, attached)
+// observeSyscalls counts the natural outcome of every syscall of the services' tasks with one program at the exit of
+// all syscalls, keyed by the syscall's number.
+func (k *kernel) observeSyscalls() error {
+	attached, err := link.Tracepoint(rawSyscallsGroup, rawSyscallsExit, k.objects.ObserveSyscalls, nil)
+	if err != nil {
+		return fmt.Errorf("observing syscalls: %w", err)
 	}
+	k.links = append(k.links, attached)
 	return nil
 }
 
@@ -145,7 +143,7 @@ func (k *kernel) Close() error {
 	for _, point := range k.points {
 		errs = append(errs, closeFiles(point.files))
 	}
-	errs = append(errs, closeFiles(k.eventFiles), k.objects.ObserveSyscall.Close(), k.objects.LeaveNative.Close(),
+	errs = append(errs, closeFiles(k.eventFiles), k.objects.ObserveSyscalls.Close(), k.objects.LeaveNative.Close(),
 		k.objects.ObserveUsdt.Close(), k.objects.ObserveTracepoint.Close(), k.objects.CgroupServices.Close(),
 		k.objects.Marks.Close(), k.objects.Natural.Close(), k.objects.Triggers.Close(), k.objects.NativeSites.Close(),
 		k.objects.NativeRules.Close(), k.objects.NativeOutcomes.Close(), k.objects.EventServices.Close(),

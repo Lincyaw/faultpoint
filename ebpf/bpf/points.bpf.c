@@ -129,7 +129,8 @@ struct {
 	__type(value, __u32);
 } cgroup_services SEC(".maps");
 
-/* The syscall a task is in when it was injected, so its exit is not counted as natural. */
+/* A task the agent injected a syscall in, with the syscall's number in the agent's table, so the syscall's exit is not
+ * counted as natural. */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 16384);
@@ -272,20 +273,20 @@ int inject_syscall(struct pt_regs *ctx)
 	return 0;
 }
 
-SEC("tracepoint")
-int observe_syscall(struct syscall_trace_exit *ctx)
+/* At the exit of every syscall, its number and errno are counted for the service of the current task; a task exits
+ * the syscall it is in before it enters another, so a mark the injection left is that syscall's, not natural. */
+SEC("tracepoint/raw_syscalls/sys_exit")
+int observe_syscalls(struct trace_event_raw_sys_exit *ctx)
 {
 	__u32 *service = current_service();
-	if (!service)
+	if (!service || ctx->id < 0)
 		return 0;
-	__u32 syscall = bpf_get_attach_cookie(ctx);
 	__u64 task = bpf_get_current_pid_tgid();
-	__u32 *mark = bpf_map_lookup_elem(&marks, &task);
-	if (mark && *mark == syscall) {
+	if (bpf_map_lookup_elem(&marks, &task)) {
 		bpf_map_delete_elem(&marks, &task);
 		return 0;
 	}
-	struct natural_key key = {.service = *service, .syscall = syscall, .error = ctx->ret < 0 ? -ctx->ret : 0};
+	struct natural_key key = {.service = *service, .syscall = ctx->id, .error = ctx->ret < 0 ? -ctx->ret : 0};
 	increment(&natural, &key);
 	return 0;
 }

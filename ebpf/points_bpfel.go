@@ -185,7 +185,7 @@ const (
 	pointsProgInjectPacket      = "inject_packet"
 	pointsProgInjectSyscall     = "inject_syscall"
 	pointsProgLeaveNative       = "leave_native"
-	pointsProgObserveSyscall    = "observe_syscall"
+	pointsProgObserveSyscalls   = "observe_syscalls"
 	pointsProgObserveTracepoint = "observe_tracepoint"
 	pointsProgObserveUsdt       = "observe_usdt"
 	pointsVarCgroupLevels       = "cgroup_levels"
@@ -239,7 +239,7 @@ type pointsProgramSpecs struct {
 	InjectPacket      *ebpf.ProgramSpec `ebpf:"inject_packet"`
 	InjectSyscall     *ebpf.ProgramSpec `ebpf:"inject_syscall"`
 	LeaveNative       *ebpf.ProgramSpec `ebpf:"leave_native"`
-	ObserveSyscall    *ebpf.ProgramSpec `ebpf:"observe_syscall"`
+	ObserveSyscalls   *ebpf.ProgramSpec `ebpf:"observe_syscalls"`
 	ObserveTracepoint *ebpf.ProgramSpec `ebpf:"observe_tracepoint"`
 	ObserveUsdt       *ebpf.ProgramSpec `ebpf:"observe_usdt"`
 }
@@ -336,7 +336,7 @@ type pointsPrograms struct {
 	InjectPacket      *ebpf.Program `ebpf:"inject_packet"`
 	InjectSyscall     *ebpf.Program `ebpf:"inject_syscall"`
 	LeaveNative       *ebpf.Program `ebpf:"leave_native"`
-	ObserveSyscall    *ebpf.Program `ebpf:"observe_syscall"`
+	ObserveSyscalls   *ebpf.Program `ebpf:"observe_syscalls"`
 	ObserveTracepoint *ebpf.Program `ebpf:"observe_tracepoint"`
 	ObserveUsdt       *ebpf.Program `ebpf:"observe_usdt"`
 }
@@ -347,7 +347,7 @@ func (p *pointsPrograms) Close() error {
 		p.InjectPacket,
 		p.InjectSyscall,
 		p.LeaveNative,
-		p.ObserveSyscall,
+		p.ObserveSyscalls,
 		p.ObserveTracepoint,
 		p.ObserveUsdt,
 	)

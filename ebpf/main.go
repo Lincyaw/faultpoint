@@ -18,21 +18,25 @@ import (
 
 const environmentPrefix = "FAULTPOINT_"
 
-// agent applies one rule set at a time; the mutex orders installs, collections and the final detach.
+// agent applies one rule set at a time; the mutex orders installs, collections and the final detach. syscallNames
+// names this architecture's syscalls by number, and observedSyscalls are those the observations report, every one when
+// it is nil.
 type agent struct {
-	mu         sync.Mutex
-	services   []service
-	syscalls   syscallTable
-	seed       int64
-	kernel     *kernel
-	injector   *injector
-	rules      *kernelRules
-	experiment string
-	sinks      map[string]*faultpoint.JSONLSink
-	natural    map[pointsNaturalKey]uint64
-	outcomes   map[pointsNativeKey]uint64
-	fired      map[uint32]uint64
-	injected   []uint64
+	mu               sync.Mutex
+	services         []service
+	syscalls         syscallTable
+	syscallNames     map[int]string
+	observedSyscalls map[string]bool
+	seed             int64
+	kernel           *kernel
+	injector         *injector
+	rules            *kernelRules
+	experiment       string
+	sinks            map[string]*faultpoint.JSONLSink
+	natural          map[pointsNaturalKey]uint64
+	outcomes         map[pointsNativeKey]uint64
+	fired            map[uint32]uint64
+	injected         []uint64
 }
 
 // main ends through the core's Abort or Crash, whose registered cleanup detaches what the agent attached; with scan, it
@@ -93,8 +97,13 @@ func main() {
 	if err != nil {
 		faultpoint.Abort("%v", err)
 	}
-	a := &agent{services: services, seed: seed, kernel: loaded, sinks: map[string]*faultpoint.JSONLSink{},
-		natural: map[pointsNaturalKey]uint64{}, outcomes: map[pointsNativeKey]uint64{}, fired: map[uint32]uint64{}}
+	names, observed, err := observedSyscalls(options.Syscalls)
+	if err != nil {
+		faultpoint.Abort("%v", err)
+	}
+	a := &agent{services: services, syscallNames: names, observedSyscalls: observed, seed: seed, kernel: loaded,
+		sinks: map[string]*faultpoint.JSONLSink{}, natural: map[pointsNaturalKey]uint64{},
+		outcomes: map[pointsNativeKey]uint64{}, fired: map[uint32]uint64{}}
 	faultpoint.AtExit(a.shutdown)
 	if err := loaded.observeFunctions(points, sites); err != nil {
 		faultpoint.Abort("%v", err)
@@ -102,16 +111,13 @@ func main() {
 	if err := loaded.observeEvents(selected); err != nil {
 		faultpoint.Abort("%v", err)
 	}
-	for _, name := range options.Syscalls {
-		a.syscalls.number(name)
-	}
 	if report != "" {
 		for _, configured := range services {
 			if a.sinks[configured.name], err = faultpoint.NewJSONLSink(report, configured.name, jsonl); err != nil {
 				faultpoint.Abort("%v", err)
 			}
 		}
-		if err := loaded.observe(a.syscalls); err != nil {
+		if err := loaded.observeSyscalls(); err != nil {
 			faultpoint.Abort("%v", err)
 		}
 		go func() {

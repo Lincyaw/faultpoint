@@ -23,14 +23,14 @@ const (
 
 // Mechanisms a record injects or observes with.
 const (
-	mechanismUprobeEntry    = "uprobe_entry"
-	mechanismUprobeReturns  = "uprobe_returns"
-	mechanismUSDT           = "usdt"
-	mechanismKprobeOverride = "kprobe_override"
-	mechanismFmodRet        = "fmod_ret"
-	mechanismFexit          = "fexit"
-	mechanismTracepoint     = "tracepoint"
-	mechanismSyscallExit    = "syscall_exit_tracepoint"
+	mechanismUprobeEntry     = "uprobe_entry"
+	mechanismUprobeReturns   = "uprobe_returns"
+	mechanismUSDT            = "usdt"
+	mechanismKprobeOverride  = "kprobe_override"
+	mechanismFmodRet         = "fmod_ret"
+	mechanismFexit           = "fexit"
+	mechanismTracepoint      = "tracepoint"
+	mechanismRawSyscallsExit = "raw_syscalls_exit"
 )
 
 // Layers of a record, as the search names them.
@@ -348,13 +348,10 @@ func kernelRecords(service, layer string, kernel kernelInventory) []hookRecord {
 	var records []hookRecord
 	for _, syscall := range kernel.syscalls {
 		record := hookRecord{ID: faultpoint.PointID(service, kindSyscall, syscall.name), Key: syscall.name,
-			Kind: kindSyscall, Layer: layer, Target: hookTarget{File: kernelObject, BuildID: kernel.build,
-				Symbol: syscall.entry},
+			Kind: kindSyscall, Layer: layer, Observe: mechanismRawSyscallsExit,
+			Target:  hookTarget{File: kernelObject, BuildID: kernel.build, Symbol: syscall.entry},
 			Actions: []string{actionCrash}, Values: []valueRange{}, Observed: []valueRange{}, Cost: costKernel,
 			Traps: trapsHost, Safety: syscallSafety}
-		if syscall.exitEvent {
-			record.Observe = mechanismSyscallExit
-		}
 		if syscall.injectable {
 			record.Inject, record.Actions = mechanismKprobeOverride, []string{actionFail, actionCrash}
 			record.Values = injectionValues(injectErrno)
