@@ -210,10 +210,14 @@ func (c *core) install(data []byte) {
 }
 
 // Decide returns the rule that injects at this execution of a point: the first whose scope matches the
-// execution's baggage and whose trigger fires, or nil.
-func Decide(ctx context.Context, point string) *Rule {
+// execution's baggage and whose trigger fires, or nil. Given actions, only the rules of those actions are matched
+// and counted, so that a point deciding before and after its operation counts a rule only where it can act.
+func Decide(ctx context.Context, point string, actions ...string) *Rule {
 	state := current.state.Load()
 	for _, rule := range state.byPoint[point] {
+		if len(actions) > 0 && !slices.Contains(actions, rule.Action.Kind) {
+			continue
+		}
 		if current.inScope(ctx, rule.Scope) && current.fires(state, rule) {
 			return rule
 		}

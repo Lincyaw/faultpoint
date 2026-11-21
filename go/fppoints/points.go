@@ -70,25 +70,27 @@ func observeCall(ctx context.Context, point string, rule *faultpoint.Rule, err e
 	faultpoint.Observe(ctx, point, "error", 0, rule, map[string]string{"error": faultpoint.ErrorName(err)})
 }
 
+// beforeCall are the actions of a call point decided before its call; fail_after is decided once the call returned
+// no error, so that a call failing by itself keeps its error and does not count towards a fail_after rule.
+var beforeCall = []string{"fail", "delay", "crash"}
+
 // Call is the call point of a call site whose error the caller checks: the rewriter calls Call(ctx, id, f)(args)
 // where the source calls f(args), so that the arguments are evaluated as before. Under a fail rule f is not called:
-// the results are zero values and the error the rule names. Under fail_after f is called and the caller gets the
-// rule's error instead of f's. f is returned as it is when the plugin is not enabled.
+// the results are zero values and the error the rule names. Under fail_after f is called and, when it returned no
+// error, the caller gets the rule's error instead. f is returned as it is when the plugin is not enabled.
 func Call[F any](ctx context.Context, point string, fn F) F {
 	if !enabled {
 		return fn
 	}
 	callee := reflect.ValueOf(fn)
 	called := reflect.MakeFunc(callee.Type(), func(arguments []reflect.Value) []reflect.Value {
-		rule := faultpoint.Decide(ctx, point)
-		kind := ""
+		rule := faultpoint.Decide(ctx, point, beforeCall...)
 		if rule != nil {
 			action.Hold(rule)
-			kind = rule.Action.Kind
 		}
 		var results []reflect.Value
 		switch {
-		case kind == "fail":
+		case rule != nil && rule.Action.Kind == "fail":
 			for index := range callee.Type().NumOut() {
 				results = append(results, reflect.Zero(callee.Type().Out(index)))
 			}
@@ -98,7 +100,10 @@ func Call[F any](ctx context.Context, point string, fn F) F {
 			results = callee.Call(arguments)
 		}
 		last := len(results) - 1
-		if kind == "fail" || kind == "fail_after" {
+		if rule == nil && results[last].IsNil() {
+			rule = faultpoint.Decide(ctx, point, "fail_after")
+		}
+		if rule != nil && (rule.Action.Kind == "fail" || rule.Action.Kind == "fail_after") {
 			replaced := reflect.New(callee.Type().Out(last)).Elem()
 			replaced.Set(reflect.ValueOf(injected(rule, point)))
 			results[last] = replaced
@@ -111,13 +116,19 @@ func Call[F any](ctx context.Context, point string, fn F) F {
 }
 
 // Failed is the call point of an error check whose call the rewriter cannot hand to Call: it observes the error the
-// call returned and, under a fail_after rule, replaces it, which is all it can do once the call has run; a fail
-// rule, which skips the call, cannot be obeyed there. It reports whether the error is not nil.
+// call returned and, under a fail_after rule when the call returned no error, replaces it, which is all it can do
+// once the call has run; a fail rule, which skips the call, cannot be obeyed there. It reports whether the error is
+// not nil.
 func Failed(ctx context.Context, point string, err *error) bool {
 	if !enabled {
 		return *err != nil
 	}
-	rule := faultpoint.Decide(ctx, point)
+	var rule *faultpoint.Rule
+	if *err == nil {
+		rule = faultpoint.Decide(ctx, point)
+	} else {
+		rule = faultpoint.Decide(ctx, point, beforeCall...)
+	}
 	if rule != nil {
 		action.Hold(rule)
 	}
