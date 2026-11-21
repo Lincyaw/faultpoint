@@ -128,6 +128,10 @@ async function execute(rule: Rule | null, run: () => Promise<unknown>, DatabaseE
     case "crash":
       return CORE.crash(typeof rule.action.code === "number" ? rule.action.code : 1);
     case "fail":
+      // A fail with ms waits as a delay does, before it fails.
+      if (rule.action.ms !== undefined) {
+        await sleep(CORE.own(() => numberParameter(rule, "ms")));
+      }
       throw CORE.own(() => injectedError(DatabaseError, rule, "injected store failure"));
     case "drop":
       return { command: "", rowCount: 1, rows: [], fields: [] } satisfies QueryResult;
@@ -164,7 +168,7 @@ function instrumentQuery(original: Query, DatabaseError: DatabaseError): Query {
     const requestContext = context.active();
     const started = performance.now();
     const observe = (outcome: string, quantity: number, observed: Rule | null, detail: Record<string, string>): void =>
-      context.with(requestContext, () => CORE.observe(point, outcome, quantity, observed, detail));
+      context.with(requestContext, () => CORE.observe(point, outcome, quantity, performance.now() - started, observed, detail));
     const result = execute(rule, () => original.apply(this, forwarded) as Promise<unknown>, DatabaseError).then((answer) => {
       // Only a statement that ran and succeeded is one a fail_after rule replaces and counts.
       const replaced = CORE.own(() => {

@@ -18,6 +18,7 @@ export interface ObservationRecord {
   rule: string | null;
   count: number;
   total: number;
+  elapsed: number;
   exemplars: string[];
   detail: Record<string, string>;
 }
@@ -62,10 +63,11 @@ export class JsonlSink implements ObservationSink {
     const record = this.tally.get(key) ?? {
       experiment: observation.experiment, service: this.service, process: this.process, start: 0, end: 0,
       point: observation.point, outcome: observation.outcome, scope: observation.scope, rule: observation.rule,
-      count: 0, total: 0, exemplars: [], detail: Object.fromEntries(detail),
+      count: 0, total: 0, elapsed: 0, exemplars: [], detail: Object.fromEntries(detail),
     };
     record.count += 1;
     record.total += observation.quantity;
+    record.elapsed += observation.elapsed;
     // A trace is sampled by its id, so that every process keeps or skips the same traces.
     if (observation.traceId !== null && record.exemplars.length < this.options.exemplars
       && parseInt(observation.traceId.slice(-8), 16) % 10_000 < this.options.exemplar_rate * 10_000) {

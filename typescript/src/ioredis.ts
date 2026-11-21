@@ -133,16 +133,25 @@ function instrumentSendCommand(original: SendCommand, identifier: RegExp, ReplyE
       const rule = CORE.decide(point);
       const requestContext = context.active();
       const started = performance.now();
-      command.promise.then((reply) => CORE.own(() => context.with(requestContext, () => CORE.observe(point,
-        spec.empty === undefined ? "ok" : empty(spec.empty, reply) ? "empty" : "rows", performance.now() - started, rule, {}))),
-      (error: unknown) => CORE.own(() => context.with(requestContext, () => CORE.observe(point, "error",
-        performance.now() - started, rule, failureDetail(error, ReplyError)))));
+      // The total of a command, like its elapsed time, is the milliseconds until its reply.
+      const observe = (outcome: string, detail: Record<string, string>): void => context.with(requestContext, () => {
+        const elapsed = performance.now() - started;
+        CORE.observe(point, outcome, elapsed, elapsed, rule, detail);
+      });
+      command.promise.then((reply) => CORE.own(() => observe(spec.empty === undefined ? "ok" : empty(spec.empty, reply) ? "empty" : "rows", {})),
+        (error: unknown) => CORE.own(() => observe("error", failureDetail(error, ReplyError))));
       switch (rule?.action.kind) {
         case "fail": {
           // With a code the error is the one ioredis makes for that error reply, which carries the command.
           const code = stringParameter(rule, "code");
-          command.reject(code === undefined ? new Error("faultpoint: injected Redis failure")
-            : Object.assign(new ReplyError(`${code} faultpoint: injected Redis failure`), { command: { name: command.name, args: command.args } }));
+          const failure = code === undefined ? new Error("faultpoint: injected Redis failure")
+            : Object.assign(new ReplyError(`${code} faultpoint: injected Redis failure`), { command: { name: command.name, args: command.args } });
+          // A fail with ms waits as a delay does, before it fails.
+          if (rule.action.ms === undefined) {
+            command.reject(failure);
+          } else {
+            setTimeout(() => command.reject(failure), numberParameter(rule, "ms"));
+          }
           return true;
         }
         case "empty":

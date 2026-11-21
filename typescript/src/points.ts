@@ -2,9 +2,10 @@ import { POINTS_SYMBOL } from "./config.js";
 import { CORE, EVERY_LOCATOR, type Plugin } from "./core.js";
 import { type Rule, numberParameter } from "./rules.js";
 
-/** Perform delay and crash, blocking the thread as contention does. */
+/** Perform delay and crash, blocking the thread as contention does; a fail rule with ms waits the same way before it
+ * fails. */
 function hold(rule: Rule): void {
-  if (rule.action.kind === "delay") {
+  if (rule.action.kind === "delay" || (rule.action.kind === "fail" && rule.action.ms !== undefined)) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, numberParameter(rule, "ms"));
   }
   if (rule.action.kind === "crash") {
@@ -22,7 +23,7 @@ export function branch(point: string, taken: boolean): boolean {
     hold(rule);
     taken = taken || rule.action.kind === "fail";
   }
-  CORE.observe(point, taken ? "taken" : "not_taken", 0, rule, {});
+  CORE.observe(point, taken ? "taken" : "not_taken", 0, 0, rule, {});
   return taken;
 }
 
@@ -36,12 +37,13 @@ export function check(point: string, result: boolean): boolean {
     hold(rule);
     result = result !== (rule.action.kind === "negate");
   }
-  CORE.observe(point, result ? "true" : "false", 0, rule, {});
+  CORE.observe(point, result ? "true" : "false", 0, 0, rule, {});
   return result;
 }
 
 /** One iteration of a loop, delayed by a delay rule to model contention. */
 export function loop(point: string): void {
+  const started = performance.now();
   if (!CORE.enabled) {
     return;
   }
@@ -49,7 +51,7 @@ export function loop(point: string): void {
   if (rule !== null) {
     hold(rule);
   }
-  CORE.observe(point, "iteration", 0, rule, {});
+  CORE.observe(point, "iteration", 0, performance.now() - started, rule, {});
 }
 
 /** A business value, replaced by a set rule or offset by a shift rule. */
@@ -71,7 +73,7 @@ export function value<T>(point: string, observed: T): T {
       result = ((observed as number) + numberParameter(rule, "amount")) as T;
     }
   }
-  CORE.observe(point, "observed", typeof result === "number" ? result : 0, rule, {});
+  CORE.observe(point, "observed", typeof result === "number" ? result : 0, 0, rule, {});
   return result;
 }
 
@@ -89,12 +91,13 @@ export function clock<T extends number | Date>(point: string, reading: T): T {
       result = (reading instanceof Date ? new Date(reading.getTime() + shift) : (reading as number) + shift) as T;
     }
   }
-  CORE.observe(point, "read", 0, rule, {});
+  CORE.observe(point, "read", 0, 0, rule, {});
   return result;
 }
 
 /** Whether a resource was acquired: its natural outcome, or rejected by a fail rule. */
 export function acquire(point: string, acquired: boolean): boolean {
+  const started = performance.now();
   if (!CORE.enabled) {
     return acquired;
   }
@@ -103,7 +106,7 @@ export function acquire(point: string, acquired: boolean): boolean {
     hold(rule);
     acquired = acquired && rule.action.kind !== "fail";
   }
-  CORE.observe(point, acquired ? "acquired" : "rejected", 0, rule, {});
+  CORE.observe(point, acquired ? "acquired" : "rejected", 0, performance.now() - started, rule, {});
   return acquired;
 }
 

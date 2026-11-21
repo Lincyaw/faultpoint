@@ -15,6 +15,8 @@ export interface Observation {
   scope: string;
   rule: string | null;
   quantity: number;
+  /** The milliseconds from entering the point to its result, injected waits included; 0 for a kind without duration. */
+  elapsed: number;
   traceId: string | null;
   detail: Readonly<Record<string, string>>;
 }
@@ -179,9 +181,10 @@ export class Core {
     return null;
   }
 
-  observe(point: string, outcome: string, quantity: number, rule: Rule | null, detail: Readonly<Record<string, string>>): void {
+  observe(point: string, outcome: string, quantity: number, elapsed: number, rule: Rule | null,
+          detail: Readonly<Record<string, string>>): void {
     this.sink?.add({
-      experiment: this.experiment, point, outcome, quantity, rule: rule?.id ?? null,
+      experiment: this.experiment, point, outcome, quantity, elapsed, rule: rule?.id ?? null,
       scope: this.context?.baggage(this.settings.scopeKey) ?? "", traceId: this.context?.traceId() ?? null, detail,
     });
   }

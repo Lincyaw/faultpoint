@@ -56,8 +56,8 @@ class HttpBoundaries {
       const decided = CORE.decideAmong(point, ACTS_BEFORE);
       observed = decided;
       // A response that closes before it finished was abandoned: its connection closed first.
-      response.on("close", () => CORE.own(() => context.with(requestContext, () => CORE.observe(point,
-        response.writableFinished ? statusOutcome(response.statusCode) : "error", performance.now() - started, observed,
+      response.on("close", () => CORE.own(() => context.with(requestContext, () => observeExchange(point,
+        response.writableFinished ? statusOutcome(response.statusCode) : "error", started, observed,
         response.writableFinished ? { status: String(response.statusCode), abandoned: "false" } : { abandoned: "true" }))));
       if (decided?.action.kind !== "fail") {
         answerOnceWritten(response, () => context.with(requestContext, () => CORE.decideAmong(point, ACTS_AFTER)), (replacing) => {
@@ -107,7 +107,7 @@ class HttpBoundaries {
         }
         response = await EXCHANGES.run(exchange, () => base(request));
       } catch (error) {
-        CORE.own(() => CORE.observe(point, errorOutcome(error), performance.now() - started, rule,
+        CORE.own(() => observeExchange(point, errorOutcome(error), started, rule,
           { error: errorName(error), sent: String(exchange.sent) }));
         throw error;
       }
@@ -117,8 +117,7 @@ class HttpBoundaries {
         await response.arrayBuffer();
         return failFetch(point, replacing, started);
       }
-      CORE.own(() => CORE.observe(point, statusOutcome(response.status), performance.now() - started, rule,
-        { status: String(response.status) }));
+      CORE.own(() => observeExchange(point, statusOutcome(response.status), started, rule, { status: String(response.status) }));
       return response;
     };
   }
@@ -142,7 +141,7 @@ class HttpBoundaries {
         const requestContext = context.active();
         const started = performance.now();
         const observe = (outcome: string, detail: Record<string, string>, observed: Rule | null): void => CORE.own(
-          () => context.with(requestContext, () => CORE.observe(point, outcome, performance.now() - started, observed, detail)));
+          () => context.with(requestContext, () => observeExchange(point, outcome, started, observed, detail)));
         if (rule?.action.kind === "duplicate") {
           CORE.abort(`rule ${rule.id}: duplicate at ${point} needs fetch, since an http.request body cannot be sent twice`);
         }
@@ -177,13 +176,24 @@ function statusOutcome(status: number): string {
   return `${Math.floor(status / 100)}xx`;
 }
 
-/** Delay without blocking other requests, since a boundary delay models a slow peer. */
+/** Observe an exchange, whose total, like its elapsed time, is the milliseconds since it started. */
+function observeExchange(point: string, outcome: string, started: number, rule: Rule | null, detail: Record<string, string>): void {
+  const elapsed = performance.now() - started;
+  CORE.observe(point, outcome, elapsed, elapsed, rule, detail);
+}
+
+/** Whether a rule waits ms before it acts: a delay, and a fail that fails slowly. */
+function waits(rule: Rule): boolean {
+  return rule.action.kind === "delay" || (rule.action.kind === "fail" && rule.action.ms !== undefined);
+}
+
+/** Delay without blocking other requests, since a boundary delay models a slow peer; a fail with ms waits the same way. */
 function wait(rule: Rule): Promise<void> {
   return CORE.own(() => {
     if (rule.action.kind === "crash") {
       CORE.crash(typeof rule.action.code === "number" ? rule.action.code : 1);
     }
-    return rule.action.kind === "delay" ? sleep(numberParameter(rule, "ms")) : Promise.resolve();
+    return waits(rule) ? sleep(numberParameter(rule, "ms")) : Promise.resolve();
   });
 }
 
@@ -243,14 +253,13 @@ function failFetch(point: string, rule: Rule, started: number): Response {
   const answer = CORE.own((): Response | Error => {
     const sent = String(rule.action.kind === "fail_after");
     if (typeof rule.action.status === "number") {
-      CORE.observe(point, statusOutcome(rule.action.status), performance.now() - started, rule,
-        { status: String(rule.action.status), sent });
+      observeExchange(point, statusOutcome(rule.action.status), started, rule, { status: String(rule.action.status), sent });
       return new Response(null, { status: rule.action.status });
     }
     const error = stringParameter(rule, "error") === "refused"
       ? new TypeError("fetch failed", { cause: boundaryError(rule) })
       : new DOMException("The operation was aborted due to timeout", "TimeoutError");
-    CORE.observe(point, errorOutcome(error), performance.now() - started, rule, { error: errorName(error), sent });
+    observeExchange(point, errorOutcome(error), started, rule, { error: errorName(error), sent });
     return error;
   });
   if (answer instanceof Response) {
@@ -311,7 +320,7 @@ function answerInstead(clientRequest: ClientRequest, rule: Rule,
   clientRequest.write = (() => true) as typeof clientRequest.write;
   clientRequest.end = (() => clientRequest) as typeof clientRequest.end;
   // The response event runs the application's listeners, whose errors are their own.
-  process.nextTick(() => {
+  const answering = (): void => {
     const answer = CORE.own((): IncomingMessage | Error => {
       if (typeof rule.action.status === "number") {
         observe(statusOutcome(rule.action.status), { status: String(rule.action.status), sent: "false" }, rule);
@@ -327,7 +336,13 @@ function answerInstead(clientRequest: ClientRequest, rule: Rule,
       return;
     }
     clientRequest.destroy(answer);
-  });
+  };
+  // A fail with ms answers once it has waited, on a timer as a delay sends late.
+  if (waits(rule)) {
+    setTimeout(answering, numberParameter(rule, "ms"));
+  } else {
+    process.nextTick(answering);
+  }
 }
 
 /** Let a request reach its peer and watch its response: a fail_after rule decided when the response comes, which only
