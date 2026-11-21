@@ -1,9 +1,10 @@
-// Package action holds what every plugin does the same way: delay and crash, and the error of a peer that timed out
-// or refused the connection.
+// Package action holds what every plugin does the same way: delay, the wait of a fail and crash, and the error of a
+// peer that timed out or refused the connection.
 package action
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -24,7 +25,8 @@ const (
 // count towards a fail_after rule.
 var Before = []string{"fail", "drop", "duplicate", "empty", "delay", "crash"}
 
-// Hold performs delay and crash: a delay blocks the calling goroutine, a crash ends the process with its code.
+// Hold performs delay and crash, and the wait of a fail rule before it fails: a delay, and the ms of a fail, block
+// the calling goroutine, a crash ends the process with its code.
 func Hold(rule *faultpoint.Rule) {
 	defer faultpoint.Guard()
 	switch rule.Action.Kind {
@@ -33,6 +35,15 @@ func Hold(rule *faultpoint.Rule) {
 			MS int `json:"ms"`
 		}
 		rule.DecodeParams(&params)
+		time.Sleep(time.Duration(params.MS) * time.Millisecond)
+	case "fail":
+		// The plugin that builds the failure checks the other parameters of a fail.
+		var params struct {
+			MS int `json:"ms"`
+		}
+		if err := json.Unmarshal(rule.Action.Params, &params); err != nil {
+			faultpoint.Abort("rule %s: parameters of fail: %v", rule.ID, err)
+		}
 		time.Sleep(time.Duration(params.MS) * time.Millisecond)
 	case "crash":
 		params := struct {
@@ -56,6 +67,8 @@ func Failure(rule *faultpoint.Rule, coded func(code string) error) error {
 	var params struct {
 		Error string `json:"error"`
 		Code  string `json:"code"`
+		// MS is the wait before a fail, which Hold has already waited.
+		MS int `json:"ms"`
 	}
 	rule.DecodeParams(&params)
 	switch {

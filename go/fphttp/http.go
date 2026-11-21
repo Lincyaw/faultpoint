@@ -126,6 +126,8 @@ func (c *ServerCall) FailureStatus() int {
 	defer faultpoint.Guard()
 	params := struct {
 		Status int `json:"status"`
+		// MS is the wait before a fail, which action.Hold has already waited.
+		MS int `json:"ms"`
 	}{Status: defaultFailureStatus}
 	c.Rule.DecodeParams(&params)
 	return params.Status
@@ -352,6 +354,8 @@ func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, erro
 	params := struct {
 		Status int    `json:"status"`
 		Error  string `json:"error"`
+		// MS is the wait before a fail, which action.Hold has already waited.
+		MS int `json:"ms"`
 	}{Error: action.Timeout}
 	rule.DecodeParams(&params)
 	if params.Status != 0 {

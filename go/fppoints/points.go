@@ -50,6 +50,8 @@ func Branch(ctx context.Context, point string, taken bool) bool {
 func injected(rule *faultpoint.Rule, point string) error {
 	var params struct {
 		Error string `json:"error"`
+		// MS is the wait before a fail, which action.Hold has already waited.
+		MS int `json:"ms"`
 	}
 	rule.DecodeParams(&params)
 	if params.Error == "" {
