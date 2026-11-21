@@ -410,6 +410,13 @@ fn sqlx_store(expression: &Expr) -> Option<Expr> {
             ::sqlx::Error::Database(database) => database.code().map(::std::borrow::Cow::into_owned),
             _ => ::std::option::Option::None,
         },
+        // The server's error answered a statement it had; no connection, from the pool or the network, sent nothing.
+        sent: |error| match error {
+            ::sqlx::Error::Database(_) => ::std::option::Option::Some(true),
+            ::sqlx::Error::PoolTimedOut | ::sqlx::Error::PoolClosed => ::std::option::Option::Some(false),
+            ::sqlx::Error::Io(io) if io.kind() == ::std::io::ErrorKind::ConnectionRefused => ::std::option::Option::Some(false),
+            _ => ::std::option::Option::None,
+        },
     })))
 }
 
@@ -477,6 +484,14 @@ fn redis_store(expression: &Expr) -> Option<Expr> {
         substitute: #substitute,
         is_empty: |_| false,
         code: |error| error.code().map(::std::borrow::ToOwned::to_owned),
+        // An error reply, or the response timeout of a written command, came after Redis had it; a refused connection sent nothing.
+        sent: |error| if error.code().is_some() || error.is_timeout() {
+            ::std::option::Option::Some(true)
+        } else if error.is_connection_refusal() {
+            ::std::option::Option::Some(false)
+        } else {
+            ::std::option::Option::None
+        },
     })))
 }
 

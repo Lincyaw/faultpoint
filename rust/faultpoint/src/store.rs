@@ -41,6 +41,8 @@ pub struct Hooks<T, E> {
     pub substitute: fn() -> Result<T, E>,
     pub is_empty: fn(&T) -> bool,
     pub code: fn(&E) -> Option<String>,
+    /// Whether an operation that failed of itself had reached the server, when the client's error tells.
+    pub sent: fn(&E) -> Option<bool>,
 }
 
 /// What statements touch: their relations, the names of their WITH items, and whether they write, as any
@@ -207,10 +209,14 @@ where
             Err(error) => {
                 let mut detail = Detail::from([("error", type_name::<E>().to_owned())]);
                 detail.extend((hooks.code)(error).map(|code| ("code", code)));
-                // Under a rule it is known whether the operation was sent: a delayed one always is, and a failed one never.
-                if action == "delay" || action == "fail" {
-                    detail.insert("sent", (action == "delay").to_string());
-                }
+                // An operation a fail rule answered was never sent and one fail_after replaced was; of one that failed
+                // of itself, the client's error tells, when it can.
+                let sent = match rule.as_ref().map(|rule| rule.action.kind.as_str()) {
+                    Some("fail") => Some(false),
+                    Some("fail_after") => Some(true),
+                    _ => (hooks.sent)(error),
+                };
+                detail.extend(sent.map(|sent| ("sent", sent.to_string())));
                 ("error", detail)
             }
             Ok(_) if action == "empty" => ("empty", Detail::new()),
