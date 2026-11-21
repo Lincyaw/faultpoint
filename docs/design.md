@@ -74,7 +74,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | 类别 | 放置位置 | 可用动作 | 观测结果（outcome） |
 | --- | --- | --- | --- |
 | `branch` | 守卫错误返回或抛出的条件判断 | `fail`：强制进入该分支 | `taken` `not_taken` |
-| `call` | 返回错误值的调用点（Go 的 `err`） | `fail`：不执行被调函数，直接得到错误；`fail_after`：被调函数正常完成后，再把结果换成错误；被调函数自己失败时保留它自己的失败，记为自然结果，也不消耗规则的触发次数 | `error` `ok` |
+| `call` | 返回错误值的调用点（Go 的 `err`） | `fail`：不执行被调函数，直接得到错误；`fail_after`：被调函数正常完成后，再把结果换成错误（见第 3 节） | `error` `ok` |
 | `check` | 返回布尔值的检测函数 | `negate` | `true` `false` |
 | `loop` | 循环体开头 | `delay`：每次迭代延迟 | `iteration` |
 | `value` | 业务计算结果（人工标注） | `set` `shift` | `observed`，数值记入 total |
@@ -130,6 +130,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 ```
 
 - **范围**：`scope` 中的每一项都必须等于当前请求 baggage 中的同名项，规则才生效。不在任何请求中的后台工作没有 baggage，只匹配 `scope` 为空的规则。内核看不到请求的 baggage，所以 `syscall` 和 `packet` 的规则不能带 `scope`，作用范围就是故障点所属服务的所有容器。
+- **`fail_after` 只替换正常完成的执行**：无论在哪个类别，`fail_after` 都在操作正常完成之后才生效（调用返回、语句执行成功、请求得到应答）。操作自己失败时，保留它自己的失败，记为自然结果，不带规则 id，也不计入这条规则的触发次数。否则自然失败会被当成注入，比较时就看不到它。
 - **触发**：每个进程对每条规则单独计数：先跳过前 `skip` 次匹配，之后最多注入 `limit` 次，每次以 `probability` 的概率注入（随机数以 `FAULTPOINT_SEED` 和规则 id 为种子）。并发下“第 n 次”本身是不确定的，所以优先用 `scope` 限定到具体的租户或请求，少用计数。`syscall` 和 `packet` 的计数由 eBPF 代理在内核中进行，范围是一条规则在该服务所有容器上的匹配，而不是每个进程；它的随机序列与各语言 SDK 的不同。
 - **适用性**：动作必须属于该类别的可用动作（见 1.3）。边界类故障点的 `fail` 和 `fail_after` 用 `status` 指定合成的响应状态，或用 `error` 指定 `timeout` 或 `refused`。`call` 的 `error` 是已登记的错误名，Go 改写器会把包级的 `error` 变量自动登记为 `<包路径>.<变量名>`，这样注入的就是代码真实会返回的哨兵错误。`syscall` 的 `fail` 必须给出 errno 名，例如 `ECONNREFUSED`。存储和消息类的 `fail` `fail_after` 可以用 `code` 指定客户端库报告的错误码：SQL 存储是 SQLSTATE（例如 `23505`），Redis 是错误回复的前缀（例如 `WRONGTYPE`）。适配器抛出客户端库自己的、带这个码的错误类型，这样应用按错误码分支的处理照常执行，被注入的记录也带上同样的 `code`。
   - **怎样构造**：尽量交给客户端库自己的工厂或解析器，例如 redis-py 的 `parse_error`、Lettuce 的 `ExceptionFactory`、redis-rs 的回复解析器；PostgreSQL 的错误按服务端发来的字段构造（Java 的 `PSQLException`、Go 的 `*pgconn.PgError`、psycopg 按 SQLSTATE 查到的类）。Rust 的这类错误由 SDK 导出的宏在应用的 crate 里展开，SDK 不依赖客户端库；Go 的 database/sql 由驱动插件登记各自的构造器。
