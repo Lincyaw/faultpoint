@@ -2,6 +2,7 @@
 //! passes the operation's future and hooks that build the client's own values, so this crate depends on
 //! neither client.
 
+use std::any::type_name;
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -15,7 +16,7 @@ use sqlparser::ast::{Statement, visit_relations};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::core::{Plugin, core};
+use crate::core::{Detail, Plugin, core};
 use crate::rules::{Rule, point_id};
 
 /// spec/redis-commands.json, the table every SDK reads.
@@ -32,11 +33,13 @@ static KEY_IDENTIFIER: LazyLock<Regex> = LazyLock::new(|| {
 static STATEMENTS: LazyLock<Mutex<HashMap<String, (&'static str, String)>>> = LazyLock::new(Mutex::default);
 
 /// What a rewritten call site supplies: the client's error for an injected failure, the value an empty read
-/// or a dropped write answers with, and whether a read's value is empty.
+/// or a dropped write answers with, whether a read's value is empty, and the code a store gave an error, such as
+/// a SQLSTATE or the prefix of a Redis error reply.
 pub struct Hooks<T, E> {
     pub failure: fn() -> E,
     pub substitute: fn() -> Result<T, E>,
     pub is_empty: fn(&T) -> bool,
+    pub code: fn(&E) -> Option<String>,
 }
 
 /// The kind and locator of a SQL statement: a query is read and anything else written, the tables it
@@ -137,13 +140,19 @@ where
         (_, None) => unreachable!("an action comes from a rule"),
     };
     // An injected empty reply is empty whatever the client's type tells; otherwise the call site's hook decides.
-    let outcome = match &result {
-        Err(_) => "error",
-        Ok(_) if action == "empty" => "empty",
-        Ok(value) if kind == "store_read" || kind == "consume" => if (hooks.is_empty)(value) { "empty" } else { "rows" },
-        Ok(_) => "ok",
+    let (outcome, detail) = match &result {
+        Err(error) => {
+            let mut detail = Detail::from([("error", type_name::<E>().to_owned())]);
+            detail.extend((hooks.code)(error).map(|code| ("code", code)));
+            ("error", detail)
+        }
+        Ok(_) if action == "empty" => ("empty", Detail::new()),
+        Ok(value) if kind == "store_read" || kind == "consume" => {
+            (if (hooks.is_empty)(value) { "empty" } else { "rows" }, Detail::new())
+        }
+        Ok(_) => ("ok", Detail::new()),
     };
-    core.observe(&point, outcome, started.elapsed().as_secs_f64() * 1000.0, rule.as_ref());
+    core.observe(&point, outcome, started.elapsed().as_secs_f64() * 1000.0, rule.as_ref(), detail);
     result
 }
 

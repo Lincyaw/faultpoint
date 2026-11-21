@@ -390,6 +390,10 @@ fn sqlx_store(expression: &Expr) -> Option<Expr> {
         failure: || ::sqlx::Error::Protocol(::std::string::String::from("faultpoint: injected store failure")),
         substitute: #substitute,
         is_empty: #is_empty,
+        code: |error| match error {
+            ::sqlx::Error::Database(database) => database.code().map(::std::borrow::Cow::into_owned),
+            _ => ::std::option::Option::None,
+        },
     })))
 }
 
@@ -452,6 +456,7 @@ fn redis_store(expression: &Expr) -> Option<Expr> {
         failure: || ::redis::RedisError::from((::redis::ErrorKind::IoError, "faultpoint: injected Redis failure")),
         substitute: #substitute,
         is_empty: |_| false,
+        code: |error| error.code().map(::std::borrow::ToOwned::to_owned),
     })))
 }
 

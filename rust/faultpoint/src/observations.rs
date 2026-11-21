@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Settings;
-use crate::core::{Observation, ObservationSink, Plugin};
+use crate::core::{Detail, Observation, ObservationSink, Plugin};
 
 /// One line of an observation file, as spec/observation.schema.json defines.
 #[derive(Serialize)]
@@ -25,6 +25,7 @@ pub struct ObservationRecord {
     pub count: u64,
     pub total: f64,
     pub exemplars: Vec<String>,
+    pub detail: Detail,
 }
 
 #[derive(Deserialize)]
@@ -46,7 +47,7 @@ fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("the clock is after 1970").as_secs_f64()
 }
 
-type TallyKey = (String, String, String, String, Option<String>);
+type TallyKey = (String, String, String, String, Option<String>, Detail);
 
 struct Tally {
     records: HashMap<TallyKey, ObservationRecord>,
@@ -82,12 +83,13 @@ impl JsonlSink {
 impl ObservationSink for Arc<JsonlSink> {
     fn add(&self, observation: Observation<'_>) {
         let key = (observation.experiment.to_owned(), observation.point.to_owned(), observation.outcome.to_owned(),
-                   observation.scope.clone(), observation.rule.map(str::to_owned));
+                   observation.scope.clone(), observation.rule.map(str::to_owned), observation.detail.clone());
         let mut tally = self.tally.lock().unwrap();
         let record = tally.records.entry(key).or_insert_with(|| ObservationRecord {
             experiment: observation.experiment.into(), service: self.service.clone(), process: self.process.clone(),
             start: 0.0, end: 0.0, point: observation.point.into(), outcome: observation.outcome.into(),
             scope: observation.scope, rule: observation.rule.map(str::to_owned), count: 0, total: 0.0, exemplars: vec![],
+            detail: observation.detail,
         });
         record.count += 1;
         record.total += observation.quantity;

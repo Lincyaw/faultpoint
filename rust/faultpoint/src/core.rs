@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, Once, RwLock};
 
 use serde_json::Value;
@@ -9,6 +9,10 @@ use crate::rules::{Rule, RuleSet, point_parts};
 
 const INVALID_RULES_EXIT: i32 = 70;
 
+/// What tells executions of one outcome apart, by bounded values under the keys spec/kinds.json gives the kind;
+/// its keys are sorted, so that one detail has one form.
+pub type Detail = BTreeMap<&'static str, String>;
+
 /// One execution of a point, as the core hands it to the observation sink.
 pub struct Observation<'a> {
     pub experiment: &'a str,
@@ -18,6 +22,7 @@ pub struct Observation<'a> {
     pub rule: Option<&'a str>,
     pub quantity: f64,
     pub trace_id: Option<String>,
+    pub detail: Detail,
 }
 
 pub trait RuleSource: Send {
@@ -175,13 +180,13 @@ impl Core {
         None
     }
 
-    pub fn observe(&self, point: &str, outcome: &str, quantity: f64, rule: Option<&Rule>) {
+    pub fn observe(&self, point: &str, outcome: &str, quantity: f64, rule: Option<&Rule>, detail: Detail) {
         let Some(sink) = &self.sink else { return };
         let state = self.state.read().unwrap().clone();
         sink.add(Observation {
             experiment: &state.experiment, point, outcome, quantity, rule: rule.map(|rule| rule.id.as_str()),
             scope: self.baggage(&self.settings.scope_key).unwrap_or_default(),
-            trace_id: self.context.as_ref().and_then(|context| context.trace_id()),
+            trace_id: self.context.as_ref().and_then(|context| context.trace_id()), detail,
         });
     }
 

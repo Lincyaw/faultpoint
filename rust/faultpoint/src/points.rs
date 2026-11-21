@@ -1,3 +1,4 @@
+use std::any::type_name;
 use std::fmt;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -5,7 +6,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::core::{Plugin, core};
+use crate::core::{Detail, Plugin, core};
 use crate::rules::Rule;
 
 fn number(rule: &Rule, name: &str) -> f64 {
@@ -49,7 +50,7 @@ pub fn branch(point: &str, taken: bool) -> bool {
         }
         None => taken,
     };
-    core.observe(point, if taken { "taken" } else { "not_taken" }, 0.0, rule.as_ref());
+    core.observe(point, if taken { "taken" } else { "not_taken" }, 0.0, rule.as_ref(), Detail::new());
     taken
 }
 
@@ -67,7 +68,7 @@ pub fn check(point: &str, result: bool) -> bool {
         }
         None => result,
     };
-    core.observe(point, if result { "true" } else { "false" }, 0.0, rule.as_ref());
+    core.observe(point, if result { "true" } else { "false" }, 0.0, rule.as_ref(), Detail::new());
     result
 }
 
@@ -81,7 +82,7 @@ pub fn loop_iteration(point: &str) {
     if let Some(rule) = &rule {
         hold(rule);
     }
-    core.observe(point, "iteration", 0.0, rule.as_ref());
+    core.observe(point, "iteration", 0.0, rule.as_ref(), Detail::new());
 }
 
 /// A business value, replaced by a set rule or offset by a shift rule.
@@ -106,7 +107,7 @@ pub fn value<T: Serialize + DeserializeOwned>(point: &str, observed: T) -> T {
         }
     }
     let quantity = serde_json::to_value(&result).ok().and_then(|current| current.as_f64()).unwrap_or(0.0);
-    core.observe(point, "observed", quantity, rule.as_ref());
+    core.observe(point, "observed", quantity, rule.as_ref(), Detail::new());
     result
 }
 
@@ -143,7 +144,7 @@ pub fn clock<T: ClockReading>(point: &str, reading: T) -> T {
             reading = reading.shifted(number(rule, "amount"));
         }
     }
-    core.observe(point, "read", 0.0, rule.as_ref());
+    core.observe(point, "read", 0.0, rule.as_ref(), Detail::new());
     reading
 }
 
@@ -161,7 +162,7 @@ pub fn acquire(point: &str, acquired: bool) -> bool {
         }
         None => acquired,
     };
-    core.observe(point, if acquired { "acquired" } else { "rejected" }, 0.0, rule.as_ref());
+    core.observe(point, if acquired { "acquired" } else { "rejected" }, 0.0, rule.as_ref(), Detail::new());
     acquired
 }
 
@@ -179,7 +180,10 @@ pub fn call<T, E: From<Injected>>(point: &str, result: Result<T, E>) -> Result<T
         }
         None => result,
     };
-    core.observe(point, if result.is_ok() { "ok" } else { "error" }, 0.0, rule.as_ref());
+    match &result {
+        Ok(_) => core.observe(point, "ok", 0.0, rule.as_ref(), Detail::new()),
+        Err(_) => core.observe(point, "error", 0.0, rule.as_ref(), Detail::from([("error", type_name::<E>().to_owned())])),
+    }
     result
 }
 
