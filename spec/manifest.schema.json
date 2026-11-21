@@ -27,6 +27,21 @@
         "code": {
           "title": "Code",
           "type": "string"
+        },
+        "actions": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Actions"
         }
       },
       "required": [

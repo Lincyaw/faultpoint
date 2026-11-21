@@ -78,6 +78,8 @@ class PointEntry(BaseModel):
     function: str
     code: str
     """The first line of the instrumented source."""
+    actions: tuple[str, ...] | None = None
+    """The actions this point implements when narrower than its kind's; None means all of its kind's."""
 
 
 class Manifest(BaseModel):
