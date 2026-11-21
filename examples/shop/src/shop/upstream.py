@@ -1,4 +1,5 @@
 import json
+import shlex
 import socket
 import subprocess
 import time
@@ -21,6 +22,22 @@ UPSTREAM_SERVICES: Final = frozenset(UNSCOPED_TARGETS)
 PACKET_POINTS: Final = tuple(f"{service}:packet:egress:*:*" for service in sorted(UPSTREAM_SERVICES))
 """The packets each upstream component sends, which the kernel agent can delay; it observes only what it injects, so
 these points are configured rather than found in a control."""
+SERVER_COMMANDS: Final = {REDIS: "redis-server", POSTGRES: "postgres"}
+"""What each image's entrypoint runs by default."""
+NATIVE_FUNCTIONS: Final[dict[str, tuple[dict[str, Any], ...]]] = {
+    REDIS: ({"file": "/usr/local/bin/redis-server", "symbol": "lookupKey", "kind": "call",
+             "result": {"registers": ["ax"], "outcome": "ax", "type": "pointer", "error": "zero"},
+             "errors": {"NULL": [{"constant": 0}]},
+             # Only lookups for reading may find nothing: a write lookup that does trips Redis' own assertion.
+             "predicate": {"register": "dx", "mask": 8, "equals": 0},
+             "clones": {"lookupKey.constprop.0": None, "lookupKey.constprop.1": {}}},),
+    POSTGRES: ({"file": "/usr/lib/postgresql/16/bin/postgres", "symbol": "pq_getbyte", "kind": "call",
+                "result": {"registers": ["ax"], "outcome": "ax", "type": "int32", "error": "negative"},
+                "errors": {"EOF": [{"constant": -1}]}},),
+}
+"""The functions of each upstream component where the kernel agent places points, in its configuration's terms: a
+read of Redis that finds no key, and a backend of PostgreSQL reading the end of its client's connection, which every
+caller of pq_getbyte handles as the client leaving."""
 AGENT_IMAGE: Final = "python:3.12-alpine"
 POSTGRES_PASSWORD: Final = "shop"
 REDIS_PORT: Final = 6379
@@ -72,8 +89,18 @@ def docker(*arguments: str, stdin: str | None = None) -> str:
                           input=stdin).stdout.strip()
 
 
+def private_files_command(service: str) -> str:
+    """The image's default command, run after copying every file the kernel agent probes into the container's own
+    writable layer, since a probe on a file of a shared image layer traps every container that maps it."""
+    files = sorted({function["file"] for function in NATIVE_FUNCTIONS[service]})
+    copies = [f"cp {shlex.quote(file)} {shlex.quote(file)}.copy && mv {shlex.quote(file)}.copy {shlex.quote(file)}"
+              for file in files]
+    return " && ".join([*copies, f"exec docker-entrypoint.sh {SERVER_COMMANDS[service]}"])
+
+
 def start_container(service: str, name: str, image: str, port: int, *options: str) -> Container:
-    identifier = docker("run", "-d", "--name", name, "-p", f"127.0.0.1::{port}", *options, image)
+    identifier = docker("run", "-d", "--name", name, "-p", f"127.0.0.1::{port}", *options, "--entrypoint", "sh",
+                        image, "-c", private_files_command(service))
     published = docker("port", name, f"{port}/tcp").splitlines()[0].rpartition(":")[2]
     return Container(service=service, name=name, identifier=identifier, port=int(published))
 
@@ -116,21 +143,25 @@ def host_peer(container: Container) -> str:
 
 def agent_config(upstream: Upstream, flush_seconds: float) -> dict[str, Any]:
     """The kernel agent's services: each container's cgroup, its own interface, which transmits its egress, and the
-    host side of its cable, which transmits its ingress."""
-    return {"options": {"jsonl": {"flush_seconds": flush_seconds}, "ebpf": {"syscalls": list(AGENT_SYSCALLS), "services": {
-        container.service: {"cgroups": [container.cgroup], "devices": [
+    host side of its cable, which transmits its ingress; and the functions of each container it places points in."""
+    containers = (upstream.redis, upstream.postgres)
+    return {"options": {"jsonl": {"flush_seconds": flush_seconds}, "ebpf": {
+        "syscalls": list(AGENT_SYSCALLS),
+        "services": {container.service: {"cgroups": [container.cgroup], "devices": [
             {"netns": docker("inspect", "-f", "{{.NetworkSettings.SandboxKey}}", container.name), "name": "eth0",
              "transmits": "egress"},
-            {"name": host_peer(container), "transmits": "ingress"}]}
-        for container in (upstream.redis, upstream.postgres)}}}}
+            {"name": host_peer(container), "transmits": "ingress"}]} for container in containers},
+        "functions": [{"service": container.service, **function}
+                      for container in containers for function in NATIVE_FUNCTIONS[container.service]]}}}
 
 
 def start_agent(directory: Path, rules: Path, upstream: Upstream, sdk: Path, prefix: str, flush_seconds: float) -> str:
     """The eBPF agent for the upstream containers, privileged in a container of its own, reading the repetition's
-    rules; its observations stay inside the container until it stops, so that root never owns a file of ours."""
+    rules; its observations stay inside the container until it stops, so that root never owns a file of ours. It sees
+    the host's processes, to open a container's files through the root of a process in the container's cgroup."""
     (directory / AGENT_CONFIG).write_text(json.dumps(agent_config(upstream, flush_seconds)))
     name = f"{prefix}-agent"
-    docker("run", "-d", "--name", name, "--privileged", "--network=host", "--cgroupns=host",
+    docker("run", "-d", "--name", name, "--privileged", "--network=host", "--cgroupns=host", "--pid=host",
            "-v", "/sys/kernel/tracing:/sys/kernel/tracing", "-v", "/var/run/docker/netns:/var/run/docker/netns",
            "-v", f"{sdk / 'ebpf' / 'fpebpf'}:/fpebpf:ro", "-v", f"{directory / AGENT_CONFIG}:/work/config.json:ro",
            "-v", f"{rules}:/work/rules.json:ro", "-e", "FAULTPOINT_CONFIG=/work/config.json",

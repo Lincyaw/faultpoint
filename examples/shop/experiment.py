@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import Final
 
 from shop.deployment import MANIFESTS, RUNS, SCOPE_KEY, build, repetition, run, verified_build
+from shop.upstream import UPSTREAM_SERVICES
 from shop.workload import Scenarios
+
+TREATED_TENANT: Final = "a"
+UNSCOPED: Final = ""
 
 
 def known_points(control: str) -> dict[str, str]:
@@ -32,7 +36,11 @@ TREATMENTS: Final = {
     "pricing-unavailable": ("pricing", "rpc_server", "/price", {"kind": "fail", "status": 503}),
     "ledger-declines": ("ledger", "branch", "InsufficientFunds", {"kind": "fail"}),
     "pricing-discount": ("pricing", "check", "discounted", {"kind": "negate"}),
+    "redis-lookup-miss": ("redis", "call", "lookupKey", {"kind": "fail", "error": "NULL"}),
+    "postgres-client-eof": ("postgres", "call", "pq_getbyte", {"kind": "fail", "error": "EOF"}),
 }
+"""Faults at points of the shop's services, injected in tenant a, and at points the kernel agent places in an upstream
+component, which no rule can scope and so reach every tenant."""
 
 
 def main() -> None:
@@ -57,16 +65,18 @@ def main() -> None:
     for name in arguments.treatments:
         service, kind, contains, action = TREATMENTS[name]
         point = find_point(controls[0], service, kind, contains)
+        scoped = service not in UPSTREAM_SERVICES
         labels = [f"{name}-{index}" for index in range(arguments.repetitions)]
         for label in labels:
-            rules = {"experiment": label, "rules": [{"id": name, "point": point, "action": action,
-                                                     "scope": {SCOPE_KEY: "a"}}]}
-            print(label, repetition(RUNS / label, workload, rules, sdk), flush=True)
+            rule = {"id": name, "point": point, "action": action} | (
+                {"scope": {SCOPE_KEY: TREATED_TENANT}} if scoped else {})
+            print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": [rule]}, sdk), flush=True)
         reports = sorted(str(path) for label in controls + labels for path in (RUNS / label).glob("*.jsonl"))
-        print(f"\n== {name}: {action} at {point}, scope a", flush=True)
-        run(["uv", "run", "--extra", "tools", "faultpoint", "diff", *reports,
-             *[f"--control={label}@a" for label in controls], *[f"--treatment={label}@a" for label in labels]],
-            sdk / "python")
+        for scope in [TREATED_TENANT] if scoped else [TREATED_TENANT, UNSCOPED]:
+            print(f"\n== {name}: {action} at {point}, compared in scope {scope!r}", flush=True)
+            run(["uv", "run", "--extra", "tools", "faultpoint", "diff", *reports,
+                 *[f"--control={label}@{scope}" for label in controls],
+                 *[f"--treatment={label}@{scope}" for label in labels]], sdk / "python")
 
 
 if __name__ == "__main__":
