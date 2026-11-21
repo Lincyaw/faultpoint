@@ -1,11 +1,13 @@
 import importlib.resources
 import re
+from collections.abc import Iterable
 from typing import Any, Final, Self
 
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel
 
 from faultpoint.actions import ONE_FAILURE
+from faultpoint.placement import Manifest, PointEntry
 from faultpoint.rules import STRICT, Rule, RuleSet
 
 KINDS_FILE: Final = ("spec", "kinds.json")
@@ -71,3 +73,19 @@ class KindTable(BaseModel):
         if rule.scope and not spec.scope:
             problems.append(f"a {rule.kind} point sees no request baggage, so its rule has no scope")
         return problems
+
+
+def manifest_violations(ruleset: RuleSet, manifests: Iterable[Manifest]) -> list[str]:
+    """The rules whose point is narrower than its kind in a manifest and that ask for another action, and those
+    missing from the manifests of their service that list points of their kind; a boundary point, which no
+    manifest lists, is never missing."""
+    points = {point.id: point for manifest in manifests for point in manifest.points}
+    listed = {(manifest.service, point.kind) for manifest in manifests for point in manifest.points}
+    violations = []
+    for rule in ruleset.rules:
+        match points.get(rule.point):
+            case None if (rule.service, rule.kind) in listed:
+                violations.append(f"rule {rule.id}: {rule.point} is in no manifest of {rule.service}")
+            case PointEntry(actions=tuple() as actions) if rule.action.kind not in actions:
+                violations.append(f"rule {rule.id}: {rule.point} implements only {', '.join(actions)}")
+    return violations

@@ -12,7 +12,7 @@ from faultpoint.placement import MANIFEST_FILE, Manifest, Placement, scan_tree
 from faultpoint.rules import RuleSet
 from faultpoint.tools.analysis import Selection, compare
 from faultpoint.tools.candidates import executed_candidates
-from faultpoint.tools.kinds import KindTable
+from faultpoint.tools.kinds import KindTable, manifest_violations
 
 app = typer.Typer(no_args_is_help=True, help="Fault points that inject and observe faults.")
 # Point ids are printed verbatim: rich would turn ":loop:" into an emoji and "[...]" into markup.
@@ -30,10 +30,15 @@ def schema(directory: Annotated[Path, typer.Argument(help="Where the JSON Schema
 
 
 @app.command()
-def check(rules: Annotated[Path, typer.Argument(help="A rule set file.")]) -> None:
-    """Validate a rule set against the kind table before a controller installs it."""
+def check(rules: Annotated[Path, typer.Argument(help="A rule set file.")],
+          manifest: Annotated[list[Path] | None, typer.Option(
+              help="A manifest of a service the rules target, whose points' actions the rules are held to.")] = None,
+          ) -> None:
+    """Validate a rule set against the kind table, and against the manifests given, before a controller installs
+    it."""
     ruleset = RuleSet.model_validate_json(rules.read_bytes())
-    violations = KindTable.installed().violations(ruleset)
+    manifests = [Manifest.model_validate_json(path.read_bytes()) for path in manifest or ()]
+    violations = KindTable.installed().violations(ruleset) + manifest_violations(ruleset, manifests)
     for violation in violations:
         typer.echo(violation, err=True)
     if violations:
