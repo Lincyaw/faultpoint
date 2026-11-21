@@ -6,12 +6,15 @@ from typing import Final
 
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
-from shop.deployment import MANIFESTS, RUNS, SCOPE_KEY, build, refusal, repetition, run, verified_build
-from shop.upstream import PACKET_POINTS
+from shop.deployment import (MANIFESTS, RESPONSES_FILE, RUNS, SCOPE_KEY, Instrumentation, Responses, build, refusal,
+                             repetition, run, verified_build)
+from shop.upstream import PACKET_POINTS, AgentObservation
 from shop.workload import FROZEN, Scenarios
 
 TREATED_TENANT: Final = "a"
 UNSCOPED: Final = ""
+SHOWN_DIFFERENCES: Final = 3
+"""The differing responses a transparency check prints of each scenario."""
 
 
 class PointRule(BaseModel):
@@ -78,6 +81,30 @@ def rule_of(name: str, index: int, point_rule: PointRule, control: str) -> dict[
             | ({"trigger": point_rule.trigger} if point_rule.trigger else {}))
 
 
+def compare_transparency(sdk: Path, instrumentation: Instrumentation) -> None:
+    """Run every scenario once without faultpoint and once with it and no rule, and show whether the users received
+    the same responses, status and body, in the same order."""
+    scenarios = Scenarios.read()
+    runs = {"detached": Instrumentation(attached=False), "attached": instrumentation}
+    for scenario in scenarios.scenarios:
+        workload = scenarios.workload(scenario.name).model_dump(mode="json")
+        received = {}
+        for mode, chosen in runs.items():
+            label = f"transparency-{scenario.name}-{mode}"
+            print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": []}, sdk, chosen),
+                  flush=True)
+            received[mode] = Responses.model_validate_json((RUNS / label / RESPONSES_FILE).read_text()).responses
+        # Both send the same sequence, so a run that answered fewer requests within the load's deadline differs.
+        pairs = list(zip(received["detached"], received["attached"]))
+        differing = [(index, detached, attached) for index, (detached, attached) in enumerate(pairs)
+                     if detached != attached]
+        print(f"== {scenario.name}: {len(pairs) - len(differing)} of {len(received['detached'])} responses without "
+              f"faultpoint and {len(received['attached'])} with it the same", flush=True)
+        for index, detached, attached in differing[:SHOWN_DIFFERENCES]:
+            print(f"   #{index} without {detached.status} {detached.body[:120]!r}, "
+                  f"with {attached.status} {attached.body[:120]!r}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=(
         "Build the five shop services with faultpoint attached, run control and treatment repetitions under the "
@@ -90,25 +117,41 @@ def main() -> None:
     parser.add_argument("--scenario", default="limited-stock", help="The workload, a scenario of scenarios.json.")
     parser.add_argument("--treatments-file", type=Path,
                         help="Further treatments, by name, as JSON lists of rules of the PointRule form.")
+    parser.add_argument("--all-syscalls", action="store_true",
+                        help="Let the kernel agent report the natural results of every syscall, not of a chosen few.")
+    parser.add_argument("--hooks", type=Path, help=(
+        "A JSON file of the records of the build's hook catalog the kernel agent attaches, per upstream service, in "
+        "the shape of its hooks options."))
+    parser.add_argument("--controls-only", action="store_true", help="Run the control repetitions and no treatment.")
+    parser.add_argument("--transparency", action="store_true", help=(
+        "Instead, run every scenario once without faultpoint, no SDK, FAULTPOINT_ variable or kernel agent, and once "
+        "with it and no rule, and compare the responses."))
     parser.add_argument("treatments", nargs="*", default=list(TREATMENTS))
     arguments = parser.parse_args()
     treatments = TREATMENTS | (Treatments.validate_json(arguments.treatments_file.read_bytes())
                                if arguments.treatments_file else {})
+    instrumentation = Instrumentation(agent=AgentObservation(
+        **({"syscalls": None} if arguments.all_syscalls else {}),
+        **({"hooks": json.loads(arguments.hooks.read_text())} if arguments.hooks else {})))
     sdk = arguments.sdk_root.resolve()
     commit = verified_build(sdk) if arguments.skip_build else build(sdk)
     print(f"SDK commit {commit} from {sdk}", flush=True)
+    if arguments.transparency:
+        compare_transparency(sdk, instrumentation)
+        return
     workload = Scenarios.read().workload(arguments.scenario).model_dump(mode="json")
     controls = [f"control-{index}" for index in range(arguments.repetitions)]
     for label in controls:
-        print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": []}, sdk), flush=True)
-    for name in arguments.treatments:
+        print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": []}, sdk, instrumentation),
+              flush=True)
+    for name in [] if arguments.controls_only else arguments.treatments:
         rules = [rule_of(name, index, point_rule, controls[0]) for index, point_rule in enumerate(treatments[name])]
         labels = [f"{name}-{index}" for index in range(arguments.repetitions)]
         refused = False
         for label in labels:
             try:
-                print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": rules}, sdk),
-                      flush=True)
+                print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": rules}, sdk,
+                                        instrumentation), flush=True)
             except subprocess.CalledProcessError:
                 refused = True
                 print(label, "refused:", refusal(RUNS / label), flush=True)

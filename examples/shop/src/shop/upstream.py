@@ -1,12 +1,14 @@
 import json
 import shlex
+import shutil
 import socket
 import subprocess
 import time
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final
 
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue
 
 from shop.workload import FROZEN
 
@@ -50,6 +52,11 @@ AGENT_REPORT: Final = "/agent.jsonl"
 AGENT_OBSERVATIONS: Final = "agent.jsonl"
 AGENT_CONFIG: Final = "agent.config.json"
 AGENT_LOG: Final = "agent.log"
+AGENT_CATALOG: Final = "/catalog"
+"""Where the kernel agent's container holds a scan's hook catalog: the scan writes it there, the agent reads it."""
+TRACING_MOUNTS: Final = ("-v", "/sys/kernel/tracing:/sys/kernel/tracing")
+DEBUG_MOUNTS: Final = ("-v", "/sys/kernel/debug:/sys/kernel/debug")
+"""The scan reads the kernel's functions under debugfs."""
 UPSTREAM_FILE: Final = "upstream.json"
 READY_DEADLINE_S: Final = 60
 STOP_GRACE_S: Final = 20
@@ -68,6 +75,17 @@ class Container(BaseModel):
     @property
     def cgroup(self) -> str:
         return str(CONTAINER_CGROUPS / f"docker-{self.identifier}.scope")
+
+
+class AgentObservation(BaseModel):
+    """What the kernel agent observes besides the points it injects at: the syscalls whose natural results it reports,
+    every syscall when none are listed, and per upstream service the records of the build's hook catalog it attaches,
+    in the shape of the agent's hooks options."""
+
+    model_config = FROZEN
+
+    syscalls: tuple[str, ...] | None = AGENT_SYSCALLS
+    hooks: dict[str, dict[str, JsonValue]] = {}
 
 
 class Upstream(BaseModel):
@@ -144,32 +162,59 @@ def host_peer(container: Container) -> str:
     return socket.if_indextoname(int(docker("exec", container.name, "cat", "/sys/class/net/eth0/iflink")))
 
 
-def agent_config(upstream: Upstream, flush_seconds: float) -> dict[str, Any]:
+def agent_config(upstream: Upstream, flush_seconds: float, observation: AgentObservation) -> dict[str, Any]:
     """The kernel agent's services: each container's cgroup, its own interface, which transmits its egress, and the
-    host side of its cable, which transmits its ingress; and the functions of each container it places points in."""
+    host side of its cable, which transmits its ingress; the functions of each container it places points in; and
+    what it observes besides."""
     containers = (upstream.redis, upstream.postgres)
     return {"options": {"jsonl": {"flush_seconds": flush_seconds}, "ebpf": {
-        "syscalls": list(AGENT_SYSCALLS),
         "services": {container.service: {"cgroups": [container.cgroup], "devices": [
             {"netns": docker("inspect", "-f", "{{.NetworkSettings.SandboxKey}}", container.name), "name": "eth0",
              "transmits": "egress"},
             {"name": host_peer(container), "transmits": "ingress"}]} for container in containers},
         "functions": [{"service": container.service, **function}
-                      for container in containers for function in NATIVE_FUNCTIONS[container.service]]}}}
+                      for container in containers for function in NATIVE_FUNCTIONS[container.service]],
+        **({"syscalls": list(observation.syscalls)} if observation.syscalls is not None else {}),
+        **({"hooks": observation.hooks, "catalog": AGENT_CATALOG} if observation.hooks else {})}}}
 
 
-def start_agent(directory: Path, rules: Path, upstream: Upstream, sdk: Path, prefix: str, flush_seconds: float) -> str:
+def start_agent(directory: Path, rules: Path, upstream: Upstream, sdk: Path, prefix: str, flush_seconds: float,
+                observation: AgentObservation, catalog: Path) -> str:
     """The eBPF agent for the upstream containers, privileged in a container of its own, reading the repetition's
-    rules; its observations stay inside the container until it stops, so that root never owns a file of ours. It sees
-    the host's processes, to open a container's files through the root of a process in the container's cgroup."""
-    (directory / AGENT_CONFIG).write_text(json.dumps(agent_config(upstream, flush_seconds)))
+    rules and, when it attaches hooks, the build's hook catalog; its observations stay inside the container until it
+    stops, so that root never owns a file of ours. It sees the host's processes, to open a container's files through
+    the root of a process in the container's cgroup."""
+    (directory / AGENT_CONFIG).write_text(json.dumps(agent_config(upstream, flush_seconds, observation)))
     name = f"{prefix}-agent"
+    catalog_mounts = ("-v", f"{catalog}:{AGENT_CATALOG}:ro") if observation.hooks else ()
     docker("run", "-d", "--name", name, "--privileged", "--network=host", "--cgroupns=host", "--pid=host",
-           "-v", "/sys/kernel/tracing:/sys/kernel/tracing", "-v", "/var/run/docker/netns:/var/run/docker/netns",
+           *TRACING_MOUNTS, "-v", "/var/run/docker/netns:/var/run/docker/netns", *catalog_mounts,
            "-v", f"{sdk / 'ebpf' / 'fpebpf'}:/fpebpf:ro", "-v", f"{directory / AGENT_CONFIG}:/work/config.json:ro",
            "-v", f"{rules}:/work/rules.json:ro", "-e", "FAULTPOINT_CONFIG=/work/config.json",
            "-e", "FAULTPOINT_RULES=/work/rules.json", "-e", f"FAULTPOINT_REPORT={AGENT_REPORT}", AGENT_IMAGE, "/fpebpf")
     return name
+
+
+def scan_hooks(sdk: Path, catalog: Path) -> None:
+    """Write the kernel agent's hook catalog of the upstream images, once per build: every function, USDT probe and
+    kernel record of the files a fresh container of each image maps, with the build id of each file, which the agent
+    checks when it attaches a record in a later container."""
+    prefix = f"fp-scan-{sha256(str(catalog).encode()).hexdigest()[:12]}"
+    remove_containers(prefix)
+    try:
+        upstream = start_upstream(prefix, "", [])
+        config = catalog.with_name(f"{catalog.name}.scan.json")
+        services = {container.service: {"cgroups": [container.cgroup]}
+                    for container in (upstream.redis, upstream.postgres)}
+        config.write_text(json.dumps({"options": {"ebpf": {"services": services}}}))
+        name = f"{prefix}-scanner"
+        docker("run", "--name", name, "--privileged", "--pid=host", "--cgroupns=host", *TRACING_MOUNTS, *DEBUG_MOUNTS,
+               "-v", f"{sdk / 'ebpf' / 'fpebpf'}:/fpebpf:ro", "-v", f"{config}:/work/config.json:ro",
+               "-e", "FAULTPOINT_CONFIG=/work/config.json", AGENT_IMAGE, "/fpebpf", "scan", AGENT_CATALOG)
+        shutil.rmtree(catalog, ignore_errors=True)
+        docker("cp", f"{name}:{AGENT_CATALOG}", str(catalog))
+    finally:
+        remove_containers(prefix)
 
 
 def stop_agent(name: str, directory: Path) -> None:

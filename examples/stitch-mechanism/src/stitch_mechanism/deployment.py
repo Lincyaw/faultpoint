@@ -1,23 +1,21 @@
-import json
 import os
-import secrets
 import shutil
 import signal
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from string import ascii_lowercase
 from typing import Any, Final
 
 from pydantic import BaseModel, Field, JsonValue, PositiveInt
-from shop.deployment import (FLUSH_SECONDS, IDENTIFIER_SEGMENT, LOAD_DEADLINE_S, REDIS_KEY_IDENTIFIER, SCOPE_KEY,
-                             STATUSES_FILE, WORKLOAD_FILE, Service, Statuses, System, built_commit, isolated_repetition,
-                             run, sdk_commit, start, wait_for_host_route, wait_for_port, write_config)
-from shop.upstream import UPSTREAM_FILE, Upstream
+from shop.deployment import (FLUSH_SECONDS, IDENTIFIER_SEGMENT, INSTRUMENTATION_FILE, LOAD_DEADLINE_S,
+                             REDIS_KEY_IDENTIFIER, WORKLOAD_FILE, Instrumentation, Response, Service, Statuses, System,
+                             answered, built_commit, isolated_repetition, record_responses, run, sdk_commit,
+                             service_environment, start, tenant_request, wait_for_host_route, wait_for_port,
+                             write_config)
+from shop.upstream import UPSTREAM_FILE, Upstream, scan_hooks
 from shop.workload import FROZEN
 
 MECHANISM: Final = Path(__file__).resolve().parents[2]
@@ -25,6 +23,7 @@ SCENARIOS: Final = MECHANISM / "scenarios.json"
 RUNS: Final = MECHANISM.parent.parent / "runs" / "stitch-mechanism"
 BUILD: Final = RUNS / "build"
 MANIFESTS: Final = BUILD / "manifests"
+HOOKS: Final = BUILD / "hooks"
 BUILT_FROM: Final = BUILD / "sdk-commit"
 PORTS: Final = {"quote": 27280, "catalog": 27281}
 QUOTE_PLUGINS: Final = ["points", "import-hook", "httpx", "asgi"]
@@ -75,6 +74,7 @@ def build(sdk: Path) -> str:
     commit = sdk_commit(sdk)
     BUILD.mkdir(parents=True, exist_ok=True)
     run(["go", "build", "-o", "fpebpf", "."], sdk / "ebpf", {"CGO_ENABLED": "0"})
+    scan_hooks(sdk, HOOKS)
     run(["uv", "sync", "-q"], MECHANISM / "quote")
     # Python plugins are found through the faultpoint.plugins entry points, which only an installed package exposes.
     run(["uv", "pip", "install", "-q", "--python", str(MECHANISM / "quote" / ".venv"), "-e", str(sdk / "python")],
@@ -106,13 +106,13 @@ def services(sdk: Path, upstream: Upstream) -> list[Service]:
                 command=[str(MECHANISM / "quote" / ".venv" / "bin" / "uvicorn"), "quote:app", "--port",
                          str(PORTS["quote"]), "--log-level", "warning"],
                 directory=MECHANISM / "quote", config=quote_config(), environment={
-                    # The Python SDK attaches at start through the sitecustomize of its bootstrap directory; quote's
-                    # own directory lets a rule name an exception class of the quote module.
-                    "PYTHONPATH": os.pathsep.join([str(sdk / "python" / "src" / "faultpoint" / "bootstrap"),
-                                                   str(MECHANISM / "quote")]),
-                    "FAULTPOINT_SOURCE_ROOT": str(MECHANISM / "quote"),
                     "CATALOG_URL": f"http://127.0.0.1:{PORTS['catalog']}",
-                    "CATALOG_TIMEOUT_S": str(QUOTE_CATALOG_TIMEOUT_S)}),
+                    "CATALOG_TIMEOUT_S": str(QUOTE_CATALOG_TIMEOUT_S)},
+                # The Python SDK attaches at start through the sitecustomize of its bootstrap directory; quote's own
+                # directory lets a rule name an exception class of the quote module.
+                attachment={"PYTHONPATH": os.pathsep.join([str(sdk / "python" / "src" / "faultpoint" / "bootstrap"),
+                                                           str(MECHANISM / "quote")]),
+                            "FAULTPOINT_SOURCE_ROOT": str(MECHANISM / "quote")}),
         Service(name="catalog", port=PORTS["catalog"], command=[str(BUILD / "catalog-bin")], directory=BUILD,
                 config={"options": {"http": routes, "redis": {"key_identifier": REDIS_KEY_IDENTIFIER}}},
                 environment={"CATALOG_DATABASE": f"{upstream.database} pool_max_conns={CATALOG_POOL_SIZE}",
@@ -142,69 +142,56 @@ def cache_commands(workload: Workload) -> list[str]:
             for tenant in workload.tenant_names() for number in workload.cached_sku_numbers]
 
 
-def send_quote(tenant: str, sku: str, guaranteed: bool) -> int:
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{PORTS['quote']}/quotes", method="POST",
-        data=json.dumps({"tenant": tenant, "sku": sku, "guaranteed": guaranteed}).encode(),
-        headers={"content-type": "application/json", "baggage": f"{SCOPE_KEY}={tenant}",
-                 "traceparent": f"00-{secrets.token_hex(16)}-{secrets.token_hex(8)}-01"})
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.status
-    except urllib.error.HTTPError as refused:
-        return refused.code
-
-
-def load(workload: Workload) -> Statuses:
+def load(workload: Workload) -> list[Response]:
     """The same sequence of quotes in every repetition, the tenants interleaved and the workload's number of them in
-    flight at once; a quote due after LOAD_DEADLINE_S is not sent."""
+    flight at once, in the order they were sent; a quote due after LOAD_DEADLINE_S is not sent."""
     quotes = [(tenant, workload.skus(tenant)[index % len(workload.sku_numbers)])
               for index in range(workload.quotes_per_tenant) for tenant in workload.tenant_names()]
     started = time.monotonic()
 
-    def answered(quote: tuple[str, str]) -> tuple[str, int | None]:
+    def quoted(quote: tuple[str, str]) -> Response | None:
+        tenant, sku = quote
         if time.monotonic() - started > LOAD_DEADLINE_S:
-            return quote[0], None
-        return quote[0], send_quote(*quote, workload.guaranteed)
+            return None
+        return answered(tenant, tenant_request(f"http://127.0.0.1:{PORTS['quote']}/quotes", tenant,
+                                               {"tenant": tenant, "sku": sku, "guaranteed": workload.guaranteed}))
 
-    statuses: dict[str, dict[int, int]] = {tenant: {} for tenant in workload.tenant_names()}
     with ThreadPoolExecutor(workload.concurrency) as pool:
-        for tenant, status in pool.map(answered, quotes):
-            if status is not None:
-                statuses[tenant][status] = statuses[tenant].get(status, 0) + 1
-    return Statuses(tenants=statuses)
+        return [response for response in pool.map(quoted, quotes) if response is not None]
 
 
-def serve_and_load(directory: Path, sdk: Path) -> Statuses:
-    """Start quote and catalog on a repetition directory, send its workload's quotes and stop them, inside the
-    repetition's own network namespace."""
+def serve_and_load(directory: Path, sdk: Path) -> None:
+    """Start quote and catalog on a repetition directory, send its workload's quotes, stop them and keep the
+    responses, inside the repetition's own network namespace."""
     wait_for_host_route()
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     workload = Workload.model_validate_json((directory / WORKLOAD_FILE).read_text())
     upstream = Upstream.model_validate_json((directory / UPSTREAM_FILE).read_text())
+    instrumentation = Instrumentation.model_validate_json((directory / INSTRUMENTATION_FILE).read_text())
     mechanism = services(sdk, upstream)
     processes: list[subprocess.Popen[bytes]] = []
     try:
         for service in mechanism:
-            processes.append(start(directory, service))
+            processes.append(start(directory, service, service_environment(directory, service, instrumentation)))
         for service, process in zip(mechanism, processes, strict=True):
             wait_for_port(directory, service, process)
-        statuses = load(workload)
+        responses = load(workload)
         time.sleep(3 * FLUSH_SECONDS)
     finally:
         for process in processes:
             process.send_signal(signal.SIGTERM)
         for process in processes:
             process.wait(timeout=30)
-    return statuses
+    record_responses(directory, workload.tenant_names(), responses)
 
 
-def repetition(directory: Path, workload: dict[str, JsonValue], rules: dict[str, Any], sdk: Path) -> Statuses:
+def repetition(directory: Path, workload: dict[str, JsonValue], rules: dict[str, Any], sdk: Path,
+               instrumentation: Instrumentation) -> Statuses:
     """One run of quote and catalog under a rule set, with the prices and discount rules in PostgreSQL and the cached
     SKUs' prices in Redis."""
     mechanism = Workload.model_validate(workload)
-    return isolated_repetition(directory, mechanism, rules, sdk, price_sql(mechanism), cache_commands(mechanism),
-                               "stitch_mechanism.deployment")
+    return isolated_repetition(directory, mechanism, rules, sdk, instrumentation, price_sql(mechanism),
+                               cache_commands(mechanism), "stitch_mechanism.deployment", HOOKS)
 
 
 SYSTEM: Final = System(name="stitch-mechanism", scenarios=SCENARIOS, manifests=MANIFESTS, entry_service="quote",
@@ -212,5 +199,4 @@ SYSTEM: Final = System(name="stitch-mechanism", scenarios=SCENARIOS, manifests=M
 
 
 if __name__ == "__main__":
-    statuses = serve_and_load(Path(sys.argv[1]), Path(sys.argv[2]))
-    (Path(sys.argv[1]) / STATUSES_FILE).write_text(statuses.model_dump_json())
+    serve_and_load(Path(sys.argv[1]), Path(sys.argv[2]))

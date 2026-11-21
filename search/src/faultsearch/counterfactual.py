@@ -11,7 +11,7 @@ from faultpoint.rules import Rule, RuleSet
 from faultpoint.tools.analysis import Comparison, Effect, Metric, Selection, compare
 from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, Field, JsonValue
-from shop.deployment import REFUSAL_FILE, SCOPE_KEY, STATUSES_FILE, Statuses, System, refusal
+from shop.deployment import REFUSAL_FILE, SCOPE_KEY, STATUSES_FILE, Instrumentation, Statuses, System, refusal
 
 from faultsearch.catalog import FROZEN, Fault
 from faultsearch.store import CONTROLS, LEAKS, TREATMENTS, Store
@@ -72,6 +72,8 @@ class RunSettings(BaseModel):
     """Whether faults share repetitions in different tenants; off when upstream components are observed, since no
     tenant scope separates their observations."""
     system: str = "shop"
+    instrumentation: Instrumentation = Instrumentation()
+    """What of faultpoint runs and what the kernel agent observes, the same in every repetition."""
     """The system the experiment explores, by name."""
 
 
@@ -245,7 +247,8 @@ class Runner:
         label, workload, ruleset = job
         directory = self.store.repetition(label)
         try:
-            return self.system.repetition(directory, workload, ruleset.model_dump(mode="json"), self.settings.sdk)
+            return self.system.repetition(directory, workload, ruleset.model_dump(mode="json"), self.settings.sdk,
+                                          self.settings.instrumentation)
         except subprocess.CalledProcessError:
             reason = refusal(directory)
             if reason is None:
