@@ -257,7 +257,11 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 - **取反**：`check` 需要自然的返回值，所以在每条返回指令处翻转结果寄存器。
 - **条件**：可以按入口参数寄存器给出注入条件，例如只在“读查找”时注入，避免破坏组件自身的不变式。注入的值必须在函数真实可能的结果范围内：对 redis-server 写路径上的 `lookupKey` 克隆注入“未找到”，会触发 Redis 自身的断言（`db.c:188`）而使进程退出。
 - **符号**：按名字定位并在 id 中带上 build-id。导出符号在去符号的构建中通常仍在（例如 Redis 以 `-rdynamic` 链接），编译器生成的克隆却是局部符号，去符号后就找不到了。导出但从不被调用的函数（例如官方构建中的 `aofWrite`）交给“先观测、再注入”筛掉。
-- **配置是数据**：每个原生函数点在代理的配置中给出：文件路径、符号、类别（`call` `check`）、结果寄存器布局、哪种结果算失败、注入时写入的值、注入条件。编译器生成的克隆（`.constprop` `.isra` `.part` `.cold`）一并覆盖。
+- **配置是数据**：每个原生函数点在代理的配置中给出：文件路径、符号、类别（`call` `check`）、结果寄存器布局、哪种结果算失败、注入时写入的值、注入条件。
+  - **写入的值**：每个寄存器一个字，可以是常量，也可以是“符号地址加偏移处的字”，后者用于取得 Go 哨兵错误的接口值。
+  - **编译器生成的克隆**（`.constprop` `.isra` `.part` `.cold`）一律在返回处观测。每个克隆可以单独给出注入条件，可以无条件注入，也可以只观测。函数带注入条件时，每个有入口的克隆都必须明确列出，以免写路径上的克隆在不知情时被注入。
+  - **取值**：失败的整型结果记入 `detail.value`，指针结果不带细节。取反记为它产生的结果。
+  - **动作**：原生函数点只实现 `fail` `crash`（`call`）和 `negate` `crash`（`check`），不实现 `delay`。规则集加载时，代理拒绝其他动作和带范围的规则。
 - **身份**：`<service>:<kind>:<文件名>@<build-id 前 12 位>:<符号>`。
 - **范围**：与 `syscall` `packet` 一样，只按服务的 cgroup 限定，规则不能带 `scope`。
 - **隔离**：uprobe 挂在文件的 inode 上，共享镜像层中的同一个文件会让所有使用它的容器都陷入，过滤只能阻止注入，不能免去开销。因此目标文件要放在目标容器私有的层里。
@@ -300,7 +304,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 - **选项按插件名给出**：每个插件只读取自己名下的选项，缺省组件读取自己的名字（例如 `jsonl`）。一个选项键不对应任何插件或组件时，进程在启动时终止，并在消息中给出这个键。Python 只认配置中启用的插件，Go 认编译进构建的插件。
 - **启用哪些插件**：给出 `plugins` 时只启用列出的插件。不给出时，Python 启用缺省集合（`points` `import-hook` `httpx` `asgi` `dbapi`），Go 启用编译进构建的全部插件（改写器缺省编译 `points` `http` `sql`）。
 - **放置规则的键**：Go 另有 `call` 和 `errors`（错误登记）两个开关；Go 的读时钟名单使用完整的函数名，例如 `time.Now`。
-- **eBPF 代理的选项**在 `ebpf` 名下：`{"services": {"<服务>": {"cgroups": ["/sys/fs/cgroup/..."], "devices": [{"netns": "<网络命名空间路径，空表示代理自己的>", "name": "eth0", "transmits": "egress" 或 "ingress"}]}}, "syscalls": ["connect", ...]}`。代理不使用 `FAULTPOINT_SERVICE`，一个代理进程服务多个服务。
+- **eBPF 代理的选项**在 `ebpf` 名下：`{"services": {"<服务>": {"cgroups": ["/sys/fs/cgroup/..."], "devices": [{"netns": "<网络命名空间路径，空表示代理自己的>", "name": "eth0", "transmits": "egress" 或 "ingress"}]}}, "syscalls": ["connect", ...], "functions": [<原生函数点，见第 6.5 节>]}`。代理不使用 `FAULTPOINT_SERVICE`，一个代理进程服务多个服务。有原生函数点时，代理需要 `--pid=host`，以便通过 `/proc/<pid>/root` 打开容器内的文件。文件不在容器根目录所在的挂载上，或进程的根目录就是宿主机时，代理拒绝该文件，以免探针挂到宿主机的文件上。
 - 规则和观测都未配置时，接入插件不安装任何东西；已经放置的故障点只读一个全局标志就返回。
 - 延迟有两种语义。边界上的延迟表示对端变慢，异步代码中不阻塞事件循环。进程内的延迟表示资源竞争，会阻塞当前线程。
 - 核心终止进程的所有途径（无效或不适用的规则集、读不到规则文件、`crash` 动作、无效配置）都先写出观测，再按登记顺序运行进程登记的清理，最后退出。eBPF 代理用这个机制在退出前卸下程序、链接和它装上的 fq qdisc；被改写的服务不登记清理。
@@ -325,7 +329,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | 边界适配 | httpx、httpx2、ASGI（uvicorn）、DB-API（sqlite3）、psycopg（含连接池）、redis-py | `net/http`、gin、`database/sql`、pgx（含 pgxpool）、go-redis | HTTP 服务端（含 fastify）、`fetch`、`http.request`、pg、ioredis | Servlet、JDBC 语句实现（覆盖 JdbcTemplate 与 Hikari）、Spring 的 HTTP 客户端、JDK `HttpClient`、Lettuce | tower（axum）、sqlx 与 redis-rs 的调用点 | `syscall`、`packet` |
 | 消息边界 | Redis Streams（经 redis-py） | Redis Streams（经 go-redis） | Redis Streams（经 ioredis） | Redis Streams（经 Lettuce） | Redis Streams（经 redis-rs） | — |
 | 依赖库中的故障点（第 6.4 节） | 已实现，只改写纯 Python 模块；`faultpoint candidates` 列出执行过的候选 | 已实现，模块副本加 `replace` | 已实现 | 已实现 | 已实现，crate 副本加 `[patch]` | — |
-| 原生函数中的故障点（第 6.5 节） | — | — | — | — | — | 只有可行性试验，尚未进入代理 |
+| 原生函数中的故障点（第 6.5 节） | — | — | — | — | — | 已实现：`call`（`fail` `crash`）、`check`（`negate` `crash`），仅 x86-64，内核 6.18 及以上 |
 | 接入 | 导入钩子 | 构建副本，自动装配边界 | `--import` 加载钩子 | `-javaagent` | 构建副本 | 特权进程 |
 | 未覆盖 | 非 uvicorn 运行的 ASGI 应用 | 依赖内部创建的服务端和客户端；pgx 的 `CopyFrom` `Commit` `Rollback` | 直接使用 undici | WebClient、Feign、Apache HttpClient、OkHttp | reqwest、`query!` 宏、类型化的 Redis 命令方法 | 自然丢包、32 位兼容系统调用、IPv6（未验证） |
 | 只重放置候选故障点（第 6.4 节第 3 步） | 未实现 | 未实现 | 未实现 | 未实现 | 未实现 | — |
