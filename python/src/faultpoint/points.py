@@ -7,6 +7,7 @@ from typing import Any, Final
 
 import faultpoint.runtime
 from faultpoint.actions import Crash, Delay, Fail, Negate, RaiseFail, SetValue, Shift
+from faultpoint.observations import DetailKey, error_type
 from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
 
 INJECTED_MESSAGE: Final = ""
@@ -85,12 +86,19 @@ class CallSite:
         self.decision = decide_in_process(self.runtime, self.point)
         match self.decision:
             case Decision(action=RaiseFail(error=error)):
-                self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision)
-                raise (self.candidates()[0] if error is None else error)(INJECTED_MESSAGE)
+                raised = self.candidates()[0] if error is None else error
+                self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision,
+                                     {DetailKey.ERROR: error_type(raised)})
+                raise raised(INJECTED_MESSAGE)
 
     def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
                  trace: TracebackType | None) -> None:
-        self.runtime.observe(self.point, PointOutcome.OK if kind is None else PointOutcome.ERROR, 0.0, self.decision)
+        match kind:
+            case None:
+                self.runtime.observe(self.point, PointOutcome.OK, 0.0, self.decision)
+            case _:
+                self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision,
+                                     {DetailKey.ERROR: error_type(kind)})
 
 
 def call(point: str, candidates: Callable[[], tuple[type[BaseException], ...]]) -> CallSite:

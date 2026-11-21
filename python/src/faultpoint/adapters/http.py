@@ -11,6 +11,7 @@ import wrapt
 from pydantic import BaseModel, JsonValue
 
 from faultpoint.actions import BoundaryError, BoundaryFail, Crash, Delay, Duplicate, FailAfter, Failure
+from faultpoint.observations import DetailKey, error_type, flag
 from faultpoint.rules import STRICT, point_id
 from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
 
@@ -18,6 +19,8 @@ HTTPX_MODULE: Final = "httpx"
 HTTPX2_MODULE: Final = "httpx2"
 UVICORN_MODULE: Final = "uvicorn"
 DEFAULT_FAILURE_STATUS: Final = 503
+RESPONSE_START: Final = "http.response.start"
+HTTP_DISCONNECT: Final = "http.disconnect"
 IDENTIFIER_SEGMENT: Final = re.compile(
     r"^(\d+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,})$")
 
@@ -65,9 +68,57 @@ async def discard(message: Message) -> None:
 
 
 async def send_failure(send: Send, status: int | None) -> None:
-    await send({"type": "http.response.start", "status": status or DEFAULT_FAILURE_STATUS,
+    await send({"type": RESPONSE_START, "status": status or DEFAULT_FAILURE_STATUS,
                 "headers": [(b"content-length", b"0")]})
     await send({"type": "http.response.body", "body": b""})
+
+
+async def ready_message(receive: Receive) -> Message | None:
+    """The message a receive answers at once, without waiting for the client: a disconnect, or request body."""
+    pending = asyncio.ensure_future(receive())
+    done, _ = await asyncio.wait({pending}, timeout=0)
+    pending.cancel()
+    return pending.result() if pending in done else None
+
+
+class ServerExchange:
+    """One request's exchange with its client: the response status, and whether the client left before the
+    response was sent, which a disconnect the application receives, a probe before the response, or a failed
+    send tells; body the probe takes is handed to the application's next receive."""
+
+    def __init__(self, receive: Receive, send: Send) -> None:
+        self.inner_receive = receive
+        self.inner_send = send
+        self.status: int | None = None
+        self.held: list[Message] = []
+        self.abandoned = False
+
+    async def receive(self) -> Message:
+        message = self.held.pop() if self.held else await self.inner_receive()
+        self.abandoned = self.abandoned or message["type"] == HTTP_DISCONNECT
+        return message
+
+    async def probe(self) -> None:
+        """Look, before the response, whether the client left; request body the look takes is held."""
+        ready = None if self.abandoned else await ready_message(self.inner_receive)
+        if ready is not None and ready["type"] == HTTP_DISCONNECT:
+            self.abandoned = True
+        elif ready is not None:
+            self.held.append(ready)
+
+    async def send(self, message: Message) -> None:
+        if message["type"] == RESPONSE_START:
+            self.status = message["status"]
+            await self.probe()
+        try:
+            await self.inner_send(message)
+        except OSError:
+            self.abandoned = True
+            raise
+
+    def detail(self) -> dict[str, str]:
+        status = {} if self.status is None else {DetailKey.STATUS: str(self.status)}
+        return {**status, DetailKey.ABANDONED: flag(self.abandoned)}
 
 
 class ServerPoint:
@@ -90,21 +141,16 @@ class ServerPoint:
         point = point_id(self.runtime.settings.service, RpcKind.SERVER,
                          f"{scope['method']} {path_template(scope['path'], self.options.identifier_segment)}")
         decision = self.runtime.decide(point)
-        statuses: list[int] = []
-
-        async def capture(message: Message) -> None:
-            if message["type"] == "http.response.start":
-                statuses.append(message["status"])
-            await send(message)
-
+        exchange = ServerExchange(receive, send)
         started = time.monotonic()
         try:
-            await self.respond(scope, receive, capture, decision)
-        except BaseException:
-            self.runtime.observe(point, RpcOutcome.ERROR, elapsed_ms(started), decision)
+            await self.respond(scope, exchange.receive, exchange.send, decision)
+        except BaseException as error:
+            self.runtime.observe(point, RpcOutcome.ERROR, elapsed_ms(started), decision,
+                                 {**exchange.detail(), DetailKey.ERROR: error_type(error)})
             raise
-        self.runtime.observe(point, status_outcome(statuses[0]) if statuses else RpcOutcome.ERROR,
-                             elapsed_ms(started), decision)
+        self.runtime.observe(point, RpcOutcome.ERROR if exchange.status is None else status_outcome(exchange.status),
+                             elapsed_ms(started), decision, exchange.detail())
 
     async def respond(self, scope: Scope, receive: Receive, send: Send, decision: Decision | None) -> None:
         match decision:
@@ -169,6 +215,25 @@ class ClientPoint:
             raise self.library.ReadTimeout("timed out", request=request)
         return self.library.Response(failure.status, request=request)
 
+    def sent(self, decision: Decision | None, error: Exception | None) -> dict[str, str]:
+        """Whether the request was fully sent: never for an injected fail, always for a fail_after, and for a
+        natural failure when it happened while the response was read."""
+        match decision:
+            case Decision(action=BoundaryFail()):
+                return {DetailKey.SENT: flag(False)}
+            case Decision(action=FailAfter()):
+                return {DetailKey.SENT: flag(True)}
+        reading = (self.library.ReadError, self.library.ReadTimeout, self.library.RemoteProtocolError)
+        return {} if error is None else {DetailKey.SENT: flag(isinstance(error, reading))}
+
+    def observe(self, point: str, started: float, decision: Decision | None, response: Any) -> None:
+        self.runtime.observe(point, status_outcome(response.status_code), elapsed_ms(started), decision,
+                             {DetailKey.STATUS: str(response.status_code), **self.sent(decision, None)})
+
+    def observe_error(self, point: str, started: float, decision: Decision | None, error: Exception) -> None:
+        self.runtime.observe(point, self.error_outcome(error), elapsed_ms(started), decision,
+                             {DetailKey.ERROR: error_type(error), **self.sent(decision, error)})
+
     def handle(self, send: Callable[..., Any], transport: Any, args: tuple[Any, ...],
                kwargs: dict[str, Any]) -> Any:
         (request,) = args
@@ -177,9 +242,9 @@ class ClientPoint:
         try:
             response = self.exchange(send, request, decision)
         except Exception as error:
-            self.runtime.observe(point, self.error_outcome(error), elapsed_ms(started), decision)
+            self.observe_error(point, started, decision, error)
             raise
-        self.runtime.observe(point, status_outcome(response.status_code), elapsed_ms(started), decision)
+        self.observe(point, started, decision, response)
         return response
 
     def exchange(self, send: Callable[[Any], Any], request: Any, decision: Decision | None) -> Any:
@@ -208,9 +273,9 @@ class ClientPoint:
         try:
             response = await self.exchange_async(send, request, decision)
         except Exception as error:
-            self.runtime.observe(point, self.error_outcome(error), elapsed_ms(started), decision)
+            self.observe_error(point, started, decision, error)
             raise
-        self.runtime.observe(point, status_outcome(response.status_code), elapsed_ms(started), decision)
+        self.observe(point, started, decision, response)
         return response
 
     async def exchange_async(self, send: Callable[[Any], Awaitable[Any]], request: Any,

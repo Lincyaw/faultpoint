@@ -15,6 +15,7 @@ from sqlglot.errors import ErrorLevel
 
 from faultpoint.actions import BoundaryError, BoundaryFail, Crash, Delay, Drop, Duplicate, Empty, FailAfter, Failure
 from faultpoint.adapters.store import StoreKind, StoreOutcome
+from faultpoint.observations import DetailKey, error_type
 from faultpoint.rules import point_id
 from faultpoint.runtime import Decision, Runtime
 
@@ -22,6 +23,7 @@ SQLGLOT_LOGGER: Final = "sqlglot"
 STATEMENT_CACHE_SIZE: Final = 4096
 DIGEST_LENGTH: Final = 8
 CLASSIFYING: Final = contextvars.ContextVar("faultpoint_classifying", default=False)
+ERROR_CODE_ATTRIBUTES: Final = ("sqlstate", "sqlite_errorname")
 
 
 class ClassificationFilter(logging.Filter):
@@ -36,6 +38,13 @@ CLASSIFICATION_FILTER: Final = ClassificationFilter()
 
 def quiet_classification() -> None:
     logging.getLogger(SQLGLOT_LOGGER).addFilter(CLASSIFICATION_FILTER)
+
+
+def error_detail(error: Exception) -> dict[str, str]:
+    """The error type, and the code the database returned with it: psycopg's SQLSTATE or sqlite3's error name,
+    since DB-API names no common attribute."""
+    codes = [code for name in ERROR_CODE_ATTRIBUTES if isinstance(code := getattr(error, name, None), str)]
+    return {DetailKey.ERROR: error_type(error), **({DetailKey.CODE: codes[0]} if codes else {})}
 
 
 @functools.lru_cache(maxsize=STATEMENT_CACHE_SIZE)
@@ -128,8 +137,8 @@ class Store:
         kind, point, decision = self.decide(statement, sql)
         try:
             result = self.perform(execute, decision)
-        except Exception:
-            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision)
+        except Exception as error:
+            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, error_detail(error))
             raise
         self.finish(statement, kind, point, decision, cursor)
         return result
@@ -158,8 +167,8 @@ class Store:
         kind, point, decision = self.decide(statement, sql)
         try:
             result = await self.perform_async(execute, decision)
-        except Exception:
-            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision)
+        except Exception as error:
+            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, error_detail(error))
             raise
         self.finish(statement, kind, point, decision, cursor)
         return result

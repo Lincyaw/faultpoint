@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from faultpoint.config import Config, Settings
 from faultpoint.context import ContextProvider, OtelContext
-from faultpoint.observations import (JSONL_OPTIONS, JsonlOptions, JsonlSink, Observation,
+from faultpoint.observations import (JSONL_OPTIONS, NO_DETAIL, JsonlOptions, JsonlSink, Observation,
                                      ObservationSink)
 from faultpoint.rules import FileRuleSource, Rule, RuleSet, RuleSource
 
@@ -108,13 +108,14 @@ class Runtime:
                             for key, value in decision.rule.scope.items())
                      and rules.fires(decision.rule)), None)
 
-    def observe(self, point: str, outcome: str, quantity: float, decision: Decision | None) -> None:
+    def observe(self, point: str, outcome: str, quantity: float, decision: Decision | None,
+                detail: Mapping[str, str] = NO_DETAIL) -> None:
         if self.sink is not None:
             self.sink.add(Observation(
                 experiment=self.rules.experiment, point=point, outcome=outcome,
                 scope=self.context.baggage(self.settings.scope_key) or "",
                 rule=None if decision is None else decision.rule.id, quantity=quantity,
-                trace_id=self.context.trace_id()))
+                trace_id=self.context.trace_id(), detail=dict(detail)))
 
     def crash(self, code: int) -> NoReturn:
         if self.sink is not None:

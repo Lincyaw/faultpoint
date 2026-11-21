@@ -2,8 +2,10 @@ import os
 import socket
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final, Protocol
 
 from pydantic import BaseModel, Field
@@ -13,6 +15,31 @@ from faultpoint.rules import STRICT
 JSONL_OPTIONS: Final = "jsonl"
 SAMPLED_DIGITS: Final = 8
 SAMPLING_BUCKETS: Final = 10_000
+NO_DETAIL: Final[Mapping[str, str]] = MappingProxyType({})
+
+type DetailItems = tuple[tuple[str, str], ...]
+
+
+class DetailKey(StrEnum):
+    """The keys of an observation's detail; spec/kinds.json lists those of each kind. Values stay bounded: no
+    messages, identifiers or times."""
+
+    STATUS = "status"
+    ERROR = "error"
+    SENT = "sent"
+    ABANDONED = "abandoned"
+    CODE = "code"
+    VALUE = "value"
+
+
+def error_type(error: BaseException | type[BaseException]) -> str:
+    """The qualified class name of an exception, the error of a detail."""
+    kind = error if isinstance(error, type) else type(error)
+    return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def flag(value: bool) -> str:
+    return "true" if value else "false"
 
 
 class Observation(BaseModel):
@@ -27,6 +54,7 @@ class Observation(BaseModel):
     rule: str | None
     quantity: float
     trace_id: str | None
+    detail: dict[str, str] = Field(default_factory=dict)
 
 
 class ObservationRecord(BaseModel):
@@ -50,6 +78,9 @@ class ObservationRecord(BaseModel):
     """The summed quantity of the executions, such as latency in milliseconds or rows."""
     exemplars: tuple[str, ...] = ()
     """Trace ids of some of the executions."""
+    detail: dict[str, str] = Field(default_factory=dict)
+    """What else the executions had in common beyond their outcome, by the keys the kind lists, such as the exact
+    status or the error type."""
 
 
 class ObservationSink(Protocol):
@@ -90,12 +121,12 @@ class JsonlSink:
         self.interval = options.flush_seconds
         self.options = options
         self.lock = threading.Lock()
-        self.tally: dict[tuple[str, str, str, str, str | None], TallyEntry] = {}
+        self.tally: dict[tuple[str, str, str, str, str | None, DetailItems], TallyEntry] = {}
         self.window_start = time.time()
 
     def add(self, observation: Observation) -> None:
         key = (observation.experiment, observation.point, observation.outcome, observation.scope,
-               observation.rule)
+               observation.rule, tuple(sorted(observation.detail.items())))
         with self.lock:
             entry = self.tally.setdefault(key, TallyEntry())
             entry.count += 1
@@ -110,8 +141,8 @@ class JsonlSink:
             records = [ObservationRecord(
                 experiment=experiment, service=self.service, process=self.process,
                 start=self.window_start, end=end, point=point, outcome=outcome, scope=scope,
-                rule=rule, count=entry.count, total=entry.total, exemplars=tuple(entry.exemplars))
-                for (experiment, point, outcome, scope, rule), entry in self.tally.items()]
+                rule=rule, count=entry.count, total=entry.total, exemplars=tuple(entry.exemplars),
+                detail=dict(detail)) for (experiment, point, outcome, scope, rule, detail), entry in self.tally.items()]
             self.tally = {}
             self.window_start = end
             lines = "".join(record.model_dump_json() + "\n" for record in records)

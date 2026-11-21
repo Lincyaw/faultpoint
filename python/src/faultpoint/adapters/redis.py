@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints
 from faultpoint.actions import BoundaryError, BoundaryFail, Crash, Delay, Drop, Duplicate, Empty, FailAfter, Failure
 from faultpoint.adapters.store import (CONSUME_ACTIONS, READ_ACTIONS, WRITE_ACTIONS, MessageKind, StoreKind,
                                        StoreOutcome)
+from faultpoint.observations import DetailKey, error_type
 from faultpoint.rules import point_id
 from faultpoint.runtime import Decision, Plugin, Runtime
 
@@ -26,6 +27,7 @@ KEY_POSITION: Final = r"^(after:\S+|numkeys:\d+)$"
 AFTER: Final = "after"
 STREAMS_KEY: Final = "after:STREAMS"
 CONTAINERS: Final = (list, tuple, dict, set)
+ERROR_CODE: Final = re.compile(r"^[A-Z][A-Z0-9_]*(?= )")
 
 type Queued = tuple[tuple[Any, ...], dict[str, Any]]
 
@@ -220,6 +222,18 @@ class CommandPoints:
             return self.exceptions.ConnectionError("Connection refused.")
         return self.exceptions.TimeoutError("Timeout reading from socket")
 
+    def error_detail(self, error: BaseException) -> dict[str, str]:
+        """The error type, and the code of an error reply: the prefix redis-py parsed off, or else the leading
+        word of a reply it kept whole."""
+        match error:
+            case self.exceptions.RedisError(status_code=str() as code):
+                codes = [code]
+            case self.exceptions.ResponseError():
+                codes = ERROR_CODE.findall(str(error))
+            case _:
+                codes = []
+        return {DetailKey.ERROR: error_type(error), **({DetailKey.CODE: codes[0]} if codes else {})}
+
     def prepare(self, decisions: list[Decided | None]) -> float:
         """Crash or fail before anything is sent, and the seconds to wait before sending."""
         for decided in decisions:
@@ -227,14 +241,17 @@ class CommandPoints:
                 case Decided(action=Crash(code=code)):
                     self.runtime.crash(code)
                 case Decided(action=BoundaryFail() as failure):
-                    self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decided.decision)
-                    raise self.failure(failure)
+                    raised = self.failure(failure)
+                    self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decided.decision,
+                                         self.error_detail(raised))
+                    raise raised
         return delay_seconds(decisions)
 
-    def failed(self, decisions: list[Decided | None]) -> None:
+    def failed(self, decisions: list[Decided | None], error: Exception) -> None:
         for decided in decisions:
             if decided is not None:
-                self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decided.decision)
+                self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, decided.decision,
+                                     self.error_detail(error))
 
     def settle(self, client: Any, queue: list[Queued], decisions: list[Decided | None],
                replies: list[Any]) -> list[Any]:
@@ -267,10 +284,16 @@ class CommandPoints:
     def observe_reply(self, decided: Decided, reply: Any) -> None:
         """A read or a consume is empty or not; a consume's quantity is the messages it delivered."""
         command, point, decision = decided.command, decided.point, decided.decision
-        failed = isinstance(reply, Exception) or isinstance(decided.action, FailAfter)
+        match decided.action, reply:
+            case FailAfter() as failure, _:
+                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, self.error_detail(self.failure(failure)))
+            case _, Exception():
+                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision, self.error_detail(reply))
+            case _:
+                self.observe_result(command, point, reply, decision)
+
+    def observe_result(self, command: Command, point: str, reply: Any, decision: Decision | None) -> None:
         match command.kind:
-            case _ if failed:
-                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, decision)
             case StoreKind.READ:
                 self.runtime.observe(point, StoreOutcome.EMPTY if is_empty(reply, command.empty)
                                      else StoreOutcome.ROWS, 0.0, decision)
@@ -288,8 +311,8 @@ class CommandPoints:
             time.sleep(delay)
         try:
             replies = [execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
-        except Exception:
-            self.failed(decisions)
+        except Exception as error:
+            self.failed(decisions, error)
             raise
         return self.settle(client, [(args, kwargs)], decisions, replies)[0]
 
@@ -304,8 +327,8 @@ class CommandPoints:
                                      for _ in range(copies(decided))]
         try:
             replies = execute(*args, **kwargs)
-        except Exception:
-            self.failed(decisions)
+        except Exception as error:
+            self.failed(decisions, error)
             raise
         return self.settle(pipeline, stack, decisions, replies)
 
@@ -317,8 +340,8 @@ class CommandPoints:
             await asyncio.sleep(delay)
         try:
             replies = [await execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
-        except Exception:
-            self.failed(decisions)
+        except Exception as error:
+            self.failed(decisions, error)
             raise
         return self.settle(client, [(args, kwargs)], decisions, replies)[0]
 
@@ -333,8 +356,8 @@ class CommandPoints:
                                      for _ in range(copies(decided))]
         try:
             replies = await execute(*args, **kwargs)
-        except Exception:
-            self.failed(decisions)
+        except Exception as error:
+            self.failed(decisions, error)
             raise
         return self.settle(pipeline, stack, decisions, replies)
 

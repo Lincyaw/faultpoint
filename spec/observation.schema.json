@@ -61,6 +61,13 @@
       },
       "title": "Exemplars",
       "type": "array"
+    },
+    "detail": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Detail",
+      "type": "object"
     }
   },
   "required": [
