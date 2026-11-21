@@ -162,8 +162,8 @@ func (i interceptor) exec(ctx context.Context, query string, run func() (driver.
 type queryKey struct{}
 
 // query is a statement whose rows are being read, whose outcome is observed when its rows are closed; ended is
-// whether reading them reached their end or an error, err is the error a fail_after rule gave, and started is when
-// the statement entered its point.
+// whether reading them reached their end or an error, err is the error that ended them, the statement's own or a
+// fail_after rule's, and started is when the statement entered its point.
 type query struct {
 	point   string
 	rule    *faultpoint.Rule
@@ -185,7 +185,7 @@ func (q *query) advance(ctx context.Context, err error, coded func(code string) 
 		q.ended = true
 		err = cmp.Or(q.failAfter(ctx, coded), err)
 	default:
-		q.ended = true
+		q.ended, q.err = true, err
 	}
 	return err
 }
