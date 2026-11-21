@@ -93,9 +93,14 @@ func serve(c *gin.Context) {
 		return
 	}
 	c.Request = call.Request
-	if call.Action() == "fail" {
+	switch {
+	case call.Ended != nil:
+		c.Abort()
+		call.Failed(call.Ended)
+	case call.Action() == "fail":
 		c.AbortWithStatus(call.FailureStatus())
-	} else {
+		call.Finish(c.Writer.Status())
+	default:
 		writer := c.Writer
 		answered := &answer{ResponseWriter: writer, call: call}
 		c.Writer = answered
@@ -104,8 +109,8 @@ func serve(c *gin.Context) {
 		// here without writing it.
 		answered.settle()
 		c.Writer = writer
+		call.Finish(c.Writer.Status())
 	}
-	call.Finish(c.Writer.Status())
 }
 
 // handle runs the handlers after the middleware for a request the server point took, observing a panic of them,
@@ -113,7 +118,7 @@ func serve(c *gin.Context) {
 func handle(call *fphttp.ServerCall, c *gin.Context) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			call.Panicked(recovered)
+			call.Failed(recovered)
 			panic(recovered)
 		}
 	}()

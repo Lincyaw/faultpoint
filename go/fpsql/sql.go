@@ -105,31 +105,33 @@ func DriverName(name string) string {
 	return instrumented
 }
 
-// begin decides the rule of a statement's point that acts before it runs and performs its delay or crash.
-func begin(ctx context.Context, query string) (string, *faultpoint.Rule, string) {
+// begin decides the rule of a statement's point that acts before it runs and performs its wait or crash; besides the
+// point, the rule and its action, it returns the error the statement gets without being sent: the context's when
+// the caller gave up during the wait, a fail rule's, or nil.
+func (i interceptor) begin(ctx context.Context, query string) (string, *faultpoint.Rule, string, error) {
 	defer faultpoint.Guard()
 	known := classifier.Classify(query)
 	point := faultpoint.PointID(faultpoint.Service(), known.Kind, known.Locator)
 	rule := faultpoint.Decide(ctx, point, action.Before...)
 	if rule == nil {
-		return point, nil, ""
+		return point, nil, "", nil
 	}
-	action.Hold(rule)
-	return point, rule, rule.Action.Kind
+	ended := action.Wait(ctx, rule)
+	if ended == nil && rule.Action.Kind == "fail" {
+		ended = action.Failure(rule, i.coded)
+	}
+	return point, rule, rule.Action.Kind, ended
 }
 
 func (i interceptor) exec(ctx context.Context, query string, run func() (driver.Result, error)) (driver.Result, error) {
 	defer faultpoint.Guard()
 	started := time.Now()
-	point, rule, kind := begin(ctx, query)
+	point, rule, kind, err := i.begin(ctx, query)
 	var result driver.Result
-	var err error
-	switch kind {
-	case "fail":
-		err = action.Failure(rule, i.coded)
-	case "drop":
+	switch {
+	case err == nil && kind == "drop":
 		result = driver.RowsAffected(1)
-	default:
+	case err == nil:
 		faultpoint.Outside(func() { result, err = run() })
 	}
 	if err == nil && kind == "duplicate" {
@@ -203,12 +205,9 @@ func (q *query) failAfter(ctx context.Context, coded func(code string) error) er
 func (i interceptor) read(ctx context.Context, sql string, run func() (driver.Rows, error)) (context.Context, driver.Rows, error) {
 	defer faultpoint.Guard()
 	started := time.Now()
-	point, rule, kind := begin(ctx, sql)
+	point, rule, kind, err := i.begin(ctx, sql)
 	var rows driver.Rows
-	var err error
-	if kind == "fail" {
-		err = action.Failure(rule, i.coded)
-	} else {
+	if err == nil {
 		faultpoint.Outside(func() { rows, err = run() })
 	}
 	if err != nil {

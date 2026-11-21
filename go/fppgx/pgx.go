@@ -61,9 +61,11 @@ type statement struct {
 	rule    *faultpoint.Rule
 	action  string
 	started time.Time
+	// ended is the context's error when the caller gave up during the rule's wait.
+	ended error
 }
 
-// decide classifies a statement, decides its rule that acts before it runs and performs the rule's delay or crash.
+// decide classifies a statement, decides its rule that acts before it runs and performs the rule's wait or crash.
 func decide(ctx context.Context, query string) statement {
 	defer faultpoint.Guard()
 	started := time.Now()
@@ -72,10 +74,23 @@ func decide(ctx context.Context, query string) statement {
 		point: faultpoint.PointID(faultpoint.Service(), known.Kind, known.Locator), started: started}
 	s.rule = faultpoint.Decide(ctx, s.point, action.Before...)
 	if s.rule != nil {
-		action.Hold(s.rule)
+		s.ended = action.Wait(ctx, s.rule)
 		s.action = s.rule.Action.Kind
 	}
 	return s
+}
+
+// failure is the error a statement gets without being sent: the context's when the caller gave up during the
+// rule's wait, a fail rule's, or nil when it is sent.
+func (s *statement) failure() error {
+	defer faultpoint.Guard()
+	switch {
+	case s.ended != nil:
+		return s.ended
+	case s.action == "fail":
+		return action.Failure(s.rule, postgresError)
+	}
+	return nil
 }
 
 // failAfter decides, once the statement completed normally and no rule acted on it before, whether a fail_after
@@ -137,13 +152,11 @@ func Exec(db execer, ctx context.Context, sql string, arguments ...any) (pgconn.
 		return tag, err
 	}
 	var tag pgconn.CommandTag
-	var err error
-	switch s.action {
-	case "fail":
-		err = action.Failure(s.rule, postgresError)
-	case "drop":
+	err := s.failure()
+	switch {
+	case err == nil && s.action == "drop":
 		tag = pgconn.NewCommandTag(s.command + " 1")
-	default:
+	case err == nil:
 		tag, err = run()
 	}
 	if err == nil && s.action == "duplicate" {
@@ -174,8 +187,7 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 	defer faultpoint.Guard()
 	s := decide(ctx, sql)
 	s.refuse("Query", "drop")
-	if s.action == "fail" {
-		err := action.Failure(s.rule, postgresError)
+	if err := s.failure(); err != nil {
 		s.observe(0, err)
 		return failedRows{err: err}, err
 	}
@@ -273,18 +285,20 @@ func QueryRow(db rowQuerier, ctx context.Context, sql string, arguments ...any) 
 	defer faultpoint.Guard()
 	s := decide(ctx, sql)
 	s.refuse("QueryRow", "drop")
-	row := &observedRow{statement: s, query: func() (row pgx.Row) {
+	row := &observedRow{statement: s, failure: s.failure(), query: func() (row pgx.Row) {
 		faultpoint.Outside(func() { row = db.QueryRow(s.inner, sql, arguments...) })
 		return row
 	}}
-	if s.action != "fail" {
+	if row.failure == nil {
 		row.row = row.query()
 	}
 	return row
 }
 
+// observedRow is the row of a statement, failure the error it gets without being sent.
 type observedRow struct {
 	statement statement
+	failure   error
 	query     func() pgx.Row
 	row       pgx.Row
 }
@@ -293,8 +307,8 @@ type observedRow struct {
 func (r *observedRow) Scan(dest ...any) (err error) {
 	defer faultpoint.Guard()
 	s := r.statement
-	if s.action == "fail" {
-		err = action.Failure(s.rule, postgresError)
+	if r.failure != nil {
+		err = r.failure
 	} else {
 		faultpoint.Outside(func() { err = r.row.Scan(dest...) })
 	}
@@ -335,11 +349,9 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 	}
 	s := decide(ctx, strings.Join(queries, ";\n"))
 	s.refuse("SendBatch", "drop", "empty")
-	var err error
 	var results pgx.BatchResults
-	if s.action == "fail" {
-		err = action.Failure(s.rule, postgresError)
-	} else {
+	err := s.failure()
+	if err == nil {
 		faultpoint.Outside(func() { results = db.SendBatch(s.inner, batch) })
 	}
 	if err == nil && s.action == "duplicate" {
@@ -408,9 +420,8 @@ func begin(ctx context.Context, run func(context.Context) (pgx.Tx, error)) (tx p
 	defer faultpoint.Guard()
 	s := decide(ctx, "BEGIN")
 	s.refuse("Begin", "drop", "duplicate")
-	if s.action == "fail" {
-		err = action.Failure(s.rule, postgresError)
-	} else {
+	err = s.failure()
+	if err == nil {
 		faultpoint.Outside(func() { tx, err = run(s.inner) })
 	}
 	if err == nil && s.failAfter() != nil {

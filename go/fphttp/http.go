@@ -67,17 +67,19 @@ func statusOutcome(status int) string { return strconv.Itoa(status/100) + "xx" }
 
 type takenKey struct{}
 
-// ServerCall is one request a server point took, with the rule decided for it; a framework adapter such as the gin
-// plugin uses it for the requests its framework serves.
+// ServerCall is one request a server point took, with the rule decided for it, and Ended, the context's error when
+// the client gave up during the rule's wait, which ends the request before its handler; a framework adapter such as
+// the gin plugin uses it for the requests its framework serves.
 type ServerCall struct {
 	Request *http.Request
 	Rule    *faultpoint.Rule
+	Ended   error
 	point   string
 	started time.Time
 }
 
 // Take takes a request at its rpc_server point: it restores the caller's trace and baggage, decides the rule that
-// acts before the handler runs and performs its delay or crash. It returns nil when a server point around this one
+// acts before the handler runs and performs its wait or crash. It returns nil when a server point around this one
 // already took the request, as when a wrapped http.Server serves an instrumented framework, so that a request is
 // one execution of one point.
 func Take(request *http.Request) *ServerCall {
@@ -90,7 +92,7 @@ func Take(request *http.Request) *ServerCall {
 		point: faultpoint.PointID(faultpoint.Service(), "rpc_server", request.Method+" "+pathTemplate(request.URL.Path))}
 	call.Rule = faultpoint.Decide(ctx, call.point, action.Before...)
 	if call.Rule != nil {
-		action.Hold(call.Rule)
+		call.Ended = action.Wait(ctx, call.Rule)
 	}
 	return call
 }
@@ -126,7 +128,7 @@ func (c *ServerCall) FailureStatus() int {
 	defer faultpoint.Guard()
 	params := struct {
 		Status int `json:"status"`
-		// MS is the wait before a fail, which action.Hold has already waited.
+		// MS is the wait before a fail, which Take has already waited.
 		MS int `json:"ms"`
 	}{Status: defaultFailureStatus}
 	c.Rule.DecodeParams(&params)
@@ -146,11 +148,12 @@ func (c *ServerCall) Finish(status int) {
 		map[string]string{"status": strconv.Itoa(status), "abandoned": c.abandoned()})
 }
 
-// Panicked observes a request whose handler panicked with a value, named by its type or its registered name.
-func (c *ServerCall) Panicked(recovered any) {
+// Failed observes a request that ended without an answer: its handler panicked with a value, or its client gave up
+// during the rule's wait with the context's error; the cause is named by its type or its registered name.
+func (c *ServerCall) Failed(cause any) {
 	defer faultpoint.Guard()
-	name := fmt.Sprintf("%T", recovered)
-	if err, isError := recovered.(error); isError {
+	name := fmt.Sprintf("%T", cause)
+	if err, isError := cause.(error); isError {
 		name = faultpoint.ErrorName(err)
 	}
 	elapsed := faultpoint.Elapsed(c.started)
@@ -290,27 +293,29 @@ func (s server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		faultpoint.Outside(func() { next.ServeHTTP(writer, request) })
 		return
 	}
-	var status int
-	if call.Action() == "fail" {
-		status = call.FailureStatus()
+	switch {
+	case call.Ended != nil:
+		call.Failed(call.Ended)
+	case call.Action() == "fail":
+		status := call.FailureStatus()
 		writer.WriteHeader(status)
-	} else {
+		call.Finish(status)
+	default:
 		answered := &answer{call: call, writer: writer}
 		wrapped := httpsnoop.Wrap(writer, httpsnoop.Hooks{WriteHeader: answered.header, Write: answered.write,
 			WriteString: answered.writeString, ReadFrom: answered.readFrom, Flush: answered.flush,
 			FlushError: answered.flushError, Hijack: answered.hijack})
 		faultpoint.Outside(func() { handle(call, next, wrapped) })
 		answered.implicit()
-		status = answered.status
+		call.Finish(answered.status)
 	}
-	call.Finish(status)
 }
 
 // handle runs the handler of a request the server point took, observing a panic of it, which goes on.
 func handle(call *ServerCall, next http.Handler, writer http.ResponseWriter) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			call.Panicked(recovered)
+			call.Failed(recovered)
 			panic(recovered)
 		}
 	}()
@@ -354,7 +359,7 @@ func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, erro
 	params := struct {
 		Status int    `json:"status"`
 		Error  string `json:"error"`
-		// MS is the wait before a fail, which action.Hold has already waited.
+		// MS is the wait before a fail, which RoundTrip has already waited.
 		MS int `json:"ms"`
 	}{Error: action.Timeout}
 	rule.DecodeParams(&params)
@@ -365,8 +370,8 @@ func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, erro
 }
 
 // RoundTrip sends a request under the rule of its point, a fail_after rule replacing only a 2xx or 3xx response of
-// the peer; a failure's detail tells whether the request was written completely, that is whether the peer may have
-// acted on it.
+// the peer, and a caller that gives up during an injected wait getting its context's error, as from a slow peer; a
+// failure's detail tells whether the request was written completely, that is whether the peer may have acted on it.
 func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	defer faultpoint.Guard()
 	base := c.base
@@ -384,25 +389,25 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	rule := faultpoint.Decide(ctx, point, action.Before...)
 	started := time.Now()
 	kind := ""
+	var response *http.Response
+	var err error
 	if rule != nil {
-		action.Hold(rule)
 		kind = rule.Action.Kind
+		err = action.Wait(ctx, rule)
 	}
-	if kind == "duplicate" && request.Body != nil && request.GetBody == nil {
+	if err == nil && kind == "duplicate" && request.Body != nil && request.GetBody == nil {
 		var body []byte
-		var err error
-		faultpoint.Outside(func() { body, err = io.ReadAll(request.Body) })
-		if err != nil {
-			return nil, err
+		var read error
+		faultpoint.Outside(func() { body, read = io.ReadAll(request.Body) })
+		if read != nil {
+			return nil, read
 		}
 		request.Body = io.NopCloser(bytes.NewReader(body))
 		request.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
 	}
-	var response *http.Response
-	var err error
-	if kind == "fail" {
+	if err == nil && kind == "fail" {
 		response, err = failure(request, rule)
-	} else {
+	} else if err == nil {
 		faultpoint.Outside(func() { response, err = base.RoundTrip(request) })
 	}
 	if err == nil && rule == nil && succeeded(response.StatusCode) {

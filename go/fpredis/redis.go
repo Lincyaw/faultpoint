@@ -111,9 +111,11 @@ type call struct {
 	rule    *faultpoint.Rule
 	action  string
 	started time.Time
+	// ended is the context's error when the caller gave up during the rule's wait.
+	ended error
 }
 
-// decide finds a command in the table, decides its rule that acts before it is sent and performs the rule's delay or
+// decide finds a command in the table, decides its rule that acts before it is sent and performs the rule's wait or
 // crash; a command outside the table is not a point.
 func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 	defer faultpoint.Guard()
@@ -131,7 +133,7 @@ func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 		started: started}
 	c.rule = faultpoint.Decide(ctx, c.point, action.Before...)
 	if c.rule != nil {
-		action.Hold(c.rule)
+		c.ended = action.Wait(ctx, c.rule)
 		c.action = c.rule.Action.Kind
 	}
 	if c.action == "empty" && known.Empty == "never" {
@@ -140,10 +142,11 @@ func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
 	return c, true
 }
 
-// sent is whether the command reaches Redis: fail and drop keep it back, and so does empty, except for an
-// array of nils, whose length only the reply knows.
+// sent is whether the command reaches Redis: a caller that gave up during the wait, fail and drop keep it back, and
+// so does empty, except for an array of nils, whose length only the reply knows.
 func (c call) sent() bool {
-	return c.action != "fail" && c.action != "drop" && (c.action != "empty" || c.command.Empty == "all_nil")
+	return c.ended == nil && c.action != "fail" && c.action != "drop" &&
+		(c.action != "empty" || c.command.Empty == "all_nil")
 }
 
 // block waits as long as a blocking read kept back by an empty rule would have waited for its empty reply, so that
@@ -175,6 +178,8 @@ func (c call) settle(cmd redis.Cmder, err error) error {
 		c.action = c.rule.Action.Kind
 	}
 	switch {
+	case c.ended != nil:
+		err = c.ended
 	case c.action == "fail" || c.action == "fail_after":
 		err = action.Failure(c.rule, replyError)
 	case err == nil && c.action == "empty":
