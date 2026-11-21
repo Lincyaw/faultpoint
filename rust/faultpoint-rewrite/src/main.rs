@@ -55,6 +55,8 @@ struct Placer<'a> {
     points: Vec<PointEntry>,
     serves: bool,
     stores: bool,
+    /// Whether a redis-rs call site was rewritten, so that the file registers how this build makes redis-rs errors.
+    replies: bool,
 }
 
 fn last_segments(path: &syn::Path, count: usize) -> String {
@@ -333,9 +335,13 @@ impl VisitMut for Placer<'_> {
             layered(call.args.iter_mut().nth(1).expect("two arguments"));
             self.serves = true;
         }
-        if let Some(store) = sqlx_store(node).or_else(|| redis_store(node)) {
+        if let Some(store) = sqlx_store(node) {
             *node = store;
             self.stores = true;
+        } else if let Some(store) = redis_store(node) {
+            *node = store;
+            self.stores = true;
+            self.replies = true;
         }
     }
 }
@@ -395,10 +401,10 @@ fn sqlx_store(expression: &Expr) -> Option<Expr> {
         _ => return None,
     };
     Some(parse_quote!(::faultpoint::store::sql(#sql, #expression, ::faultpoint::store::Hooks {
-        failure: |code| match code {
+        failure: |code| ::std::option::Option::Some(match code {
             ::std::option::Option::Some(code) => ::faultpoint::sqlx_database_error!(code),
             ::std::option::Option::None => ::sqlx::Error::Protocol(::std::string::String::from("faultpoint: injected store failure")),
-        },
+        }),
         substitute: #substitute,
         is_empty: #is_empty,
         code: |error| match error {
@@ -466,7 +472,8 @@ fn redis_store(expression: &Expr) -> Option<Expr> {
     Some(parse_quote!(::faultpoint::store::redis(#name, #key, #expression, ::faultpoint::store::Hooks {
         failure: |code| match code {
             ::std::option::Option::Some(code) => ::faultpoint::redis_error_reply!(code),
-            ::std::option::Option::None => ::redis::RedisError::from((::redis::ErrorKind::IoError, "faultpoint: injected Redis failure")),
+            ::std::option::Option::None => ::std::option::Option::Some(
+                ::redis::RedisError::from((::redis::ErrorKind::IoError, "faultpoint: injected Redis failure"))),
         },
         substitute: #substitute,
         is_empty: |_| false,
@@ -518,8 +525,14 @@ fn place_files(files: &[PathBuf], root: &Path, prefix: &str, kinds: Option<&[Str
         let mut syntax = syn::parse_file(&std::fs::read_to_string(file).expect("cannot read a source file"))
             .unwrap_or_else(|error| panic!("cannot parse {path}: {error}"));
         let mut placer = Placer { service, path, placement, prefix, kinds, scopes: Vec::new(), owner: None,
-                                  ordinals: HashMap::new(), points: Vec::new(), serves: false, stores: false };
+                                  ordinals: HashMap::new(), points: Vec::new(), serves: false, stores: false, replies: false };
         placer.visit_file_mut(&mut syntax);
+        if placer.replies {
+            syntax.items.push(parse_quote!(::faultpoint::inventory::submit! {
+                ::faultpoint::store::ReplyErrors(|code| ::faultpoint::redis_error_reply!(code)
+                    .and_then(|error| error.code().map(::std::borrow::ToOwned::to_owned)))
+            }));
+        }
         serves |= placer.serves;
         stores |= placer.stores;
         if !placer.points.is_empty() || placer.serves || placer.stores {

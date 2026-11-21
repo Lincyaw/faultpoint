@@ -33,10 +33,11 @@ static KEY_IDENTIFIER: LazyLock<Regex> = LazyLock::new(|| {
 static STATEMENTS: LazyLock<Mutex<HashMap<String, (&'static str, String)>>> = LazyLock::new(Mutex::default);
 
 /// What a rewritten call site supplies: the client's error for an injected failure, which is the client's own error
-/// for the rule's code when it names one, the value an empty read or a dropped write answers with, whether a read's
-/// value is empty, and the code a store gave an error, such as a SQLSTATE or the prefix of a Redis error reply.
+/// for the rule's code when it names one, or None when the client cannot make that error, the value an empty read or
+/// a dropped write answers with, whether a read's value is empty, and the code a store gave an error, such as a
+/// SQLSTATE or the prefix of a Redis error reply.
 pub struct Hooks<T, E> {
-    pub failure: fn(Option<&str>) -> E,
+    pub failure: fn(Option<&str>) -> Option<E>,
     pub substitute: fn() -> Result<T, E>,
     pub is_empty: fn(&T) -> bool,
     pub code: fn(&E) -> Option<String>,
@@ -126,19 +127,22 @@ where
     let rule = core.decide(&point);
     let started = Instant::now();
     let action = rule.as_ref().map_or("", |rule| rule.action.kind.as_str());
-    let code = rule.as_ref().and_then(|rule| rule.action.parameters.get("code")).and_then(Value::as_str);
-    let result = match (action, &rule) {
-        ("delay", Some(rule)) => {
-            tokio::time::sleep(Duration::from_secs_f64(number(rule, "ms") / 1000.0)).await;
-            operation.await
+    let result = match &rule {
+        None => operation.await,
+        Some(rule) => {
+            let code = rule.action.parameters.get("code").and_then(Value::as_str);
+            match action {
+                "delay" => {
+                    tokio::time::sleep(Duration::from_secs_f64(number(rule, "ms") / 1000.0)).await;
+                    operation.await
+                }
+                "crash" => core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32),
+                "fail" => Err(injected(rule, code, &point, hooks.failure)),
+                "empty" | "drop" => (hooks.substitute)(),
+                "fail_after" => operation.await.and_then(|_| Err(injected(rule, code, &point, hooks.failure))),
+                other => core.abort(&format!("rule {}: {other} is not implemented at {point}", rule.id)),
+            }
         }
-        ("crash", Some(rule)) => core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32),
-        ("fail", _) => Err((hooks.failure)(code)),
-        ("empty" | "drop", _) => (hooks.substitute)(),
-        ("fail_after", _) => operation.await.and_then(|_| Err((hooks.failure)(code))),
-        ("", _) => operation.await,
-        (other, Some(rule)) => core.abort(&format!("rule {}: {other} is not implemented at {point}", rule.id)),
-        (_, None) => unreachable!("an action comes from a rule"),
     };
     // An injected empty reply is empty whatever the client's type tells; otherwise the call site's hook decides.
     let (outcome, detail) = match &result {
@@ -155,6 +159,13 @@ where
     };
     core.observe(&point, outcome, started.elapsed().as_secs_f64() * 1000.0, rule.as_ref(), detail);
     result
+}
+
+/// The error a fail or fail_after rule raises; a client that cannot make it stops the process as a rule it cannot
+/// obey does, which the check at loading makes the rule set do first.
+fn injected<E>(rule: &Rule, code: Option<&str>, point: &str, failure: fn(Option<&str>) -> Option<E>) -> E {
+    failure(code).unwrap_or_else(|| core().abort(&format!(
+        "rule {}: the client in this build cannot make the error of code {} at {point}", rule.id, code.unwrap_or("-"))))
 }
 
 /// A sqlx call: the point of its SQL statement.
@@ -206,14 +217,33 @@ fn refusal(rule: &Rule) -> Option<String> {
     let code = rule.action.parameters.get("code")?.as_str()?;
     let (_, kind) = point_parts(&rule.point).ok()?;
     let locator = rule.point.splitn(3, ':').nth(2)?;
-    let (valid, form) = match redis_kind(locator.split(' ').next()?) {
-        Some(command) if command == kind => (REPLY_CODE.is_match(code), "the prefix of a Redis error reply, an upper-case word"),
-        None if (kind == "store_read" || kind == "store_write") && STATEMENT_LOCATOR.is_match(locator) => {
-            (SQLSTATE.is_match(code), "a SQLSTATE, five digits or upper-case letters")
+    match redis_kind(locator.split(' ').next()?) {
+        Some(command) if command == kind && !REPLY_CODE.is_match(code) => {
+            Some(format!("code {code} at {} is not the prefix of a Redis error reply, an upper-case word", rule.point))
         }
-        _ => return None,
-    };
-    (!valid).then(|| format!("code {code} at {} is not {form}", rule.point))
+        Some(command) if command == kind => reply_refusal(code, &rule.point),
+        None if (kind == "store_read" || kind == "store_write") && STATEMENT_LOCATOR.is_match(locator) && !SQLSTATE.is_match(code) => {
+            Some(format!("code {code} at {} is not a SQLSTATE, five digits or upper-case letters", rule.point))
+        }
+        _ => None,
+    }
+}
+
+/// How a build makes the redis-rs error for an error reply with a code, given as the code that error reports, or
+/// None when redis-rs does not make an error of the reply. The rewriter registers it in the application's crate,
+/// where redis-rs is, so that the Redis codes of a rule set are tried when it loads.
+pub struct ReplyErrors(pub fn(&str) -> Option<String>);
+
+inventory::collect!(ReplyErrors);
+
+/// Why a Redis code cannot be injected in this build: its redis-rs does not make an error reporting that code of
+/// the error reply, as a version that parses an error reply as a value would not.
+fn reply_refusal(code: &str, point: &str) -> Option<String> {
+    inventory::iter::<ReplyErrors>.into_iter().find_map(|errors| match (errors.0)(code) {
+        Some(made) if made == code => None,
+        made => Some(format!("the redis-rs version in this build does not make an error with code {code} of an error \
+                              reply, it makes {made:?}, so a fail with that code at {point} is not supported")),
+    })
 }
 
 /// The error a fail rule with a code raises at a sqlx call site: sqlx's Database variant, carrying an error whose
@@ -262,14 +292,12 @@ macro_rules! sqlx_database_error {
 }
 
 /// The error a fail rule with a code raises at a redis-rs call site: what redis-rs makes of an error reply with that
-/// prefix, read by its own parser. It expands in the application's crate, which depends on redis-rs.
+/// prefix, read by its own parser, or None when the parser does not make an error of it. It expands in the
+/// application's crate, which depends on redis-rs.
 #[macro_export]
 macro_rules! redis_error_reply {
     ($code:expr) => {
-        match ::redis::parse_redis_value(::std::format!("-{} faultpoint: injected Redis failure\r\n", $code).as_bytes()) {
-            ::std::result::Result::Err(error) => error,
-            ::std::result::Result::Ok(_) => ::std::unreachable!("redis-rs parses an error reply as an error"),
-        }
+        ::redis::parse_redis_value(::std::format!("-{} faultpoint: injected Redis failure\r\n", $code).as_bytes()).err()
     };
 }
 
