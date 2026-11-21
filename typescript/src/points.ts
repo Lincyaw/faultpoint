@@ -22,7 +22,7 @@ export function branch(point: string, taken: boolean): boolean {
     hold(rule);
     taken = taken || rule.action.kind === "fail";
   }
-  CORE.observe(point, taken ? "taken" : "not_taken", 0, rule);
+  CORE.observe(point, taken ? "taken" : "not_taken", 0, rule, {});
   return taken;
 }
 
@@ -36,7 +36,7 @@ export function check(point: string, result: boolean): boolean {
     hold(rule);
     result = result !== (rule.action.kind === "negate");
   }
-  CORE.observe(point, result ? "true" : "false", 0, rule);
+  CORE.observe(point, result ? "true" : "false", 0, rule, {});
   return result;
 }
 
@@ -49,7 +49,7 @@ export function loop(point: string): void {
   if (rule !== null) {
     hold(rule);
   }
-  CORE.observe(point, "iteration", 0, rule);
+  CORE.observe(point, "iteration", 0, rule, {});
 }
 
 /** A business value, replaced by a set rule or offset by a shift rule. */
@@ -71,7 +71,7 @@ export function value<T>(point: string, observed: T): T {
       result = ((observed as number) + numberParameter(rule, "amount")) as T;
     }
   }
-  CORE.observe(point, "observed", typeof result === "number" ? result : 0, rule);
+  CORE.observe(point, "observed", typeof result === "number" ? result : 0, rule, {});
   return result;
 }
 
@@ -89,7 +89,7 @@ export function clock<T extends number | Date>(point: string, reading: T): T {
       result = (reading instanceof Date ? new Date(reading.getTime() + shift) : (reading as number) + shift) as T;
     }
   }
-  CORE.observe(point, "read", 0, rule);
+  CORE.observe(point, "read", 0, rule, {});
   return result;
 }
 
@@ -103,7 +103,7 @@ export function acquire(point: string, acquired: boolean): boolean {
     hold(rule);
     acquired = acquired && rule.action.kind !== "fail";
   }
-  CORE.observe(point, acquired ? "acquired" : "rejected", 0, rule);
+  CORE.observe(point, acquired ? "acquired" : "rejected", 0, rule, {});
   return acquired;
 }
 

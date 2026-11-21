@@ -5,7 +5,8 @@ import { type Rule, type RuleSet, pointParts } from "./rules.js";
 
 const INVALID_RULES_EXIT = 70;
 
-/** One execution of a point, as the core hands it to the observation sink. */
+/** One execution of a point, as the core hands it to the observation sink; the detail tells executions of one outcome
+ * apart by bounded values under the keys spec/kinds.json gives the kind. */
 export interface Observation {
   experiment: string;
   point: string;
@@ -14,6 +15,13 @@ export interface Observation {
   rule: string | null;
   quantity: number;
   traceId: string | null;
+  detail: Readonly<Record<string, string>>;
+}
+
+/** How a detail names an error: its code when it has a textual one, as Node's system errors do, otherwise its name. */
+export function errorName(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : error instanceof Error ? error.name : typeof error;
 }
 
 export interface RuleSource {
@@ -132,10 +140,10 @@ export class Core {
     return null;
   }
 
-  observe(point: string, outcome: string, quantity: number, rule: Rule | null): void {
+  observe(point: string, outcome: string, quantity: number, rule: Rule | null, detail: Readonly<Record<string, string>>): void {
     this.sink?.add({
       experiment: this.experiment, point, outcome, quantity, rule: rule?.id ?? null,
-      scope: this.context?.baggage(this.settings.scopeKey) ?? "", traceId: this.context?.traceId() ?? null,
+      scope: this.context?.baggage(this.settings.scopeKey) ?? "", traceId: this.context?.traceId() ?? null, detail,
     });
   }
 

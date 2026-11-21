@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import diagnostics from "node:diagnostics_channel";
 import http, { type ClientRequest, IncomingMessage, type ServerResponse } from "node:http";
 import https from "node:https";
 import { syncBuiltinESMExports } from "node:module";
@@ -8,10 +10,15 @@ import { ROOT_CONTEXT, context, defaultTextMapGetter, defaultTextMapSetter } fro
 import { z } from "zod";
 
 import { PROPAGATOR } from "./context.js";
-import { CORE, type Plugin } from "./core.js";
+import { CORE, type Plugin, errorName } from "./core.js";
 import { type Rule, numberParameter, pointId, stringParameter } from "./rules.js";
 
 const DEFAULT_FAILURE_STATUS = 503;
+
+/** The fetch exchange in progress, and the exchange of each request undici creates for it; undici creates a request
+ * in the context of the fetch that sends it, and announces it sent once its headers and body are written. */
+const EXCHANGES = new AsyncLocalStorage<{ sent: boolean }>();
+const REQUEST_EXCHANGES = new WeakMap<object, { sent: boolean }>();
 
 export const HttpOptions = z.strictObject({
   identifier_segment: z.string().default(
@@ -44,8 +51,10 @@ class HttpBoundaries {
     const point = pointId(CORE.settings.service, "rpc_server", `${request.method} ${this.pathTemplate(request.url ?? "/")}`);
     const rule = CORE.decide(point);
     const started = performance.now();
+    // A response that closes before it finished was abandoned: its connection closed first.
     response.on("close", () => context.with(requestContext, () => CORE.observe(point,
-      response.writableFinished ? statusOutcome(response.statusCode) : "error", performance.now() - started, rule)));
+      response.writableFinished ? statusOutcome(response.statusCode) : "error", performance.now() - started, rule,
+      response.writableFinished ? { status: String(response.statusCode), abandoned: "false" } : { abandoned: "true" })));
     if (rule !== null) {
       await wait(rule);
     }
@@ -80,20 +89,22 @@ class HttpBoundaries {
         return failFetch(point, rule, started);
       }
       let response: Response;
+      const exchange = { sent: false };
       try {
         if (kind === "duplicate") {
           await (await base(request.clone())).arrayBuffer();
         }
-        response = await base(request);
+        response = await EXCHANGES.run(exchange, () => base(request));
       } catch (error) {
-        CORE.observe(point, errorOutcome(error), performance.now() - started, rule);
+        CORE.observe(point, errorOutcome(error), performance.now() - started, rule,
+          { error: errorName(error), sent: String(exchange.sent) });
         throw error;
       }
       if (rule !== null && kind === "fail_after") {
         await response.arrayBuffer();
         return failFetch(point, rule, started);
       }
-      CORE.observe(point, statusOutcome(response.status), performance.now() - started, rule);
+      CORE.observe(point, statusOutcome(response.status), performance.now() - started, rule, { status: String(response.status) });
       return response;
     };
   }
@@ -114,8 +125,8 @@ class HttpBoundaries {
       const rule = CORE.decide(point);
       const requestContext = context.active();
       const started = performance.now();
-      const observe = (outcome: string): void => context.with(requestContext,
-        () => CORE.observe(point, outcome, performance.now() - started, rule));
+      const observe = (outcome: string, detail: Record<string, string>): void => context.with(requestContext,
+        () => CORE.observe(point, outcome, performance.now() - started, rule, detail));
       if (rule?.action.kind === "duplicate") {
         CORE.abort(`rule ${rule.id}: duplicate at ${point} needs fetch, since an http.request body cannot be sent twice`);
       }
@@ -133,8 +144,14 @@ class HttpBoundaries {
         replaceResponse(clientRequest, rule, observe);
         return clientRequest;
       }
-      clientRequest.once("response", (response: IncomingMessage) => observe(statusOutcome(response.statusCode ?? 0)));
-      clientRequest.once("error", (error) => observe(errorOutcome(error)));
+      // A request finishes when its headers and body have been handed to the operating system.
+      let sent = false;
+      clientRequest.once("finish", () => {
+        sent = true;
+      });
+      clientRequest.once("response", (response: IncomingMessage) => observe(statusOutcome(response.statusCode ?? 0),
+        { status: String(response.statusCode ?? 0) }));
+      clientRequest.once("error", (error) => observe(errorOutcome(error), { error: errorName(error), sent: String(sent) }));
       return clientRequest;
     } as typeof http.request;
   }
@@ -176,15 +193,18 @@ function boundaryError(rule: Rule): Error {
   return Object.assign(new Error(`faultpoint: ${code}`), { code });
 }
 
+/** The failure a fail or fail_after rule answers a fetch with; only a fail_after has sent the request. */
 function failFetch(point: string, rule: Rule, started: number): Response {
+  const sent = String(rule.action.kind === "fail_after");
   if (typeof rule.action.status === "number") {
-    CORE.observe(point, statusOutcome(rule.action.status), performance.now() - started, rule);
+    CORE.observe(point, statusOutcome(rule.action.status), performance.now() - started, rule,
+      { status: String(rule.action.status), sent });
     return new Response(null, { status: rule.action.status });
   }
   const error = stringParameter(rule, "error") === "refused"
     ? new TypeError("fetch failed", { cause: boundaryError(rule) })
     : new DOMException("The operation was aborted due to timeout", "TimeoutError");
-  CORE.observe(point, errorOutcome(error), performance.now() - started, rule);
+  CORE.observe(point, errorOutcome(error), performance.now() - started, rule, { error: errorName(error), sent });
   throw error;
 }
 
@@ -235,24 +255,24 @@ function deferSending(clientRequest: ClientRequest, ms: number): void {
 }
 
 /** Answer a request without sending it: a synthetic status, or an error as if the peer failed. */
-function answerInstead(clientRequest: ClientRequest, rule: Rule, observe: (outcome: string) => void): void {
+function answerInstead(clientRequest: ClientRequest, rule: Rule, observe: (outcome: string, detail: Record<string, string>) => void): void {
   clientRequest.write = (() => true) as typeof clientRequest.write;
   clientRequest.end = (() => clientRequest) as typeof clientRequest.end;
   process.nextTick(() => {
     if (typeof rule.action.status === "number") {
-      observe(statusOutcome(rule.action.status));
+      observe(statusOutcome(rule.action.status), { status: String(rule.action.status), sent: "false" });
       clientRequest.emit("response", syntheticResponse(rule.action.status));
       clientRequest.destroy();
       return;
     }
     const error = boundaryError(rule);
-    observe(errorOutcome(error));
+    observe(errorOutcome(error), { error: errorName(error), sent: "false" });
     clientRequest.destroy(error);
   });
 }
 
 /** Let a request reach its peer, then hide the real response behind a failure. */
-function replaceResponse(clientRequest: ClientRequest, rule: Rule, observe: (outcome: string) => void): void {
+function replaceResponse(clientRequest: ClientRequest, rule: Rule, observe: (outcome: string, detail: Record<string, string>) => void): void {
   const emit = clientRequest.emit;
   clientRequest.emit = function (this: ClientRequest, event: string | symbol, ...arguments_: unknown[]): boolean {
     if (event !== "response") {
@@ -260,11 +280,11 @@ function replaceResponse(clientRequest: ClientRequest, rule: Rule, observe: (out
     }
     (arguments_[0] as IncomingMessage).resume();
     if (typeof rule.action.status === "number") {
-      observe(statusOutcome(rule.action.status));
+      observe(statusOutcome(rule.action.status), { status: String(rule.action.status), sent: "true" });
       return emit.call(this, "response", syntheticResponse(rule.action.status));
     }
     const error = boundaryError(rule);
-    observe(errorOutcome(error));
+    observe(errorOutcome(error), { error: errorName(error), sent: "true" });
     this.destroy(error);
     return true;
   } as typeof clientRequest.emit;
@@ -298,6 +318,18 @@ export const httpPlugin: Plugin = {
       } as typeof http.get;
     }
     syncBuiltinESMExports();
+    diagnostics.subscribe("undici:request:create", (message) => {
+      const exchange = EXCHANGES.getStore();
+      if (exchange !== undefined) {
+        REQUEST_EXCHANGES.set((message as { request: object }).request, exchange);
+      }
+    });
+    diagnostics.subscribe("undici:request:bodySent", (message) => {
+      const exchange = REQUEST_EXCHANGES.get((message as { request: object }).request);
+      if (exchange !== undefined) {
+        exchange.sent = true;
+      }
+    });
     globalThis.fetch = boundaries.instrumentFetch(globalThis.fetch);
   },
 };

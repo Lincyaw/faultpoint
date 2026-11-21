@@ -4,7 +4,7 @@ import { context } from "@opentelemetry/api";
 import { z } from "zod";
 
 import { applicationModule } from "./config.js";
-import { CORE, type Plugin } from "./core.js";
+import { CORE, type Plugin, errorName } from "./core.js";
 import { numberParameter, pointId } from "./rules.js";
 
 /** spec/redis-commands.json, which the build copies next to this module. */
@@ -89,7 +89,14 @@ function emptyReply(name: string, rule: RedisCommand["empty"], args: unknown[]):
   }
 }
 
-function instrumentSendCommand(original: SendCommand, identifier: RegExp): SendCommand {
+/** A failed command's error and, for an error reply of Redis, its prefix, the word before the first space. */
+function failureDetail(error: unknown, ReplyError: new () => Error): Record<string, string> {
+  return error instanceof ReplyError
+    ? { error: errorName(error), code: error.message.split(" ")[0] }
+    : { error: errorName(error) };
+}
+
+function instrumentSendCommand(original: SendCommand, identifier: RegExp, ReplyError: new () => Error): SendCommand {
   return function (this: unknown, command: Command, stream?: unknown) {
     const name = command.name.toUpperCase();
     const spec = TABLE.commands[name];
@@ -103,8 +110,9 @@ function instrumentSendCommand(original: SendCommand, identifier: RegExp): SendC
     const requestContext = context.active();
     const started = performance.now();
     command.promise.then((reply) => context.with(requestContext, () => CORE.observe(point,
-      spec.empty === undefined ? "ok" : empty(spec.empty, reply) ? "empty" : "rows", performance.now() - started, rule)),
-    () => context.with(requestContext, () => CORE.observe(point, "error", performance.now() - started, rule)));
+      spec.empty === undefined ? "ok" : empty(spec.empty, reply) ? "empty" : "rows", performance.now() - started, rule, {})),
+    (error: unknown) => context.with(requestContext, () => CORE.observe(point, "error", performance.now() - started, rule,
+      failureDetail(error, ReplyError))));
     switch (rule?.action.kind) {
       case "fail":
         command.reject(new Error("faultpoint: injected Redis failure"));
@@ -134,8 +142,9 @@ function instrumentSendCommand(original: SendCommand, identifier: RegExp): SendC
 export const ioredisPlugin: Plugin = {
   name: "ioredis",
   install(core, options) {
-    const ioredis = applicationModule<{ Redis: { prototype: { sendCommand: SendCommand } }; Cluster?: { prototype: { sendCommand: SendCommand } } }>(
-      core.settings.sourceRoot, "ioredis");
+    const ioredis = applicationModule<{
+      Redis: { prototype: { sendCommand: SendCommand } }; Cluster?: { prototype: { sendCommand: SendCommand } }; ReplyError: new () => Error;
+    }>(core.settings.sourceRoot, "ioredis");
     if (ioredis === null) {
       return;
     }
@@ -148,7 +157,7 @@ export const ioredisPlugin: Plugin = {
     });
     for (const client of [ioredis.Redis, ioredis.Cluster]) {
       if (client !== undefined) {
-        client.prototype.sendCommand = instrumentSendCommand(client.prototype.sendCommand, identifier);
+        client.prototype.sendCommand = instrumentSendCommand(client.prototype.sendCommand, identifier, ioredis.ReplyError);
       }
     }
   },

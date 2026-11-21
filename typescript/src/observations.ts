@@ -19,6 +19,7 @@ export interface ObservationRecord {
   count: number;
   total: number;
   exemplars: string[];
+  detail: Record<string, string>;
 }
 
 export const JsonlOptions = z.strictObject({
@@ -40,12 +41,14 @@ export class JsonlSink implements ObservationSink {
   }
 
   add(observation: Observation): void {
+    // The detail's entries are sorted, so that one detail is one key and its record lists the keys in order.
+    const detail = Object.entries(observation.detail).sort(([one], [other]) => (one < other ? -1 : 1));
     const key = JSON.stringify([observation.experiment, observation.point, observation.outcome, observation.scope,
-      observation.rule]);
+      observation.rule, detail]);
     const record = this.tally.get(key) ?? {
       experiment: observation.experiment, service: this.service, process: this.process, start: 0, end: 0,
       point: observation.point, outcome: observation.outcome, scope: observation.scope, rule: observation.rule,
-      count: 0, total: 0, exemplars: [],
+      count: 0, total: 0, exemplars: [], detail: Object.fromEntries(detail),
     };
     record.count += 1;
     record.total += observation.quantity;

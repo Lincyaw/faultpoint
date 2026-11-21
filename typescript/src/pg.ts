@@ -5,7 +5,7 @@ import { context } from "@opentelemetry/api";
 import { fingerprintSync, hasSqlDetails, loadModule, parseSync } from "libpg-query";
 
 import { applicationModule } from "./config.js";
-import { CORE, type Plugin } from "./core.js";
+import { CORE, type Plugin, errorName } from "./core.js";
 import { type Rule, numberParameter, pointId } from "./rules.js";
 
 type StoreKind = "store_read" | "store_write";
@@ -23,6 +23,9 @@ interface QueryResult {
 }
 
 type Query = (this: unknown, ...arguments_: unknown[]) => unknown;
+
+/** node-postgres's error for an error response of the server, whose code is the SQLSTATE. */
+type DatabaseError = new (message: string, length: number, name: string) => Error & { code?: string };
 
 const STATEMENTS = new Map<string, Statement>();
 
@@ -65,16 +68,14 @@ export function statementPoint(sql: string): Statement {
   return statement;
 }
 
-function injectedError(message: string): Error {
-  return Object.assign(new Error(`faultpoint: ${message}`), { code: "08006" });
-}
-
 function results(result: unknown): QueryResult[] {
   return (Array.isArray(result) ? result : [result]) as QueryResult[];
 }
 
-/** Run a query under its rule; a dropped write is acknowledged without reaching the database. */
-async function execute(rule: Rule | null, run: () => Promise<unknown>): Promise<unknown> {
+/** Run a query under its rule; a dropped write is acknowledged without reaching the database, and an injected failure
+ * is an error response with SQLSTATE 08006, connection_failure. */
+async function execute(rule: Rule | null, run: () => Promise<unknown>, DatabaseError: DatabaseError): Promise<unknown> {
+  const injectedError = (message: string) => Object.assign(new DatabaseError(`faultpoint: ${message}`, 0, "error"), { code: "08006" });
   switch (rule?.action.kind) {
     case "delay":
       await sleep(numberParameter(rule, "ms"));
@@ -102,7 +103,7 @@ async function execute(rule: Rule | null, run: () => Promise<unknown>): Promise<
 
 /** Client.prototype.query, which Pool.query also goes through, made the store point of each statement; the
  * promise and callback forms both keep their contract. */
-function instrumentQuery(original: Query): Query {
+function instrumentQuery(original: Query, DatabaseError: DatabaseError): Query {
   return function (this: unknown, ...arguments_: unknown[]) {
     const [config, values, callback] = arguments_;
     const submittable = config !== null && typeof config === "object" && typeof (config as { submit?: unknown }).submit === "function";
@@ -117,19 +118,20 @@ function instrumentQuery(original: Query): Query {
     const rule = CORE.decide(point);
     const requestContext = context.active();
     const started = performance.now();
-    const observe = (outcome: string, quantity: number): void => context.with(requestContext,
-      () => CORE.observe(point, outcome, quantity, rule));
-    const result = execute(rule, () => original.apply(this, forwarded) as Promise<unknown>).then((answer) => {
+    const observe = (outcome: string, quantity: number, detail: Record<string, string>): void => context.with(requestContext,
+      () => CORE.observe(point, outcome, quantity, rule, detail));
+    const result = execute(rule, () => original.apply(this, forwarded) as Promise<unknown>, DatabaseError).then((answer) => {
       const each = results(answer);
       if (statement.kind === "store_read") {
         const rows = each.reduce((total, part) => total + (part?.rows?.length ?? 0), 0);
-        observe(rows > 0 ? "rows" : "empty", rows);
+        observe(rows > 0 ? "rows" : "empty", rows, {});
       } else {
-        observe("ok", each.reduce((total, part) => total + (part?.rowCount ?? 0), 0));
+        observe("ok", each.reduce((total, part) => total + (part?.rowCount ?? 0), 0), {});
       }
       return answer;
     }, (error: unknown) => {
-      observe("error", performance.now() - started);
+      observe("error", performance.now() - started, error instanceof DatabaseError && typeof error.code === "string"
+        ? { error: errorName(error), code: error.code } : { error: errorName(error) });
       throw error;
     });
     if (done === undefined) {
@@ -144,7 +146,7 @@ function instrumentQuery(original: Query): Query {
 export const pgPlugin: Plugin = {
   name: "pg",
   async install(core) {
-    const pg = applicationModule<{ Client: { prototype: { query: Query } } }>(core.settings.sourceRoot, "pg");
+    const pg = applicationModule<{ Client: { prototype: { query: Query } }; DatabaseError: DatabaseError }>(core.settings.sourceRoot, "pg");
     if (pg === null) {
       return;
     }
@@ -153,6 +155,6 @@ export const pgPlugin: Plugin = {
       store_read: ["fail", "empty", "delay", "crash"],
       store_write: ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
     });
-    pg.Client.prototype.query = instrumentQuery(pg.Client.prototype.query);
+    pg.Client.prototype.query = instrumentQuery(pg.Client.prototype.query, pg.DatabaseError);
   },
 };
