@@ -124,25 +124,33 @@ where
         return operation.await;
     }
     let point = point_id(&core.settings.service, kind, &locator);
-    let rule = core.decide(&point);
+    let rule = core.decide_among(&point, |action| action != "fail_after");
     let started = Instant::now();
-    let action = rule.as_ref().map_or("", |rule| rule.action.kind.as_str());
+    let action = rule.as_ref().map_or(String::new(), |rule| rule.action.kind.clone());
     let result = match &rule {
         None => operation.await,
-        Some(rule) => {
-            let code = rule.action.parameters.get("code").and_then(Value::as_str);
-            match action {
-                "delay" => {
-                    tokio::time::sleep(Duration::from_secs_f64(number(rule, "ms") / 1000.0)).await;
-                    operation.await
-                }
-                "crash" => core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32),
-                "fail" => Err(injected(rule, code, &point, hooks.failure)),
-                "empty" | "drop" => (hooks.substitute)(),
-                "fail_after" => operation.await.and_then(|_| Err(injected(rule, code, &point, hooks.failure))),
-                other => core.abort(&format!("rule {}: {other} is not implemented at {point}", rule.id)),
+        Some(rule) => match action.as_str() {
+            "delay" => {
+                tokio::time::sleep(Duration::from_secs_f64(number(rule, "ms") / 1000.0)).await;
+                operation.await
             }
-        }
+            "crash" => core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32),
+            "fail" => Err(injected(rule, &point, hooks.failure)),
+            "empty" | "drop" => (hooks.substitute)(),
+            other => core.abort(&format!("rule {}: {other} is not implemented at {point}", rule.id)),
+        },
+    };
+    // Only an operation that ran and succeeded is one a fail_after rule replaces and counts.
+    let ran = action != "empty" && action != "drop";
+    let (rule, result) = match result {
+        Ok(value) if ran => match core.decide_among(&point, |action| action == "fail_after") {
+            Some(replacing) => {
+                let error = injected(&replacing, &point, hooks.failure);
+                (Some(replacing), Err(error))
+            }
+            None => (rule, Ok(value)),
+        },
+        other => (rule, other),
     };
     // An injected empty reply is empty whatever the client's type tells; otherwise the call site's hook decides.
     let (outcome, detail) = match &result {
@@ -161,9 +169,10 @@ where
     result
 }
 
-/// The error a fail or fail_after rule raises; a client that cannot make it stops the process as a rule it cannot
-/// obey does, which the check at loading makes the rule set do first.
-fn injected<E>(rule: &Rule, code: Option<&str>, point: &str, failure: fn(Option<&str>) -> Option<E>) -> E {
+/// The error a fail or fail_after rule raises, of the rule's code when it names one; a client that cannot make it
+/// stops the process as a rule it cannot obey does, which the check at loading makes the rule set do first.
+fn injected<E>(rule: &Rule, point: &str, failure: fn(Option<&str>) -> Option<E>) -> E {
+    let code = rule.action.parameters.get("code").and_then(Value::as_str);
     failure(code).unwrap_or_else(|| core().abort(&format!(
         "rule {}: the client in this build cannot make the error of code {} at {point}", rule.id, code.unwrap_or("-"))))
 }
