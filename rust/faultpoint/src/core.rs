@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex, Once, RwLock};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Once, OnceLock, RwLock};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -107,6 +108,10 @@ pub fn core() -> &'static Core {
                 Ok(ruleset) => CORE.apply(ruleset),
                 Err(reason) => CORE.abort(&format!("unusable rules: {reason}")),
             }));
+        }
+        #[cfg(unix)]
+        if core.sink.is_some() {
+            flush_when_stopped();
         }
     });
     core
@@ -243,5 +248,101 @@ impl Core {
         if let Some(sink) = &self.sink {
             sink.flush();
         }
+    }
+}
+
+/// The signals whose default action ends a process without its exit handlers: SIGTERM, with which a service manager
+/// stops it, and SIGINT.
+#[cfg(unix)]
+const STOPPING_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
+/// The action each stopping signal had before faultpoint's, which faultpoint's runs on to.
+#[cfg(unix)]
+static PREVIOUS: [OnceLock<libc::sigaction>; 2] = [OnceLock::new(), OnceLock::new()];
+/// The socket faultpoint's signal action writes the signal to, all a signal handler can safely do, for a thread that
+/// reads the other end to write the observations.
+#[cfg(unix)]
+static WAKE: AtomicI32 = AtomicI32::new(-1);
+
+/// Write the observations when the process ends: at its exit, when main returns or std::process::exit is called,
+/// and at a stopping signal, after which the signal's default action ends the process as it would without
+/// faultpoint, unless the application handles the signal and so stops the process itself.
+#[cfg(unix)]
+fn flush_when_stopped() {
+    if unsafe { libc::atexit(flush_at_exit) } != 0 {
+        CORE.abort("cannot write the observations at exit");
+    }
+    let (wake, mut woken) = std::os::unix::net::UnixStream::pair().unwrap_or_else(|error| CORE.abort(&format!("cannot watch the stopping signals: {error}")));
+    WAKE.store(std::os::fd::IntoRawFd::into_raw_fd(wake), Ordering::Relaxed);
+    for (index, signal) in STOPPING_SIGNALS.into_iter().enumerate() {
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = on_stopping_signal as *const () as usize;
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        let installed = unsafe {
+            libc::sigaction(signal, std::ptr::null(), &mut previous) == 0 && PREVIOUS[index].set(previous).is_ok()
+                && libc::sigemptyset(&mut action.sa_mask) == 0 && libc::sigaction(signal, &action, std::ptr::null_mut()) == 0
+        };
+        if !installed {
+            CORE.abort(&format!("cannot watch signal {signal}"));
+        }
+    }
+    std::thread::spawn(move || {
+        let mut signal = [0u8; 1];
+        while std::io::Read::read_exact(&mut woken, &mut signal).is_ok() {
+            own(|| CORE.flush());
+            let signal = libc::c_int::from(signal[0]);
+            if ends_by_default(signal) {
+                unsafe {
+                    libc::signal(signal, libc::SIG_DFL);
+                    libc::kill(libc::getpid(), signal);
+                }
+            }
+        }
+    });
+}
+
+/// Whether a stopping signal is one no one else handles, so that its default action is to end the process: no action
+/// was installed before faultpoint's, and none after it, which would have replaced it.
+// signal-hook-registry, through which tokio installs its own, does not tell whether another action is registered, so
+// faultpoint installs its action itself and asks sigaction whether it is still the one installed.
+#[cfg(unix)]
+fn ends_by_default(signal: libc::c_int) -> bool {
+    let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+    let index = STOPPING_SIGNALS.iter().position(|&each| each == signal);
+    let queried = unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) } == 0;
+    queried && current.sa_sigaction == on_stopping_signal as *const () as usize
+        && index.and_then(|index| PREVIOUS[index].get()).is_some_and(|previous| previous.sa_sigaction == libc::SIG_DFL)
+}
+
+/// faultpoint's action for a stopping signal: it wakes the thread that writes the observations and runs the action
+/// installed before it, as a handler that chains does.
+#[cfg(unix)]
+extern "C" fn on_stopping_signal(signal: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+    let byte = signal as u8;
+    unsafe { libc::write(WAKE.load(Ordering::Relaxed), (&raw const byte).cast(), 1) };
+    let index = STOPPING_SIGNALS.iter().position(|&each| each == signal);
+    if let Some(previous) = index.and_then(|index| PREVIOUS[index].get()) {
+        let handler = previous.sa_sigaction;
+        if handler != libc::SIG_DFL && handler != libc::SIG_IGN {
+            unsafe {
+                if previous.sa_flags & libc::SA_SIGINFO != 0 {
+                    let chained: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) = std::mem::transmute(handler);
+                    chained(signal, info, context);
+                } else {
+                    let chained: extern "C" fn(libc::c_int) = std::mem::transmute(handler);
+                    chained(signal);
+                }
+            }
+        }
+    }
+}
+
+/// Write the observations as the process exits; a panic of the writing stops it with the status of an error of
+/// faultpoint, through _exit, since exit may not be called again from an exit handler.
+#[cfg(unix)]
+extern "C" fn flush_at_exit() {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CORE.flush())).is_err() {
+        eprintln!("faultpoint: internal error: the observations could not be written at exit; stopping the process");
+        unsafe { libc::_exit(ABORT_EXIT) };
     }
 }
