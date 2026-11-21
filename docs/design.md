@@ -132,7 +132,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 - **范围**：`scope` 中的每一项都必须等于当前请求 baggage 中的同名项，规则才生效。不在任何请求中的后台工作没有 baggage，只匹配 `scope` 为空的规则。内核看不到请求的 baggage，所以 `syscall` 和 `packet` 的规则不能带 `scope`，作用范围就是故障点所属服务的所有容器。
 - **`fail_after` 只替换正常完成的执行**：无论在哪个类别，`fail_after` 都在操作正常完成之后才生效。正常完成指该类别的成功结果：`call` `store_write` `publish` 的 `ok`，`store_read` `consume` 的 `rows` 或 `empty`，`rpc_client` `rpc_server` 的 `2xx` 或 `3xx`。服务端在应用开始写响应、状态已知时判定，客户端在得到应答之后判定。操作自己失败时，保留它自己的失败，记为自然结果，不带规则 id，也不计入这条规则的触发次数。否则自然失败会被当成注入，比较时就看不到它。
 - **触发**：每个进程对每条规则单独计数：先跳过前 `skip` 次匹配，之后最多注入 `limit` 次，每次以 `probability` 的概率注入（随机数以 `FAULTPOINT_SEED` 和规则 id 为种子）。并发下“第 n 次”本身是不确定的，所以优先用 `scope` 限定到具体的租户或请求，少用计数。`syscall` 和 `packet` 的计数由 eBPF 代理在内核中进行，范围是一条规则在该服务所有容器上的匹配，而不是每个进程；它的随机序列与各语言 SDK 的不同。
-- **适用性**：动作必须属于该类别的可用动作（见 1.3）。边界类故障点的 `fail` 和 `fail_after` 用 `status` 指定合成的响应状态，或用 `error` 指定 `timeout` 或 `refused`。`call` 的 `error` 是已登记的错误名，Go 改写器会把包级的 `error` 变量自动登记为 `<包路径>.<变量名>`，这样注入的就是代码真实会返回的哨兵错误。`syscall` 的 `fail` 必须给出 errno 名，例如 `ECONNREFUSED`。存储和消息类的 `fail` `fail_after` 可以用 `code` 指定客户端库报告的错误码：SQL 存储是 SQLSTATE（例如 `23505`），Redis 是错误回复的前缀（例如 `WRONGTYPE`）。适配器抛出客户端库自己的、带这个码的错误类型，这样应用按错误码分支的处理照常执行，被注入的记录也带上同样的 `code`。
+- **适用性**：动作必须属于该类别的可用动作（见 1.3）。边界类故障点的 `fail` 和 `fail_after` 用 `status` 指定合成的响应状态，或用 `error` 指定 `timeout` 或 `refused`。`call` 的 `error` 是已登记的错误名，Go 改写器会把包级的 `error` 变量自动登记为 `<包路径>.<变量名>`，这样注入的就是代码真实会返回的哨兵错误。`syscall` 的 `fail` 必须给出 errno 名，例如 `ECONNREFUSED`。`fail` 可以用 `ms` 指定先等待多少毫秒再失败，用来复现一个慢的失败（例如客户端库重试之后才报错）；等待的方式与同一故障点的 `delay` 相同，异步代码中不阻塞事件循环；内核点不支持 `ms`，因为 eBPF 程序不能睡眠。存储和消息类的 `fail` `fail_after` 可以用 `code` 指定客户端库报告的错误码：SQL 存储是 SQLSTATE（例如 `23505`），Redis 是错误回复的前缀（例如 `WRONGTYPE`）。适配器抛出客户端库自己的、带这个码的错误类型，这样应用按错误码分支的处理照常执行，被注入的记录也带上同样的 `code`。
   - **怎样构造**：尽量交给客户端库自己的工厂或解析器，例如 redis-py 的 `parse_error`、Lettuce 的 `ExceptionFactory`、redis-rs 的回复解析器；PostgreSQL 的错误按服务端发来的字段构造（Java 的 `PSQLException`、Go 的 `*pgconn.PgError`、psycopg 按 SQLSTATE 查到的类）。Rust 的这类错误由 SDK 导出的宏在应用的 crate 里展开，SDK 不依赖客户端库；Go 的 database/sql 由驱动插件登记各自的构造器。
   - **拒绝**：码的格式不对（语句点上不是 SQLSTATE，Redis 点上不是大写单词）在加载时拒绝。驱动构造不出带码的错误时（例如 sqlite3 没有 SQLSTATE），Go 在驱动接上时拒绝该进程所有存储点上带码的规则，Python 在规则第一次在这个驱动上触发时拒绝；Java 对非 PostgreSQL 驱动给出带 SQLState 的普通 `SQLException`。
   - **局限**：注入的错误不带约束名、表名这类字段；Redis 流水线里，带码的注入在发送前就让整个流水线失败，而真实的错误回复只让出错的那条命令失败。
@@ -145,6 +145,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 - **范围**：取 baggage 中 `FAULTPOINT_SCOPE_KEY`（默认 `fp.scope`）的值，用于在同一次部署中区分被注入的请求与作为对照的请求。
 - **注入规则**：被注入的那次执行，记录中带有规则 id；自然发生的执行，这一项为空。比较时可以把注入本身和它引起的效果分开。
 - **样例**：当前上下文中有有效的 trace 时，每个键保留若干个 trace id（缺省 5 个，是观测输出的选项），用于把效果追溯到具体请求。
+- **耗时**：每条记录带 `elapsed`，即这些执行从进入故障点到得出结果的毫秒数之和，与 `count` 一起给出平均耗时。被注入的执行也计入它实际花的时间，包括注入的延迟。没有持续时间的类别（`branch` `check` `value` `clock`）和内核点记 0。`total` 的含义不变。
 - **独立管道**：观测写入单独的文件，不进入被测系统的日志、追踪和指标，避免进入诊断者可以申请的数据。
 - **细节**：outcome 只是一个粗的类别，同一个 outcome 之后可能发生截然不同的事。因此每条记录还带一个 `detail`：一个键和值都是字符串的映射，属于聚合键的一部分。每个类别有哪些键，由 `spec/kinds.json` 中该类别的 `details` 给出，各键的含义如下：
   - `status`：精确的状态码，例如 `409`。
