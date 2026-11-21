@@ -7,3 +7,4 @@ node_modules/
 dist/
 *.egg-info/
 go/rewrite/rewrite
+ebpf/ebpf
