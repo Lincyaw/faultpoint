@@ -300,15 +300,13 @@ public final class Jdbc {
             installation.core().check(Jdbc::refusal);
             Advices.install(installation.instrumentation(),
                     ElementMatchers.hasSuperType(ElementMatchers.named("java.sql.Statement")).and(ElementMatchers.not(ElementMatchers.isInterface())),
-                    ElementMatchers.isPublic().and(ElementMatchers.not(ElementMatchers.isAbstract()))
-                            .and(ElementMatchers.namedOneOf(EXECUTIONS.toArray(String[]::new))),
-                    "faultpoint.JdbcAdvice");
+                    new Advices.Method(ElementMatchers.isPublic().and(ElementMatchers.not(ElementMatchers.isAbstract()))
+                            .and(ElementMatchers.namedOneOf(EXECUTIONS.toArray(String[]::new))), "faultpoint.JdbcAdvice"));
             Advices.install(installation.instrumentation(),
                     ElementMatchers.hasSuperType(ElementMatchers.named("java.sql.Connection")).and(ElementMatchers.not(ElementMatchers.isInterface())),
-                    ElementMatchers.isPublic().and(ElementMatchers.not(ElementMatchers.isAbstract()))
+                    new Advices.Method(ElementMatchers.isPublic().and(ElementMatchers.not(ElementMatchers.isAbstract()))
                             .and(ElementMatchers.namedOneOf("prepareStatement", "prepareCall"))
-                            .and(ElementMatchers.takesArgument(0, String.class)),
-                    "faultpoint.JdbcAdvice$Prepare");
+                            .and(ElementMatchers.takesArgument(0, String.class)), "faultpoint.JdbcAdvice$Prepare"));
         }
     }
 }

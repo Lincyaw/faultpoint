@@ -137,9 +137,9 @@ public final class Lettuce {
             installation.core().check(Lettuce::refusal);
             Advices.install(installation.instrumentation(),
                     ElementMatchers.named("io.lettuce.core.RedisChannelHandler"),
-                    ElementMatchers.named("dispatch").and(ElementMatchers.takesArguments(1))
+                    new Advices.Method(ElementMatchers.named("dispatch").and(ElementMatchers.takesArguments(1))
                             .and(ElementMatchers.takesArgument(0, ElementMatchers.named("io.lettuce.core.protocol.RedisCommand"))),
-                    "faultpoint.LettuceAdvice");
+                            "faultpoint.LettuceAdvice"));
         }
     }
 }

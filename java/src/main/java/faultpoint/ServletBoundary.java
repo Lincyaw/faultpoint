@@ -60,11 +60,21 @@ public final class ServletBoundary {
     }
 
     /** What the entry advice hands to the exit advice; the forced status is 0 without a failure rule. */
-    public record Entry(String point, Rule rule, Context context, Scope scope, long started, int forcedStatus) {
+    public record Entry(String point, Rule rule, Context context, Scope scope, long started, int forcedStatus, Answer answer) {
         public boolean skips() {
             return rule != null && rule.kind().equals("fail");
         }
     }
+
+    /** How a request's answer turned out once its status was known: whether fail_after was decided, and the rule
+     * whose failure took the answer's place. */
+    public static final class Answer {
+        private boolean decided;
+        private Rule replacing;
+    }
+
+    /** The request this thread serves, so that the response's methods, which the servlet calls on it, find its answer. */
+    private static final ThreadLocal<Entry> SERVING = new ThreadLocal<>();
 
     /** Begin a request, or return null when it is nested, a dispatch the container makes itself, such as an async
      * or error dispatch, or faultpoint is off. */
@@ -82,33 +92,56 @@ public final class ServletBoundary {
         if (rule != null) {
             Points.hold(core, rule);
         }
-        return new Entry(point, rule, context, scope, System.nanoTime(), rule != null && rule.kind().equals("fail") ? failureStatus(rule) : 0);
+        Entry entry = new Entry(point, rule, context, scope, System.nanoTime(),
+                rule != null && rule.kind().equals("fail") ? failureStatus(rule) : 0, new Answer());
+        SERVING.set(entry);
+        return entry;
     }
 
-    public static int failureStatus(Rule rule) {
+    static int failureStatus(Rule rule) {
         Integer status = rule.integer("status");
         return status == null ? DEFAULT_FAILURE_STATUS : status;
     }
 
-    /** The fail_after rule that replaces a response, decided once the servlet returned without a failure and with the
-     * response unwritten and its status known, which only a 2xx or 3xx answer counts against the rule's trigger; a
-     * response already written, or written later by an asynchronous request, is past replacing. */
-    public static Rule replacing(Entry entry, int status, Throwable thrown, boolean written) {
-        return entry == null || thrown != null || written || !HttpClients.succeeded(status) ? null
-                : Core.current().decide(entry.point(), Core.ACTS_AFTER);
+    /** The status the response of the request this thread serves is given. The first status known, as the servlet
+     * sets it, redirects, sends an error or starts its body, is where fail_after is decided, only for a 2xx or 3xx
+     * answer; a rule that fires resets the response and answers with its failure, which every later status keeps. */
+    public static int answering(Object response, int status) throws ReflectiveOperationException {
+        Entry entry = SERVING.get();
+        if (entry == null) {
+            return status;
+        }
+        Answer answer = entry.answer();
+        if (!answer.decided) {
+            answer.decided = true;
+            Rule replacing = HttpClients.succeeded(status) ? Core.current().decide(entry.point(), Core.ACTS_AFTER) : null;
+            if (replacing != null) {
+                Class.forName("jakarta.servlet.ServletResponse", false, response.getClass().getClassLoader()).getMethod("reset").invoke(response);
+                answer.replacing = replacing;
+            }
+        }
+        return answer.replacing == null ? status : failureStatus(answer.replacing);
+    }
+
+    /** Whether the answer of the request this thread serves was replaced, so that what the servlet writes after is dropped. */
+    public static boolean replaced() {
+        Entry entry = SERVING.get();
+        return entry != null && entry.answer().replacing != null;
     }
 
     /** Leave a request's service call; the request is observed now, unless it went asynchronous, when its
-     * listener observes it on completion. Resolved is the exception a framework handled without failing the call,
-     * and replacing the fail_after rule whose failure took the answer's place, or null. */
-    public static void exit(Entry entry, int status, Throwable thrown, Object resolved, boolean asynchronous, Rule replacing) {
+     * listener observes it on completion. Resolved is the exception a framework handled without failing the call. */
+    public static void exit(Entry entry, int status, Throwable thrown, Object resolved, boolean asynchronous) {
         DEPTH.set(DEPTH.get() - 1);
         if (entry == null) {
             return;
         }
+        SERVING.remove();
         try {
             if (!asynchronous) {
-                observe(entry, status, thrown, clientAborted(thrown) || clientAborted(resolved), replacing == null ? entry.rule() : replacing);
+                Rule replacing = entry.answer().replacing;
+                observe(entry, status, thrown, clientAborted(thrown) || clientAborted(resolved),
+                        thrown == null && replacing != null ? replacing : entry.rule());
             }
         } finally {
             entry.scope().close();
@@ -190,9 +223,32 @@ public final class ServletBoundary {
             }
             installation.core().declare(Map.of("rpc_server", List.of("fail", "fail_after", "delay", "crash")), Core.EVERY_LOCATOR);
             Advices.install(installation.instrumentation(), ElementMatchers.named("jakarta.servlet.http.HttpServlet"),
-                    ElementMatchers.named("service").and(ElementMatchers.takesArguments(2))
+                    new Advices.Method(ElementMatchers.named("service").and(ElementMatchers.takesArguments(2))
                             .and(ElementMatchers.takesArgument(0, ElementMatchers.named("jakarta.servlet.ServletRequest"))),
-                    "faultpoint.ServletAdvice");
+                            "faultpoint.ServletAdvice"));
+            // A response's answer is decided where its status becomes known, and a replaced answer drops what follows.
+            Advices.install(installation.instrumentation(),
+                    ElementMatchers.hasSuperType(ElementMatchers.named("jakarta.servlet.http.HttpServletResponse"))
+                            .and(ElementMatchers.not(ElementMatchers.isInterface())),
+                    new Advices.Method(ElementMatchers.named("setStatus").and(ElementMatchers.takesArguments(int.class)),
+                            "faultpoint.ServletAdvice$Status"),
+                    new Advices.Method(ElementMatchers.named("sendError").and(ElementMatchers.takesArgument(0, int.class)),
+                            "faultpoint.ServletAdvice$Error"),
+                    new Advices.Method(ElementMatchers.named("sendRedirect").and(ElementMatchers.takesArguments(String.class)),
+                            "faultpoint.ServletAdvice$Redirect"),
+                    new Advices.Method(ElementMatchers.namedOneOf("getOutputStream", "flushBuffer").and(ElementMatchers.takesArguments(0)),
+                            "faultpoint.ServletAdvice$Body"),
+                    new Advices.Method(ElementMatchers.named("getWriter").and(ElementMatchers.takesArguments(0)),
+                            "faultpoint.ServletAdvice$Writer"),
+                    new Advices.Method(ElementMatchers.namedOneOf("setHeader", "addHeader", "setIntHeader", "addIntHeader",
+                            "setDateHeader", "addDateHeader", "setContentLength", "setContentLengthLong", "setContentType",
+                            "setCharacterEncoding", "setLocale", "addCookie", "reset", "resetBuffer", "setBufferSize"),
+                            "faultpoint.ServletAdvice$Dropped"));
+            Advices.install(installation.instrumentation(),
+                    ElementMatchers.hasSuperType(ElementMatchers.named("jakarta.servlet.ServletOutputStream"))
+                            .and(ElementMatchers.not(ElementMatchers.isInterface())),
+                    new Advices.Method(ElementMatchers.named("write").and(ElementMatchers.not(ElementMatchers.isAbstract())),
+                            "faultpoint.ServletAdvice$Dropped"));
         }
     }
 }

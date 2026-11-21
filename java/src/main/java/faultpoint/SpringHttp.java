@@ -184,15 +184,13 @@ public final class SpringHttp {
             Advices.install(installation.instrumentation(),
                     ElementMatchers.hasSuperType(ElementMatchers.named("org.springframework.http.client.ClientHttpRequest"))
                             .and(ElementMatchers.not(ElementMatchers.isInterface())),
-                    ElementMatchers.named("execute").and(ElementMatchers.takesArguments(0))
-                            .and(ElementMatchers.not(ElementMatchers.isAbstract())),
-                    "faultpoint.SpringHttpAdvice");
+                    new Advices.Method(ElementMatchers.named("execute").and(ElementMatchers.takesArguments(0))
+                            .and(ElementMatchers.not(ElementMatchers.isAbstract())), "faultpoint.SpringHttpAdvice"));
             Advices.install(installation.instrumentation(),
                     ElementMatchers.hasSuperType(ElementMatchers.named("org.springframework.http.client.AbstractStreamingClientHttpRequest")),
-                    ElementMatchers.named("executeInternal").and(ElementMatchers.takesArguments(2))
+                    new Advices.Method(ElementMatchers.named("executeInternal").and(ElementMatchers.takesArguments(2))
                             .and(ElementMatchers.takesArgument(1, ElementMatchers.named("org.springframework.http.StreamingHttpOutputMessage$Body")))
-                            .and(ElementMatchers.not(ElementMatchers.isAbstract())),
-                    "faultpoint.SpringHttpAdvice$Streaming");
+                            .and(ElementMatchers.not(ElementMatchers.isAbstract())), "faultpoint.SpringHttpAdvice$Streaming"));
         }
     }
 }
