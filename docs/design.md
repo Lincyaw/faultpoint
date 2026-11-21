@@ -337,9 +337,14 @@ eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能
   - **拒绝**：没有返回指令的函数（例如尾跳转的包装函数）、没有 DWARF 返回类别的函数（目前包括 Go 的结果），都在启动时拒绝，并提示把它排除出选择。
   - **局限**：生成的点没有注入条件。一个值在某条路径上自然出现，不代表在别的路径上合法：在 redis-server 写路径上给 `lookupKey` 注入 NULL 仍会触发它的断言。这类函数保留带注入条件的手写条目。
 - **接入搜索**：每条记录导出为清单中的 `PointEntry`，`build_catalog` 不变；层显式记录；取值域参数化动作模板，例如系统调用的 `fail` 使用该调用观测到的 errno，而不是固定的 EIO。
+- **内核函数点**：选中的 `security_*` 记录（返回 int）生成内核层的 `call` 点，用 fmod_ret 注入、fexit 观测，都按当前任务的 cgroup 过滤。
+  - **挂载时机**：fexit 只在代理报告观测期间挂载，fmod_ret 只在有规则时挂载、规则移除就卸下。
+  - **条件**：规则可以用 `when` 给出参数条件，`port`、`address`（IPv4 与 IPv4-mapped 一并比较）和文件的 `name`（base name），给出的字段都要满足。函数参数里必须有对应的 `struct sockaddr *` 或 `struct file *`，否则拒绝。只有内核 `call` 点实现 `when`，语言 SDK 的点拒绝它。
+  - **取值**：LSM 惯例的 EACCES、EPERM，加上调用方操作本身可能产生的 errno（例如 connect 的 ECONNREFUSED、ENETUNREACH、EHOSTUNREACH）。
+  - **观测**：被注入的调用只记在规则下。系统调用的观测仍会把它产生的结果记为一次自然结果，那是注入的效果。
+  - **不提供的函数**：`should_fail_bio` 在 `submit_bio_noacct` 中被内联，错误注入名单、kprobe 和 fmod_ret 指向的独立副本只有拆分 bio 的路径调用；实测 20 秒内 8 万多个 bio 中只有 7848 次经过它，没有一个是目标设备的。所以它不能忠实地作用于目标，选中时代理启动即拒绝。同一次跟踪也确认，kworker 提交的 bio 带着其他 cgroup 的 blkcg，块 I/O 按当前进程过滤会漏掉。`__filemap_add_folio` 暂不提供：它在页缓存的热路径上，调用方对失败的处理各不相同，而且参数里没有可作条件的端口、地址或文件名。
 
 **待验证**：
-- `should_fail_bio` 的工作常在 kworker 中执行，要按 bio 的 blkcg 而不是当前进程过滤。
 - 按 pid 过滤的 uprobe 能否跟随 fork。
 
 ## 7. 配置与运行时
@@ -398,7 +403,7 @@ eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能
 | 消息边界 | Redis Streams（经 redis-py） | Redis Streams（经 go-redis） | Redis Streams（经 ioredis） | Redis Streams（经 Lettuce） | Redis Streams（经 redis-rs） | — |
 | 依赖库中的故障点（第 6.4 节） | 已实现，只改写纯 Python 模块；`faultpoint candidates` 列出执行过的候选 | 已实现，模块副本加 `replace` | 已实现 | 已实现 | 已实现，crate 副本加 `[patch]` | — |
 | 原生函数中的故障点（第 6.5 节） | — | — | — | — | — | 已实现：`call`（`fail` `crash`）、`check`（`negate` `crash`），仅 x86-64，内核 6.18 及以上 |
-| eBPF 可挂载点目录（第 6.6 节） | — | — | — | — | — | 已实现：只读的 `scan`、`event` 类别、由记录生成原生函数点、`merge`、观测全部系统调用；内核函数点（kprobe 改写返回值、fmod_ret）尚未提供 |
+| eBPF 可挂载点目录（第 6.6 节） | — | — | — | — | — | 已实现：只读的 `scan`、`event` 类别、由记录生成原生函数点、`merge`、观测全部系统调用、`security_*` 的内核函数点（带端口、地址、文件名条件）；`should_fail_bio` 不提供，`__filemap_add_folio` 暂缓 |
 | 接入 | 导入钩子 | 构建副本，自动装配边界 | `--import` 加载钩子 | `-javaagent` | 构建副本 | 特权进程 |
 | 未覆盖 | 非 uvicorn 运行的 ASGI 应用 | 依赖内部创建的服务端和客户端；pgx 的 `CopyFrom` `Commit` `Rollback` | 直接使用 undici | WebClient、Feign、Apache HttpClient、OkHttp | reqwest、`query!` 宏、类型化的 Redis 命令方法 | 自然丢包、32 位兼容系统调用、IPv6（未验证） |
 | 只重放置候选故障点（第 6.4 节第 3 步） | 未实现 | 未实现 | 未实现 | 未实现 | 未实现 | — |

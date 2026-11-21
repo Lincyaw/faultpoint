@@ -5,7 +5,17 @@
       "properties": {
         "error": {"type": "string", "minLength": 1},
         "status": {"type": "integer", "minimum": 100, "maximum": 599},
-        "code": {"type": "string", "minLength": 1}
+        "code": {"type": "string", "minLength": 1},
+        "when": {
+          "type": "object",
+          "properties": {
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "address": {"type": "string", "minLength": 1},
+            "name": {"type": "string", "minLength": 1, "maxLength": 62, "pattern": "^[^/]+$"}
+          },
+          "additionalProperties": false,
+          "minProperties": 1
+        }
       },
       "additionalProperties": false
     },
