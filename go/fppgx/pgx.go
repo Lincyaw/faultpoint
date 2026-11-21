@@ -127,8 +127,12 @@ func Exec(db execer, ctx context.Context, sql string, arguments ...any) (pgconn.
 	if passes(ctx) {
 		return db.Exec(ctx, sql, arguments...)
 	}
+	defer faultpoint.Guard()
 	s := decide(ctx, sql)
-	run := func() (pgconn.CommandTag, error) { return db.Exec(s.inner, sql, arguments...) }
+	run := func() (tag pgconn.CommandTag, err error) {
+		faultpoint.Outside(func() { tag, err = db.Exec(s.inner, sql, arguments...) })
+		return tag, err
+	}
 	var tag pgconn.CommandTag
 	var err error
 	switch s.action {
@@ -164,6 +168,7 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 	if passes(ctx) {
 		return db.Query(ctx, sql, arguments...)
 	}
+	defer faultpoint.Guard()
 	s := decide(ctx, sql)
 	s.refuse("Query", "drop")
 	if s.action == "fail" {
@@ -171,13 +176,17 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 		s.observe(0, err)
 		return failedRows{err: err}, err
 	}
-	rows, err := db.Query(s.inner, sql, arguments...)
+	var rows pgx.Rows
+	var err error
+	faultpoint.Outside(func() { rows, err = db.Query(s.inner, sql, arguments...) })
 	if err == nil && s.action == "duplicate" {
-		rows.Close()
-		err = rows.Err()
+		faultpoint.Outside(func() {
+			rows.Close()
+			err = rows.Err()
+		})
 	}
 	if err == nil && s.action == "duplicate" {
-		rows, err = db.Query(s.inner, sql, arguments...)
+		faultpoint.Outside(func() { rows, err = db.Query(s.inner, sql, arguments...) })
 	}
 	if err != nil {
 		s.observe(0, err)
@@ -199,15 +208,21 @@ type observedRows struct {
 }
 
 // Err is the error of the rows: a fail_after rule's, or pgx's.
-func (r *observedRows) Err() error {
+func (r *observedRows) Err() (err error) {
+	defer faultpoint.Guard()
 	if r.err != nil {
 		return r.err
 	}
-	return r.Rows.Err()
+	faultpoint.Outside(func() { err = r.Rows.Err() })
+	return err
 }
 
-func (r *observedRows) Next() bool {
-	if !r.empty && r.Rows.Next() {
+func (r *observedRows) Next() (more bool) {
+	defer faultpoint.Guard()
+	if !r.empty {
+		faultpoint.Outside(func() { more = r.Rows.Next() })
+	}
+	if more {
 		r.read++
 		return true
 	}
@@ -216,7 +231,8 @@ func (r *observedRows) Next() bool {
 }
 
 func (r *observedRows) Close() {
-	r.Rows.Close()
+	defer faultpoint.Guard()
+	faultpoint.Outside(r.Rows.Close)
 	r.finish()
 }
 
@@ -226,13 +242,18 @@ func (r *observedRows) finish() {
 		return
 	}
 	r.done = true
-	r.Rows.Close()
-	if r.Rows.Err() == nil {
+	var err error
+	var tag pgconn.CommandTag
+	faultpoint.Outside(func() {
+		r.Rows.Close()
+		err, tag = r.Rows.Err(), r.Rows.CommandTag()
+	})
+	if err == nil {
 		r.err = r.statement.failAfter()
 	}
 	rows := r.read
 	if r.statement.kind == "store_write" {
-		rows = r.Rows.CommandTag().RowsAffected()
+		rows = tag.RowsAffected()
 	}
 	r.statement.observe(rows, r.Err())
 }
@@ -246,9 +267,13 @@ func QueryRow(db rowQuerier, ctx context.Context, sql string, arguments ...any) 
 	if passes(ctx) {
 		return db.QueryRow(ctx, sql, arguments...)
 	}
+	defer faultpoint.Guard()
 	s := decide(ctx, sql)
 	s.refuse("QueryRow", "drop")
-	row := &observedRow{statement: s, query: func() pgx.Row { return db.QueryRow(s.inner, sql, arguments...) }}
+	row := &observedRow{statement: s, query: func() (row pgx.Row) {
+		faultpoint.Outside(func() { row = db.QueryRow(s.inner, sql, arguments...) })
+		return row
+	}}
 	if s.action != "fail" {
 		row.row = row.query()
 	}
@@ -262,16 +287,16 @@ type observedRow struct {
 }
 
 // Scan reads the row; a missing row is the empty outcome of a read, not an error.
-func (r *observedRow) Scan(dest ...any) error {
+func (r *observedRow) Scan(dest ...any) (err error) {
+	defer faultpoint.Guard()
 	s := r.statement
-	var err error
 	if s.action == "fail" {
 		err = action.Failure(s.rule, postgresError)
 	} else {
-		err = r.row.Scan(dest...)
+		faultpoint.Outside(func() { err = r.row.Scan(dest...) })
 	}
 	if err == nil && s.action == "duplicate" {
-		err = r.query().Scan(dest...)
+		faultpoint.Outside(func() { err = r.query().Scan(dest...) })
 	}
 	if err == nil {
 		err = s.failAfter()
@@ -298,6 +323,7 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 	if passes(ctx) {
 		return db.SendBatch(ctx, batch)
 	}
+	defer faultpoint.Guard()
 	var queries []string
 	for _, queued := range batch.QueuedQueries {
 		if !slices.Contains(queries, queued.SQL) {
@@ -311,13 +337,13 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 	if s.action == "fail" {
 		err = action.Failure(s.rule, postgresError)
 	} else {
-		results = db.SendBatch(s.inner, batch)
+		faultpoint.Outside(func() { results = db.SendBatch(s.inner, batch) })
 	}
 	if err == nil && s.action == "duplicate" {
-		err = results.Close()
+		faultpoint.Outside(func() { err = results.Close() })
 	}
 	if err == nil && s.action == "duplicate" {
-		results = db.SendBatch(s.inner, batch)
+		faultpoint.Outside(func() { results = db.SendBatch(s.inner, batch) })
 	}
 	if err != nil {
 		s.observe(0, err)
@@ -337,11 +363,12 @@ type observedResults struct {
 }
 
 func (r *observedResults) Close() error {
+	defer faultpoint.Guard()
 	if r.closed {
 		return r.err
 	}
 	r.closed = true
-	r.err = r.BatchResults.Close()
+	faultpoint.Outside(func() { r.err = r.BatchResults.Close() })
 	if r.err == nil {
 		r.err = r.statement.failAfter()
 	}
@@ -374,15 +401,14 @@ func BeginTx(db optionsBeginner, ctx context.Context, options pgx.TxOptions) (pg
 }
 
 // begin starts a transaction unless a fail rule refuses it; nothing else can be injected where no statement runs.
-func begin(ctx context.Context, run func(context.Context) (pgx.Tx, error)) (pgx.Tx, error) {
+func begin(ctx context.Context, run func(context.Context) (pgx.Tx, error)) (tx pgx.Tx, err error) {
+	defer faultpoint.Guard()
 	s := decide(ctx, "BEGIN")
 	s.refuse("Begin", "drop", "duplicate")
-	var tx pgx.Tx
-	var err error
 	if s.action == "fail" {
 		err = action.Failure(s.rule, postgresError)
 	} else {
-		tx, err = run(s.inner)
+		faultpoint.Outside(func() { tx, err = run(s.inner) })
 	}
 	if err == nil && s.failAfter() != nil {
 		s.refuse("Begin", "fail_after")

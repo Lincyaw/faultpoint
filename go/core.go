@@ -293,18 +293,32 @@ func AtExit(cleanup func()) {
 
 // End writes the pending observations and runs the registered cleanups, once however often it is called; Crash and
 // Abort call it, and the rewriter defers it in a program's main, so that a main that returns, as after a graceful
-// shutdown, loses nothing. A concurrent call returns once the first has finished.
+// shutdown, loses nothing. A concurrent call returns once the first has finished. When the observations cannot be
+// written, the cleanups still run and the process stops with the code of invalid rules.
 func End() {
 	current.end.Do(func() {
 		current.exit.Lock()
 		defer current.exit.Unlock()
+		var failure any
 		if current.started.Load() && current.sink != nil {
-			current.sink.Flush()
+			failure = flushLast()
 		}
 		for _, cleanup := range current.cleanups {
 			cleanup()
 		}
+		if failure != nil {
+			fmt.Fprintf(os.Stderr, "faultpoint: cannot write the last observations: %v; stopping the process\n", failure)
+			os.Exit(invalidRulesExit)
+		}
 	})
+}
+
+// flushLast writes the pending observations as the process ends and returns why it could not, nil when it could,
+// so that End still runs the cleanups.
+func flushLast() (failure any) {
+	defer func() { failure = recover() }()
+	current.sink.Flush()
+	return nil
 }
 
 // EndOnSignals ends the process on SIGINT and SIGTERM as their default action does, by the same signal, once End
@@ -377,8 +391,12 @@ func Guard() {
 // application as it was instead of ending the process.
 func Outside(call func()) {
 	defer func() {
-		if recovered := recover(); recovered != nil {
-			panic(outside{value: recovered})
+		recovered := recover()
+		if _, marked := recovered.(outside); recovered != nil && !marked {
+			recovered = outside{value: recovered}
+		}
+		if recovered != nil {
+			panic(recovered)
 		}
 	}()
 	call()

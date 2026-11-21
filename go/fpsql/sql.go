@@ -77,6 +77,7 @@ func DriverName(name string) string {
 	if !enabled {
 		return name
 	}
+	defer faultpoint.Guard()
 	drivers.Lock()
 	defer drivers.Unlock()
 	instrumented := instrumentedPrefix + name
@@ -117,6 +118,7 @@ func begin(ctx context.Context, query string) (string, *faultpoint.Rule, string)
 }
 
 func (i interceptor) exec(ctx context.Context, query string, run func() (driver.Result, error)) (driver.Result, error) {
+	defer faultpoint.Guard()
 	point, rule, kind := begin(ctx, query)
 	var result driver.Result
 	var err error
@@ -126,10 +128,10 @@ func (i interceptor) exec(ctx context.Context, query string, run func() (driver.
 	case "drop":
 		result = driver.RowsAffected(1)
 	default:
-		result, err = run()
+		faultpoint.Outside(func() { result, err = run() })
 	}
 	if err == nil && kind == "duplicate" {
-		result, err = run()
+		faultpoint.Outside(func() { result, err = run() })
 	}
 	if err == nil && rule == nil {
 		rule = faultpoint.Decide(ctx, point, "fail_after")
@@ -141,7 +143,8 @@ func (i interceptor) exec(ctx context.Context, query string, run func() (driver.
 		faultpoint.Observe(ctx, point, "error", 0, rule, sqlpoint.ErrorDetail(err))
 		return nil, err
 	}
-	affected, err := result.RowsAffected()
+	var affected int64
+	faultpoint.Outside(func() { affected, err = result.RowsAffected() })
 	if err != nil {
 		affected = 0
 	}
@@ -194,13 +197,14 @@ func (q *query) failAfter(ctx context.Context, coded func(code string) error) er
 }
 
 func (i interceptor) read(ctx context.Context, sql string, run func() (driver.Rows, error)) (context.Context, driver.Rows, error) {
+	defer faultpoint.Guard()
 	point, rule, kind := begin(ctx, sql)
 	var rows driver.Rows
 	var err error
 	if kind == "fail" {
 		err = action.Failure(rule, i.coded)
 	} else {
-		rows, err = run()
+		faultpoint.Outside(func() { rows, err = run() })
 	}
 	if err != nil {
 		faultpoint.Observe(ctx, point, "error", 0, rule, sqlpoint.ErrorDetail(err))
@@ -232,12 +236,13 @@ func (i interceptor) StmtQueryContext(ctx context.Context, stmt driver.StmtQuery
 	return i.read(ctx, sql, func() (driver.Rows, error) { return stmt.QueryContext(ctx, args) })
 }
 
-func (i interceptor) RowsNext(ctx context.Context, rows driver.Rows, dest []driver.Value) error {
+func (i interceptor) RowsNext(ctx context.Context, rows driver.Rows, dest []driver.Value) (err error) {
+	defer faultpoint.Guard()
 	state, found := ctx.Value(queryKey{}).(*query)
 	if found && state.empty {
 		return io.EOF
 	}
-	err := rows.Next(dest)
+	faultpoint.Outside(func() { err = rows.Next(dest) })
 	if found {
 		err = state.advance(ctx, err, i.coded)
 	}
@@ -246,8 +251,9 @@ func (i interceptor) RowsNext(ctx context.Context, rows driver.Rows, dest []driv
 
 // RowsClose closes a statement's rows and observes its outcome once they are counted; rows the caller closes before
 // their end without an error, as Row.Scan does, may still take a fail_after rule's error here.
-func (i interceptor) RowsClose(ctx context.Context, rows driver.Rows) error {
-	err := rows.Close()
+func (i interceptor) RowsClose(ctx context.Context, rows driver.Rows) (err error) {
+	defer faultpoint.Guard()
+	faultpoint.Outside(func() { err = rows.Close() })
 	state, found := ctx.Value(queryKey{}).(*query)
 	if found && err == nil && !state.ended {
 		err = state.failAfter(ctx, i.coded)

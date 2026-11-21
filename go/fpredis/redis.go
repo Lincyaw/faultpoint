@@ -71,6 +71,7 @@ func commandLocator(locator string) bool {
 // Instrument adds the hook to a client and returns it; the client of a plugin that is not enabled is returned as
 // it is.
 func Instrument[C interface{ AddHook(redis.Hook) }](client C) C {
+	defer faultpoint.Guard()
 	if enabled {
 		client.AddHook(hook{})
 	}
@@ -273,19 +274,20 @@ type hook struct{}
 func (hook) DialHook(next redis.DialHook) redis.DialHook { return next }
 
 func (hook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
-	return func(ctx context.Context, cmd redis.Cmder) error {
+	return func(ctx context.Context, cmd redis.Cmder) (err error) {
+		defer faultpoint.Guard()
 		c, known := decide(ctx, cmd)
 		if !known {
-			return next(ctx, cmd)
+			faultpoint.Outside(func() { err = next(ctx, cmd) })
+			return err
 		}
-		var err error
 		if c.sent() {
-			err = next(ctx, cmd)
+			faultpoint.Outside(func() { err = next(ctx, cmd) })
 		} else {
 			c.block(cmd)
 		}
 		if err == nil && c.action == "duplicate" {
-			err = next(ctx, cmd)
+			faultpoint.Outside(func() { err = next(ctx, cmd) })
 		}
 		return c.settle(cmd, err)
 	}
@@ -294,7 +296,8 @@ func (hook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 // ProcessPipelineHook sends the commands no rule keeps back in one round trip, as the caller asked; a duplicate
 // would leave the pipeline or its transaction, so a pipeline cannot duplicate.
 func (hook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
-	return func(ctx context.Context, cmds []redis.Cmder) error {
+	return func(ctx context.Context, cmds []redis.Cmder) (err error) {
+		defer faultpoint.Guard()
 		calls := make([]call, len(cmds))
 		known := make([]bool, len(cmds))
 		sent := make([]redis.Cmder, 0, len(cmds))
@@ -307,9 +310,8 @@ func (hook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPip
 				sent = append(sent, cmd)
 			}
 		}
-		var err error
 		if len(sent) > 0 {
-			err = next(ctx, sent)
+			faultpoint.Outside(func() { err = next(ctx, sent) })
 		}
 		for index, cmd := range cmds {
 			if known[index] {

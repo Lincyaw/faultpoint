@@ -163,6 +163,7 @@ type server struct{ next http.Handler }
 // Handler is the rpc_server point of every route of a handler, nil meaning http.DefaultServeMux as for an
 // http.Server; it returns the handler unchanged when the plugin is not enabled.
 func Handler(next http.Handler) http.Handler {
+	defer faultpoint.Guard()
 	if _, wrapped := next.(server); !enabled || wrapped {
 		return next
 	}
@@ -191,11 +192,12 @@ func (a *answer) settle(code int) {
 // header settles the first final status the handler writes and writes the status settled on.
 func (a *answer) header(next httpsnoop.WriteHeaderFunc) httpsnoop.WriteHeaderFunc {
 	return func(code int) {
+		defer faultpoint.Guard()
 		if a.status == 0 && code >= http.StatusOK {
 			a.settle(code)
 			code = a.status
 		}
-		next(code)
+		faultpoint.Outside(func() { next(code) })
 	}
 }
 
@@ -212,88 +214,107 @@ func (a *answer) implicit() {
 }
 
 func (a *answer) write(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
-	return func(body []byte) (int, error) {
+	return func(body []byte) (written int, err error) {
+		defer faultpoint.Guard()
 		a.implicit()
 		if a.replaced() {
 			return len(body), nil
 		}
-		return next(body)
+		faultpoint.Outside(func() { written, err = next(body) })
+		return written, err
 	}
 }
 
 func (a *answer) writeString(next httpsnoop.WriteStringFunc) httpsnoop.WriteStringFunc {
-	return func(body string) (int, error) {
+	return func(body string) (written int, err error) {
+		defer faultpoint.Guard()
 		a.implicit()
 		if a.replaced() {
 			return len(body), nil
 		}
-		return next(body)
+		faultpoint.Outside(func() { written, err = next(body) })
+		return written, err
 	}
 }
 
 func (a *answer) readFrom(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
-	return func(source io.Reader) (int64, error) {
+	return func(source io.Reader) (read int64, err error) {
+		defer faultpoint.Guard()
 		a.implicit()
 		if a.replaced() {
-			return io.Copy(io.Discard, source)
+			faultpoint.Outside(func() { read, err = io.Copy(io.Discard, source) })
+		} else {
+			faultpoint.Outside(func() { read, err = next(source) })
 		}
-		return next(source)
+		return read, err
 	}
 }
 
 func (a *answer) flush(next httpsnoop.FlushFunc) httpsnoop.FlushFunc {
 	return func() {
+		defer faultpoint.Guard()
 		a.implicit()
-		next()
+		faultpoint.Outside(next)
 	}
 }
 
 func (a *answer) flushError(next httpsnoop.FlushErrorFunc) httpsnoop.FlushErrorFunc {
-	return func() error {
+	return func() (err error) {
+		defer faultpoint.Guard()
 		a.implicit()
-		return next()
+		faultpoint.Outside(func() { err = next() })
+		return err
 	}
 }
 
 // hijack leaves a hijacked connection's answer to the handler, observed as 200 as net/http reports it.
 func (a *answer) hijack(next httpsnoop.HijackFunc) httpsnoop.HijackFunc {
-	return func() (net.Conn, *bufio.ReadWriter, error) {
+	return func() (connection net.Conn, buffered *bufio.ReadWriter, err error) {
+		defer faultpoint.Guard()
 		if a.status == 0 {
 			a.status = http.StatusOK
 		}
-		return next()
+		faultpoint.Outside(func() { connection, buffered, err = next() })
+		return connection, buffered, err
 	}
 }
 
 func (s server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	defer faultpoint.Guard()
 	next := s.next
 	if next == nil {
 		next = http.DefaultServeMux
 	}
 	call := Take(request)
 	if call == nil {
-		next.ServeHTTP(writer, request)
+		faultpoint.Outside(func() { next.ServeHTTP(writer, request) })
 		return
 	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			call.Panicked(recovered)
-			panic(recovered)
-		}
-	}()
 	var status int
 	if call.Action() == "fail" {
 		status = call.FailureStatus()
 		writer.WriteHeader(status)
 	} else {
 		answered := &answer{call: call, writer: writer}
-		next.ServeHTTP(httpsnoop.Wrap(writer, httpsnoop.Hooks{WriteHeader: answered.header, Write: answered.write,
+		wrapped := httpsnoop.Wrap(writer, httpsnoop.Hooks{WriteHeader: answered.header, Write: answered.write,
 			WriteString: answered.writeString, ReadFrom: answered.readFrom, Flush: answered.flush,
-			FlushError: answered.flushError, Hijack: answered.hijack}), call.Request)
+			FlushError: answered.flushError, Hijack: answered.hijack})
+		faultpoint.Outside(func() { handle(call, next, wrapped) })
 		answered.implicit()
 		status = answered.status
 	}
 	call.Finish(status)
+}
+
+// handle runs the handler of a request the server point took, observing a panic of it, which goes on.
+func handle(call *ServerCall, next http.Handler, writer http.ResponseWriter) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			call.Panicked(recovered)
+			panic(recovered)
+		}
+	}()
+	next.ServeHTTP(writer, call.Request)
 }
 
 type client struct{ base http.RoundTripper }
@@ -301,6 +322,7 @@ type client struct{ base http.RoundTripper }
 // Transport is the rpc_client point of every request a round tripper sends, nil meaning http.DefaultTransport as
 // for an http.Client; it returns the round tripper unchanged when the plugin is not enabled.
 func Transport(base http.RoundTripper) http.RoundTripper {
+	defer faultpoint.Guard()
 	if _, wrapped := base.(client); !enabled || wrapped {
 		return base
 	}
@@ -344,6 +366,7 @@ func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, erro
 // the peer; a failure's detail tells whether the request was written completely, that is whether the peer may have
 // acted on it.
 func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
+	defer faultpoint.Guard()
 	base := c.base
 	if base == nil {
 		base = http.DefaultTransport
@@ -364,7 +387,9 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 		kind = rule.Action.Kind
 	}
 	if kind == "duplicate" && request.Body != nil && request.GetBody == nil {
-		body, err := io.ReadAll(request.Body)
+		var body []byte
+		var err error
+		faultpoint.Outside(func() { body, err = io.ReadAll(request.Body) })
 		if err != nil {
 			return nil, err
 		}
@@ -376,7 +401,7 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 	if kind == "fail" {
 		response, err = failure(request, rule)
 	} else {
-		response, err = base.RoundTrip(request)
+		faultpoint.Outside(func() { response, err = base.RoundTrip(request) })
 	}
 	if err == nil && rule == nil && succeeded(response.StatusCode) {
 		rule = faultpoint.Decide(ctx, point, "fail_after")
@@ -385,14 +410,16 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 		kind = rule.Action.Kind
 	}
 	if err == nil && (kind == "duplicate" || kind == "fail_after") {
-		io.Copy(io.Discard, response.Body)
-		response.Body.Close()
+		faultpoint.Outside(func() {
+			io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+		})
 	}
 	if err == nil && kind == "duplicate" && request.GetBody != nil {
-		request.Body, err = request.GetBody()
+		faultpoint.Outside(func() { request.Body, err = request.GetBody() })
 	}
 	if err == nil && kind == "duplicate" {
-		response, err = base.RoundTrip(request)
+		faultpoint.Outside(func() { response, err = base.RoundTrip(request) })
 	}
 	if err == nil && kind == "fail_after" {
 		response, err = failure(request, rule)

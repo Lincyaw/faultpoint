@@ -16,6 +16,7 @@ var enabled = faultpoint.Register(faultpoint.Plugin{Name: "gin", Actions: map[st
 // Instrument adds the rpc_server middleware to an engine where it is created, before any route, and returns the
 // engine; the engine of a plugin that is not enabled is returned as it is.
 func Instrument(engine *gin.Engine) *gin.Engine {
+	defer faultpoint.Guard()
 	if enabled {
 		engine.Use(serve)
 	}
@@ -46,61 +47,75 @@ func (a *answer) settle() {
 }
 
 func (a *answer) WriteHeader(code int) {
+	defer faultpoint.Guard()
 	if !a.replaced() {
-		a.ResponseWriter.WriteHeader(code)
+		faultpoint.Outside(func() { a.ResponseWriter.WriteHeader(code) })
 	}
 }
 
 func (a *answer) WriteHeaderNow() {
+	defer faultpoint.Guard()
 	a.settle()
-	a.ResponseWriter.WriteHeaderNow()
+	faultpoint.Outside(a.ResponseWriter.WriteHeaderNow)
 }
 
-func (a *answer) Write(body []byte) (int, error) {
+func (a *answer) Write(body []byte) (written int, err error) {
+	defer faultpoint.Guard()
 	a.WriteHeaderNow()
 	if a.replaced() {
 		return len(body), nil
 	}
-	return a.ResponseWriter.Write(body)
+	faultpoint.Outside(func() { written, err = a.ResponseWriter.Write(body) })
+	return written, err
 }
 
-func (a *answer) WriteString(body string) (int, error) {
+func (a *answer) WriteString(body string) (written int, err error) {
+	defer faultpoint.Guard()
 	a.WriteHeaderNow()
 	if a.replaced() {
 		return len(body), nil
 	}
-	return a.ResponseWriter.WriteString(body)
+	faultpoint.Outside(func() { written, err = a.ResponseWriter.WriteString(body) })
+	return written, err
 }
 
 func (a *answer) Flush() {
+	defer faultpoint.Guard()
 	a.WriteHeaderNow()
-	a.ResponseWriter.Flush()
+	faultpoint.Outside(a.ResponseWriter.Flush)
 }
 
 func serve(c *gin.Context) {
+	defer faultpoint.Guard()
 	call := fphttp.Take(c.Request)
 	if call == nil {
-		c.Next()
+		faultpoint.Outside(c.Next)
 		return
 	}
 	c.Request = call.Request
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			call.Panicked(recovered)
-			panic(recovered)
-		}
-	}()
 	if call.Action() == "fail" {
 		c.AbortWithStatus(call.FailureStatus())
 	} else {
 		writer := c.Writer
 		answered := &answer{ResponseWriter: writer, call: call}
 		c.Writer = answered
-		c.Next()
+		faultpoint.Outside(func() { handle(call, c) })
 		// gin writes the header of a handler that wrote nothing after the middleware returns, so the status is settled
 		// here without writing it.
 		answered.settle()
 		c.Writer = writer
 	}
 	call.Finish(c.Writer.Status())
+}
+
+// handle runs the handlers after the middleware for a request the server point took, observing a panic of them,
+// which goes on.
+func handle(call *fphttp.ServerCall, c *gin.Context) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			call.Panicked(recovered)
+			panic(recovered)
+		}
+	}()
+	c.Next()
 }
