@@ -94,7 +94,7 @@ class ServerExchange:
         self.abandoned = False
 
     async def receive(self) -> Message:
-        message = self.held.pop() if self.held else await self.inner_receive()
+        message = self.held.pop(0) if self.held else await self.inner_receive()
         self.abandoned = self.abandoned or message["type"] == HTTP_DISCONNECT
         return message
 
