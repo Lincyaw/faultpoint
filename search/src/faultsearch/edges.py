@@ -119,12 +119,23 @@ class EffectRule(BaseModel):
         return [Action.model_validate({**template.model_dump(), **given}) for template in self.faults]
 
 
+class InjectedError(BaseModel):
+    """The name of an error type only an SDK's injection gives, under which an observation reports it."""
+
+    model_config = FROZEN
+
+    name: str
+    reason: str
+
+
 class EffectMap(BaseModel):
     model_config = FROZEN
 
     entry_service: str
     """The service whose responses the user sees, which the explored system names."""
     terminal_outcomes: tuple[str, ...]
+    injected_errors: tuple[InjectedError, ...] = ()
+    """Recorded maps from before these names were listed list none."""
     rules: tuple[EffectRule, ...]
 
     @classmethod
@@ -136,6 +147,11 @@ class EffectMap(BaseModel):
         """Whether an effect is a failure the user sees: a non-2xx response of the entry service."""
         return (point_service(effect.point) == self.entry_service and point_kind(effect.point) == RPC_SERVER
                 and effect.outcome in self.terminal_outcomes)
+
+    def injected(self, effect: EffectKey) -> bool:
+        """Whether an effect names an error only an injection gives, so that only a run injecting the fault behind it
+        shows it."""
+        return effect.detail.get(ERROR) in {error.name for error in self.injected_errors}
 
 
 class Counterpart(StrEnum):
@@ -177,6 +193,9 @@ class Edge(BaseModel):
     effect_layer: Layer
     acts_on: str | None = None
     """For a fault no rule can scope, the container or process it reaches the whole of."""
+    injected: bool = False
+    """Whether the effect names an error only an injection gives, so that the edge can start a chain but not continue
+    one: a counterpart stands in for a natural effect, which never names that error."""
 
     @property
     def held_in(self) -> frozenset[str]:
@@ -276,6 +295,7 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
             edges.append(Edge(cause=runs[0].fault, effect=effect, held=tuple(held), not_held=tuple(not_held),
                               conditions=learn_conditions(held_in, not_held, scenarios), counterpart=counterpart,
                               counterparts=faults, terminal=effects.terminal(effect), effect_layer=layer,
+                              injected=effects.injected(effect),
                               acts_on=None if runs[0].fault.scoped else targets[point_service(runs[0].fault.point)]))
     return edges
 

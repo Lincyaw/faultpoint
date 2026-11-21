@@ -1,4 +1,5 @@
 from collections import Counter, defaultdict
+from enum import StrEnum
 from statistics import fmean
 from typing import Final
 
@@ -11,6 +12,15 @@ from faultsearch.edges import Condition, Edge, holds
 
 LAYER_PATH_SEPARATOR: Final = " > "
 CROSS_LAYER_KEPT: Final = 300
+
+
+class Visibility(StrEnum):
+    """What the scenarios tested tell of a chain: one of them showed it end to end, none did, or one that did not
+    show it injected the first fault in only some repetitions."""
+
+    SINGLE_SCENARIO = "single-scenario"
+    STITCHED_ONLY = "stitched-only"
+    UNDETERMINED = "undetermined"
 
 
 class Hop(BaseModel):
@@ -48,10 +58,25 @@ class Chain(BaseModel):
     """The mean similarity of the clusters of the hops' faults."""
     end_to_end: tuple[str, ...]
     """The scenarios where injecting the first fault alone showed every hop's effect."""
+    undetermined: tuple[str, ...] = ()
+    """The scenarios that did not show the chain but injected the first fault in only some repetitions, an unfinished
+    test that tells neither whether they show it nor whether they do not."""
 
     @property
     def stitched_only(self) -> bool:
-        return not self.end_to_end
+        """Every scenario that tested the first fault in all repetitions failed to show the chain, and no test of it
+        was left unfinished."""
+        return not self.end_to_end and not self.undetermined
+
+    @property
+    def shown(self) -> bool:
+        """Some scenario showed the chain end to end."""
+        return bool(self.end_to_end)
+
+    @property
+    def visibility(self) -> Visibility:
+        return (Visibility.SINGLE_SCENARIO if self.shown else Visibility.STITCHED_ONLY if self.stitched_only
+                else Visibility.UNDETERMINED)
 
     @property
     def key(self) -> str:
@@ -111,6 +136,8 @@ class Stitching(BaseModel):
     chains: int
     stitched_only: int
     single_scenario: int
+    undetermined: int = 0
+    """Chains no scenario showed whose first fault one scenario injected in only some repetitions."""
     terminal_stitched_only: int
     stitched_terminal_pairs: tuple[tuple[str, str], ...]
     """The distinct (first fault, failure the user sees) pairs of the stitched-only chains."""
@@ -149,7 +176,8 @@ def beam_search(edges: list[Edge], allocation: Allocation, width: int, max_hops:
     effect through a counterpart to a consequence that validations refuted."""
     by_cause: dict[str, list[Edge]] = defaultdict(list)
     for edge in edges:
-        by_cause[edge.cause.key].append(edge)
+        if not edge.injected:
+            by_cause[edge.cause.key].append(edge)
     beam = [Trail(edges=(edge,), conditions=edge.conditions) for edge in edges
             if edge.counterparts and not edge.terminal]
     chains: list[Trail] = []
@@ -176,14 +204,19 @@ def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[Tre
     """Chains ranked by needing several scenarios, services crossed, ending in a failure the user sees, novelty of
     their cluster sequence and cluster similarity; novelty is judged against the chains ranked above."""
     shown: dict[str, list[tuple[str, set[str]]]] = defaultdict(list)
+    unfinished: dict[str, set[str]] = defaultdict(set)
     for record in records:
         shown[record.fault.key].append((record.workload, {EffectKey.of(effect).key for effect in record.effects
                                                           if holds(effect, min_count_increase)}))
+        if any(record.injected) and not record.exercised:
+            unfinished[record.fault.key].add(record.workload)
     seen: set[tuple[int, ...]] = set()
     chains = []
     for trail in sorted(trails, key=lambda trail: trail.rank(allocation), reverse=True):
         clusters = tuple(allocation.cluster_of[edge.cause.key].number for edge in trail.edges)
         effects = {edge.effect.key for edge in trail.edges}
+        first = trail.edges[0].cause.key
+        end_to_end = tuple(sorted(scenario for scenario, shown_effects in shown[first] if effects <= shown_effects))
         chains.append(Chain(
             hops=tuple(Hop(cause=edge.cause, effect=edge.effect, held=tuple(sorted(edge.held_in)),
                            cluster=allocation.cluster_of[edge.cause.key].number, effect_layer=edge.effect_layer,
@@ -191,8 +224,8 @@ def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[Tre
                        for edge in trail.edges),
             condition=trail.conditions[0], several_scenarios=trail.several_scenarios(), services=trail.services(),
             terminal=trail.edges[-1].terminal, novel=clusters not in seen, similarity=trail.similarity(allocation),
-            end_to_end=tuple(sorted(scenario for scenario, shown_effects in shown[trail.edges[0].cause.key]
-                                    if effects <= shown_effects))))
+            end_to_end=end_to_end,
+            undetermined=tuple(sorted(scenario for scenario in unfinished[first] if scenario not in end_to_end))))
         seen.add(clusters)
     return sorted(chains, key=Chain.rank, reverse=True)
 
@@ -205,7 +238,9 @@ def stitch(edges: list[Edge], allocation: Allocation, records: list[TreatmentRec
     terminal = [chain for chain in chains if chain.stitched_only and chain.terminal]
     cross_layer = [chain for chain in chains if chain.crosses_layers and chain.terminal]
     return Stitching(strategy=allocation.strategy, edges=len(edges), chains=len(chains), stitched_only=stitched_only,
-                     single_scenario=len(chains) - stitched_only, terminal_stitched_only=len(terminal),
+                     single_scenario=sum(chain.shown for chain in chains),
+                     undetermined=sum(bool(chain.undetermined) and not chain.shown for chain in chains),
+                     terminal_stitched_only=len(terminal),
                      stitched_terminal_pairs=tuple(sorted({(chain.hops[0].cause.key, chain.hops[-1].effect.key)
                                                            for chain in terminal})),
                      keys=tuple(chain.key for chain in chains),
@@ -214,6 +249,6 @@ def stitch(edges: list[Edge], allocation: Allocation, records: list[TreatmentRec
                      top=tuple(chains[:kept]),
                      top_cross_layer=tuple(
                          [chain for chain in cross_layer if chain.stitched_only][:CROSS_LAYER_KEPT]
-                         + [chain for chain in cross_layer if not chain.stitched_only][:CROSS_LAYER_KEPT]),
+                         + [chain for chain in cross_layer if chain.shown][:CROSS_LAYER_KEPT]),
                      cycles=tuple(ranked_chains(cycle_trails, allocation, records, min_count_increase)),
                      min_count_increase=min_count_increase, refuted_mappings=tuple(sorted(refuted)))

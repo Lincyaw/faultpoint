@@ -1,5 +1,11 @@
 {
   "terminal_outcomes": ["4xx", "5xx", "error"],
+  "injected_errors": [
+    {"name": "faultpoint/internal/action.ErrInjected",
+     "reason": "What the Go SDK returns at a store or message broker point for a fail rule naming no peer error and no code; a natural failure never returns this sentinel."},
+    {"name": "*fppoints.injectedError",
+     "reason": "What the Go SDK returns at a call point for a fail rule naming no registered error; a natural call never returns this type."}
+  ],
   "rules": [
     {"kind": "branch", "outcomes": ["taken"], "metric": "count", "layers": ["business"], "faults": [],
      "reason": "fail at a branch forces it also in executions the natural cause never reaches, such as requests that succeeded; a chain continues through the boundary effects of the cause behind it."},

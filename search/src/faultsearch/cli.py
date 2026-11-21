@@ -19,10 +19,11 @@ from faultsearch.counterfactual import (EffectKey, NamedWorkload, Runner, RunSet
                                         treatment_record)
 from faultsearch.edges import Condition, EdgeSet, EffectMap, build_edges, counterpart_assignments, holds
 from faultsearch.report import render, summarise
-from faultsearch.store import (ACTIONS_INPUT, ALLOCATION_SETTINGS, CATALOG, EFFECTS_INPUT, INPUTS, MAPPING_FEEDBACK,
-                               REPORT, RUN_SETTINGS, SCENARIOS_INPUT, VALIDATIONS, Store, allocation_file,
-                               chains_file, edges_file)
-from faultsearch.validation import MappingFeedback, Validations, mapping_checks, merged_workload, selected, validate
+from faultsearch.store import (ACTIONS_INPUT, ALLOCATION_SETTINGS, CATALOG, EFFECTS_INPUT, HEADROOM, INPUTS,
+                               MAPPING_FEEDBACK, REPORT, RUN_SETTINGS, SCENARIOS_INPUT, VALIDATIONS, Store,
+                               allocation_file, chains_file, edges_file)
+from faultsearch.validation import (Headroom, MappingFeedback, Validations, headroom, mapping_checks, merged_workload,
+                                    selected, validate)
 
 app = typer.Typer(no_args_is_help=True, help=(
     "Causal stitching over faultpoint: inject faults into named workloads, stitch the causal edges across "
@@ -155,8 +156,8 @@ def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
     store.save(stitching, chains_file(strategy))
     needed = counterpart_assignments(edges, {assignment.fault.key for assignment in allocation.assignments})
     typer.echo(f"{strategy}: {len(edges)} edges, {stitching.chains} chains ({stitching.stitched_only} stitched only, "
-               f"{stitching.single_scenario} shown end to end by one scenario), {len(stitching.cycles)} cycles; "
-               f"{len(needed)} counterpart injections not yet run")
+               f"{stitching.single_scenario} shown end to end by one scenario, {stitching.undetermined} undetermined), "
+               f"{len(stitching.cycles)} cycles; {len(needed)} counterpart injections not yet run")
 
 
 @app.command()
@@ -183,21 +184,26 @@ def chains_command(experiment: Experiment,
                    through: Annotated[list[str], typer.Option(help="Text the chain's key contains.")] = [],
                    shown: Annotated[int, typer.Option(help="The most chains shown.")] = 20) -> None:
     """The ranked chains of the phased stitching from a first fault to a last effect, with their rank among all
-    chains and, for a stitched-only chain across layers ending in a failure the user sees, among those, which is
-    exact within the chains the stitching kept in full."""
-    stitching = Store(experiment).load(Stitching, chains_file(Strategy.PHASED))
+    chains and, for a stitched-only chain across layers ending in a failure the user sees, among those and among
+    those whose count hops have headroom, once a validation measured it; ranks are exact within the chains the
+    stitching kept in full."""
+    store = Store(experiment)
+    stitching = store.load(Stitching, chains_file(Strategy.PHASED))
     kept = {chain.key: chain for chain in (*stitching.top, *stitching.top_cross_layer)}
+    rooms = {room.chain: room for room in store.load(Headroom, HEADROOM).chains} if store.has(HEADROOM) else {}
     across = [key for key in stitching.keys
               if key in kept and kept[key].stitched_only and kept[key].crosses_layers and kept[key].terminal]
+    roomy = [key for key in across if key in rooms and rooms[key].room]
     found = [(rank, key) for rank, key in enumerate(stitching.keys, 1)
              if key.startswith(f"[{first}") and key.endswith(last) and all(text in key for text in through)]
     typer.echo(f"{len(found)} of {len(stitching.keys)} chains match; {len(stitching.top)} kept in full by rank")
     for rank, key in found[:shown]:
         chain = kept.get(key)
-        place = ("not kept" if chain is None else f"cross-layer stitched-only {across.index(key) + 1}"
-                 if key in across else "stitched only" if chain.stitched_only
-                 else f"shown end to end in {', '.join(chain.end_to_end)}")
-        typer.echo(f"#{rank} ({place}) condition {kept[key].condition if chain else '-'}: {key}")
+        places = ["not kept"] if chain is None else [
+            str(chain.visibility), *([f"cross-layer {across.index(key) + 1}"] if key in across else []),
+            *([f"headroom {'yes' if rooms[key].room else 'no'}"] if key in rooms else []),
+            *([f"cross-layer with headroom {roomy.index(key) + 1}"] if key in roomy else [])]
+        typer.echo(f"#{rank} ({', '.join(places)}) condition {chain.condition if chain else '-'}: {key}")
 
 
 @app.command("validate")
@@ -213,17 +219,24 @@ def validate_command(experiment: Experiment,
                               "effect.")] = 3,
                      chain: Annotated[list[str], typer.Option(help="A chain to validate besides, by its key.")] = []
                      ) -> None:
-    """Inject only the first fault of the best chains of the phased allocation in the workload their conditions
-    merge into, and keep what each validated hop says about the effect map's correspondences."""
+    """Inject only the first fault of the best chains of the phased allocation, among those whose count hops all have
+    headroom, in the workload their conditions merge into, and keep what each validated hop says about the effect
+    map's correspondences."""
     store = Store(experiment)
     stitching = store.load(Stitching, chains_file(Strategy.PHASED))
     validated = [validation.chain for validation in store.load(Validations, VALIDATIONS).validations] \
         if store.has(VALIDATIONS) else []
     runner = recorded_runner(store)
+    scenarios = recorded_scenarios(store, runner.system)
+    candidates = list({kept.key: kept for kept in (*stitching.top, *stitching.top_cross_layer)}.values())
+    room = headroom(runner, candidates, list(store.load(EdgeSet, edges_file(Strategy.PHASED)).edges), scenarios,
+                    stitching.min_count_increase)
+    store.save(room, HEADROOM)
+    roomy = frozenset(chain_room.chain for chain_room in room.chains if chain_room.room)
     validations = validate(runner,
                            selected(stitching, stitched_only, single_scenario, single_scenario_cross_layer, cross_layer,
-                                    per_pair, chain, validated),
-                           recorded_scenarios(store, runner.system), stitching.min_count_increase)
+                                    per_pair, chain, validated, roomy),
+                           scenarios, stitching.min_count_increase)
     store.save(validations, VALIDATIONS)
     feedback = store.load(MappingFeedback, MAPPING_FEEDBACK) if store.has(MAPPING_FEEDBACK) \
         else MappingFeedback(checks=())

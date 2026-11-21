@@ -1,16 +1,23 @@
 from collections import Counter, defaultdict
 from enum import StrEnum
+from statistics import fmean
 from typing import Final, Self
 
-from faultpoint.tools.analysis import Effect
+from faultpoint.observations import DetailItems
+from faultpoint.tools.analysis import Effect, Metric, natural_tallies
+from faultpoint.tools.analysis import Selection as Repetition
 from pydantic import BaseModel
 
 from faultsearch.catalog import FROZEN, Layer
 from faultsearch.chains import Chain, Stitching
-from faultsearch.counterfactual import EffectKey, NamedWorkload, Runner, Scenarios, TreatmentRecord
-from faultsearch.edges import Condition, holds
+from faultsearch.counterfactual import (EffectKey, NamedWorkload, Runner, Scenarios, TreatmentRecord,
+                                        tenant_names)
+from faultsearch.edges import Condition, Edge, holds
 
 VALIDATION_PREFIX: Final = "validate."
+UNSCOPED: Final = ""
+
+type Tallies = dict[tuple[str, str, DetailItems], tuple[int, float]]
 
 
 class Selection(StrEnum):
@@ -108,6 +115,74 @@ def merged_workload(condition: Condition, scenarios: Scenarios) -> NamedWorkload
     return NamedWorkload(name=f"{VALIDATION_PREFIX}{name or 'baseline'}", workload={**scenarios.baseline, **condition})
 
 
+class HopRoom(BaseModel):
+    """Whether a count hop can rise visibly in its chain's merged workload: the level its cause drives the count to
+    where its edge held, the highest over those scenarios of the lowest treatment count, against the counts of that
+    workload's control, in the scope the effect is observed in."""
+
+    model_config = FROZEN
+
+    hop: int
+    level: float
+    control: tuple[float, ...]
+    room: bool
+    """No control repetition reaches the level, and the level is at least the smallest increase of the controls'
+    mean that counts as an effect."""
+
+
+class ChainRoom(BaseModel):
+    model_config = FROZEN
+
+    chain: str
+    workload: str
+    hops: tuple[HopRoom, ...]
+
+    @property
+    def room(self) -> bool:
+        return all(hop.room for hop in self.hops)
+
+
+class Headroom(BaseModel):
+    """The headroom of the chains a validation chooses from, in their rank order."""
+
+    model_config = FROZEN
+
+    chains: tuple[ChainRoom, ...]
+
+
+def chain_room(chain: Chain, workload: NamedWorkload, tallies: dict[str, list[Tallies]], edges: dict[str, Edge],
+               min_count_increase: float) -> ChainRoom:
+    """Whether every count hop of a chain has headroom in its merged workload; the effects of upstream components are
+    observed outside any scope, the others in the treated tenant's."""
+    hops = []
+    for index, hop in enumerate(chain.hops):
+        if hop.effect.metric == Metric.COUNT:
+            key = (hop.effect.point, hop.effect.outcome, tuple(sorted(hop.effect.detail.items())))
+            scope = UNSCOPED if hop.effect_layer == Layer.UPSTREAM else tenant_names(workload.workload)[0]
+            control = tuple(float(counts.get(key, (0, 0.0))[0]) for counts in tallies[scope])
+            edge = edges[f"[{hop.cause.key}] {hop.effect.key}"]
+            level = max(min(sighting.effect.treatment) for sighting in edge.held)
+            hops.append(HopRoom(hop=index, level=level, control=control,
+                                room=max(control) < level and level >= (1 + min_count_increase) * fmean(control)))
+    return ChainRoom(chain=chain.key, workload=workload.name, hops=tuple(hops))
+
+
+def headroom(runner: Runner, chains: list[Chain], edges: list[Edge], scenarios: Scenarios,
+             min_count_increase: float) -> Headroom:
+    """The headroom of every chain's count hops in its merged workload, whose controls run first where missing."""
+    workloads = {chain.key: merged_workload(chain.condition, scenarios) for chain in chains}
+    tallies: dict[str, dict[str, list[Tallies]]] = {}
+    for control in runner.controls(list({workload.name: workload for workload in workloads.values()}.values())):
+        observations = {label: runner.observations(label) for label in control.labels}
+        tallies[control.workload.name] = {
+            scope: [natural_tallies(records, Repetition(experiment=label, scope=scope))
+                    for label, records in observations.items()]
+            for scope in (UNSCOPED, tenant_names(control.workload.workload)[0])}
+    by_key = {edge.key: edge for edge in edges}
+    return Headroom(chains=tuple(chain_room(chain, workloads[chain.key], tallies[workloads[chain.key].name], by_key,
+                                            min_count_increase) for chain in chains))
+
+
 def capped(chains: list[Chain], count: int, per_pair: int) -> list[Chain]:
     """The first count chains, at most per_pair of them with the same layer of the first fault and the same last
     effect, so that one hub does not take every pick."""
@@ -122,21 +197,22 @@ def capped(chains: list[Chain], count: int, per_pair: int) -> list[Chain]:
 
 
 def selected(stitching: Stitching, stitched_only: int, single_scenario: int, single_scenario_cross_layer: int,
-             cross_layer: int, per_pair: int, named: list[str],
-             validated: list[Chain]) -> list[tuple[Chain, Selection]]:
-    """The best ranked chains that exist only by stitching, a few that one scenario showed end to end, of any layers
-    and across layers, the best stitched-only chains across layers not chosen already, at most per_pair of them alike,
-    and the chains named by their keys, which may also be chains validated before."""
+             cross_layer: int, per_pair: int, named: list[str], validated: list[Chain],
+             roomy: frozenset[str]) -> list[tuple[Chain, Selection]]:
+    """Among the chains whose count hops all have headroom in their merged workloads, the best ranked that exist only
+    by stitching, a few that one scenario showed end to end, of any layers and across layers, and the best
+    stitched-only chains across layers not chosen already, at most per_pair of them alike; and the chains named by
+    their keys, which may also be chains validated before."""
     by_key = {chain.key: chain for chain in (*validated, *stitching.top, *stitching.top_cross_layer)}
-    ranked = [chain for chain in stitching.top if chain.stitched_only][:stitched_only]
+    ranked = [chain for chain in stitching.top if chain.stitched_only and chain.key in roomy][:stitched_only]
     chosen = {chain.key for chain in ranked}
-    across = capped([chain for chain in stitching.top_cross_layer if chain.stitched_only and chain.key not in chosen],
-                    cross_layer, per_pair)
+    across = capped([chain for chain in stitching.top_cross_layer
+                     if chain.stitched_only and chain.key not in chosen and chain.key in roomy], cross_layer, per_pair)
     return ([(chain, Selection.STITCHED_ONLY) for chain in ranked]
             + [(chain, Selection.SINGLE_SCENARIO) for chain in stitching.top
-               if not chain.stitched_only][:single_scenario]
+               if chain.shown and chain.key in roomy][:single_scenario]
             + [(chain, Selection.SINGLE_SCENARIO_CROSS_LAYER) for chain in stitching.top_cross_layer
-               if not chain.stitched_only][:single_scenario_cross_layer]
+               if chain.shown and chain.key in roomy][:single_scenario_cross_layer]
             + [(chain, Selection.CROSS_LAYER) for chain in across]
             + [(by_key[key], Selection.NAMED) for key in named])
 

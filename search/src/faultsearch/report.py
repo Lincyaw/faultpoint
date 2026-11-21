@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from faultsearch.allocation import Allocation, Strategy
 from faultsearch.catalog import FROZEN, Catalog, Exclusion, Layer
-from faultsearch.chains import LAYER_PATH_SEPARATOR, Chain, Stitching
+from faultsearch.chains import LAYER_PATH_SEPARATOR, Chain, Stitching, Visibility
 from faultsearch.counterfactual import ControlRecord, EffectKey, Leak, RunSettings, TreatmentRecord, treatment_record
 from faultsearch.edges import Edge, EdgeSet, EffectMap
 from faultsearch.store import (CATALOG, CONTROLS, EFFECTS_INPUT, INPUTS, LEAKS, MAPPING_FEEDBACK, REPETITIONS,
@@ -51,7 +51,7 @@ class ValidationSummary(BaseModel):
     layer_path: str
     selection: Selection
     workload: str
-    stitched_only: bool
+    visibility: Visibility
     exercised: bool
     hops: tuple[bool, ...]
     confirmed: bool
@@ -202,7 +202,7 @@ def validation_summaries(validations: Validations, random_edges: EdgeSet | None,
     return [ValidationSummary(
         chain=validation.chain.key, hops_text=tuple(hop.text for hop in validation.chain.hops),
         layer_path=validation.chain.layer_path, selection=validation.selection,
-        workload=validation.workload.name, stitched_only=validation.chain.stitched_only,
+        workload=validation.workload.name, visibility=validation.chain.visibility,
         exercised=validation.record.exercised, hops=tuple(hop.confirmed for hop in validation.hops),
         confirmed=validation.confirmed,
         random_has_edges=None if keys is None else all(f"[{hop.cause.key}] {hop.effect.key}" in keys
@@ -282,14 +282,14 @@ def render(summary: Summary) -> str:
                   f"  stitched-only chains by layer path {strategy.stitched_layer_paths}"]
     lines += ["conditional edges:", *(f"  {edge.key} | held {sorted(edge.held_in)} not {list(edge.not_held)} | "
                                        f"condition {condition_text(edge)}" for edge in summary.conditional_examples)]
-    lines += ["chains across layers:", *(f"  {'stitched-only' if chain.stitched_only else 'single-scenario'} "
+    lines += ["chains across layers:", *(f"  {chain.visibility} "
                                          f"{chain.layer_path} | {chain.condition}"
                                          + "".join(f"\n    {hop.text}" for hop in chain.hops)
                                          for chain in summary.cross_layer_chains)]
     lines += ["effects below the business layer:", *(f"  {item.layer} {item.effect} caused by {item.causes}"
                                                       for item in summary.layer_effects)]
     lines += ["validations:", *(f"  {'confirmed' if item.confirmed else 'refuted'} {item.selection} "
-                                f"{'stitched-only' if item.stitched_only else 'single-scenario'} in {item.workload} "
+                                f"{item.visibility} in {item.workload} "
                                 f"hops {''.join('+' if hop else '-' for hop in item.hops)} layers {item.layer_path} "
                                 f"random edges {item.random_has_edges} chain {item.random_has_chain}"
                                 + "".join(f"\n    {text}" for text in item.hops_text)

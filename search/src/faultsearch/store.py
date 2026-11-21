@@ -16,6 +16,7 @@ RUN_SETTINGS: Final = "run-settings.json"
 ALLOCATION_SETTINGS: Final = "allocation-settings.json"
 CATALOG: Final = "catalog.json"
 VALIDATIONS: Final = "validations.json"
+HEADROOM: Final = "headroom.json"
 MAPPING_FEEDBACK: Final = "mapping-feedback.json"
 REPORT: Final = "report.json"
 
