@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -15,6 +16,13 @@ import (
 
 	"github.com/DataDog/go-sqllexer"
 )
+
+// hashDigits is how many hexadecimal digits of a statement's hash its locator ends with.
+const hashDigits = 8
+
+// StatementLocator matches the locators Classify gives the points of statements, which the SQL adapter plugins
+// serve.
+var StatementLocator = regexp.MustCompile("#[0-9a-f]{" + strconv.Itoa(hashDigits) + "}$")
 
 // CodedErrors build, by the package of a database/sql driver, the error the driver returns for a statement refused
 // with a code; the adapter plugin of the driver's client library adds its builder from its init, so that the SQL
@@ -67,7 +75,7 @@ func (c *Classifier) Classify(query string) Point {
 		tables = "-"
 	}
 	digest := sha256.Sum256([]byte(shape))
-	point.Locator = tables + "#" + hex.EncodeToString(digest[:])[:8]
+	point.Locator = tables + "#" + hex.EncodeToString(digest[:])[:hashDigits]
 	c.points.Store(query, point)
 	return point
 }

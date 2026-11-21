@@ -23,12 +23,14 @@ type ContextProvider interface {
 }
 
 // Plugin is a point or adapter plugin as it registers from its package's init: the actions it implements at each
-// kind it serves, a pointer to its options holding their defaults, nil when it has none, and Refuse, nil when it
-// obeys every rule of those actions, which says why it cannot obey a rule at one of its kinds.
+// kind it serves, a pointer to its options holding their defaults, nil when it has none, Serves, nil when it serves
+// every point of those kinds, which says by its locator whether a point has the shape the plugin's points have, and
+// Refuse, nil when it obeys every rule of those actions, which says why it cannot obey a rule at one of its points.
 type Plugin struct {
 	Name    string
 	Actions map[string][]string
 	Options any
+	Serves  func(locator string) bool
 	Refuse  func(rule *Rule) error
 }
 
@@ -45,8 +47,7 @@ type core struct {
 	settings   settings
 	enabled    bool
 	registered []string
-	actions    map[string][]string
-	refusals   map[string][]func(rule *Rule) error
+	plugins    map[string][]Plugin
 	source     RuleSource
 	sink       ObservationSink
 	context    ContextProvider
@@ -66,13 +67,12 @@ var current core
 func init() {
 	current.settings = readSettings()
 	current.enabled = current.settings.rules != "" || current.settings.report != ""
-	current.actions = map[string][]string{}
-	current.refusals = map[string][]func(rule *Rule) error{}
+	current.plugins = map[string][]Plugin{}
 	current.restricted = map[string][]string{}
 	current.state.Store(&ruleState{})
 }
 
-// Register enrolls a plugin and reports whether it is enabled; its options are decoded only then. A kind several
+// Register enrolls a plugin and reports whether it is enabled; its options are decoded only then. A point several
 // plugins serve accepts only the actions all of them implement, so that a rule one of them cannot obey is refused
 // when it is installed.
 func Register(plugin Plugin) bool {
@@ -81,17 +81,18 @@ func Register(plugin Plugin) bool {
 		return false
 	}
 	Options(plugin.Name, plugin.Options)
-	for kind, actions := range plugin.Actions {
-		served, found := current.actions[kind]
-		if found {
-			actions = slices.DeleteFunc(slices.Clone(served), func(action string) bool { return !slices.Contains(actions, action) })
-		}
-		current.actions[kind] = actions
-		if plugin.Refuse != nil {
-			current.refusals[kind] = append(current.refusals[kind], plugin.Refuse)
-		}
+	for kind := range plugin.Actions {
+		current.plugins[kind] = append(current.plugins[kind], plugin)
 	}
 	return true
+}
+
+// serving are the enabled plugins that serve a point: those of its kind whose points have the shape of its locator.
+func (c *core) serving(point string) []Plugin {
+	_, kind, locator, _ := SplitPoint(point)
+	return slices.DeleteFunc(slices.Clone(c.plugins[kind]), func(plugin Plugin) bool {
+		return plugin.Serves != nil && !plugin.Serves(locator)
+	})
 }
 
 // Restrict narrows the actions a point implements below its kind's, as the rewriter registers them from the init of
@@ -118,16 +119,23 @@ func Recheck() {
 	}
 }
 
-// enforceLimits aborts when a rule asks more of its point than the process can do: an action the point's
-// restriction leaves out, or a rule a plugin serving its kind refuses.
+// enforceLimits aborts when a rule asks more of its point than the process can do: an action a plugin serving the
+// point does not implement or the point's restriction leaves out, or a rule such a plugin refuses.
 func (c *core) enforceLimits(rule *Rule) {
 	actions, restricted := c.restricted[rule.Point]
 	if restricted && !slices.Contains(actions, rule.Action.Kind) {
 		Abort("rule %s: %s implements only %s", rule.ID, rule.Point, strings.Join(actions, ", "))
 	}
 	_, kind, _, _ := SplitPoint(rule.Point)
-	for _, refuse := range c.refusals[kind] {
-		if err := refuse(rule); err != nil {
+	for _, plugin := range c.serving(rule.Point) {
+		if !slices.Contains(plugin.Actions[kind], rule.Action.Kind) {
+			Abort("rule %s: plugin %s, which serves %s, does not implement %s", rule.ID, plugin.Name, rule.Point,
+				rule.Action.Kind)
+		}
+		if plugin.Refuse == nil {
+			continue
+		}
+		if err := plugin.Refuse(rule); err != nil {
 			Abort("rule %s: %v", rule.ID, err)
 		}
 	}
@@ -172,9 +180,8 @@ func start() {
 	}
 }
 
-// install replaces the rule set; a rule of this service at a kind a plugin serves must use an action that plugin
-// implements, within the limits enforceLimits checks, and rules of other services or kinds are left to the processes
-// that serve them.
+// install replaces the rule set; a rule of this service at a point a plugin serves must be within the limits
+// enforceLimits checks, and rules of other services or points are left to the processes that serve them.
 func (c *core) install(data []byte) {
 	ruleset, err := ParseRuleSet(data)
 	if err != nil {
@@ -186,13 +193,9 @@ func (c *core) install(data []byte) {
 		injections: map[string]int{}, randoms: map[string]*rand.Rand{}}
 	for index := range ruleset.Rules {
 		rule := &ruleset.Rules[index]
-		service, kind, _, _ := SplitPoint(rule.Point)
-		actions, served := c.actions[kind]
-		if service != c.settings.service || !served {
+		service, _, _, _ := SplitPoint(rule.Point)
+		if service != c.settings.service || len(c.serving(rule.Point)) == 0 {
 			continue
-		}
-		if !slices.Contains(actions, rule.Action.Kind) {
-			Abort("rule %s: no plugin of this process implements %s at a %s point", rule.ID, rule.Action.Kind, kind)
 		}
 		c.enforceLimits(rule)
 		next.byPoint[rule.Point] = append(next.byPoint[rule.Point], rule)

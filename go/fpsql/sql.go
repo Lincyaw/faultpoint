@@ -36,15 +36,15 @@ func init() {
 		ReadCommands []string `json:"read_commands"`
 	}{ReadCommands: []string{"SELECT"}}
 	enabled = faultpoint.Register(faultpoint.Plugin{Name: "sql", Options: &options, Refuse: refuse,
-		Actions: map[string][]string{
+		Serves: sqlpoint.StatementLocator.MatchString, Actions: map[string][]string{
 			"store_read":  {"fail", "empty", "delay", "crash"},
 			"store_write": {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
 		}})
 	classifier = sqlpoint.NewClassifier(options.ReadCommands)
 }
 
-// refuse is why a fail rule cannot name a code in this process: a driver it wraps has no error the plugin can build
-// with one, and the point ids of its statements do not tell them from those of other stores.
+// refuse is why a fail rule at a statement's point cannot name a code in this process: a driver it wraps has no error
+// the plugin can build with one, and a statement's point does not tell which driver, or pgx, runs it.
 func refuse(rule *faultpoint.Rule) error {
 	if rule.Action.Kind != "fail" && rule.Action.Kind != "fail_after" {
 		return nil

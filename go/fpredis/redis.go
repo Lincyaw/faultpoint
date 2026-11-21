@@ -47,17 +47,25 @@ func init() {
 	if err := json.Unmarshal(table, &options); err != nil {
 		faultpoint.Abort("the redis command table: %v", err)
 	}
-	enabled = faultpoint.Register(faultpoint.Plugin{Name: "redis", Options: &options, Actions: map[string][]string{
-		"store_read":  {"fail", "empty", "delay", "crash"},
-		"consume":     {"fail", "fail_after", "empty", "delay", "crash"},
-		"store_write": {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
-		"publish":     {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
-	}})
+	enabled = faultpoint.Register(faultpoint.Plugin{Name: "redis", Options: &options, Serves: commandLocator,
+		Actions: map[string][]string{
+			"store_read":  {"fail", "empty", "delay", "crash"},
+			"consume":     {"fail", "fail_after", "empty", "delay", "crash"},
+			"store_write": {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
+			"publish":     {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
+		}})
 	pattern, err := regexp.Compile(options.KeyIdentifier)
 	if err != nil {
 		faultpoint.Abort("option key_identifier of redis: %v", err)
 	}
 	commands, identifier = options.Commands, pattern
+}
+
+// commandLocator is whether a locator starts with a command of the table, as those of the plugin's points do.
+func commandLocator(locator string) bool {
+	name, _, _ := strings.Cut(locator, " ")
+	_, known := commands[name]
+	return known
 }
 
 // Instrument adds the hook to a client and returns it; the client of a plugin that is not enabled is returned as

@@ -29,10 +29,11 @@ func init() {
 	options := struct {
 		ReadCommands []string `json:"read_commands"`
 	}{ReadCommands: []string{"SELECT"}}
-	enabled = faultpoint.Register(faultpoint.Plugin{Name: "pgx", Options: &options, Actions: map[string][]string{
-		"store_read":  {"fail", "empty", "delay", "crash"},
-		"store_write": {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
-	}})
+	enabled = faultpoint.Register(faultpoint.Plugin{Name: "pgx", Options: &options,
+		Serves: sqlpoint.StatementLocator.MatchString, Actions: map[string][]string{
+			"store_read":  {"fail", "empty", "delay", "crash"},
+			"store_write": {"fail", "fail_after", "drop", "duplicate", "delay", "crash"},
+		}})
 	classifier = sqlpoint.NewClassifier(options.ReadCommands)
 	sqlpoint.CodedErrors[pgxDriver] = postgresError
 }
