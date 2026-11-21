@@ -21,8 +21,9 @@ from faultsearch.counterfactual import EffectKey, Load, Scenarios, TreatmentReco
 EFFECTS_FILE: Final = DATA / "effects.json"
 WAIT: Final = "ms"
 """The action parameter of how long a fail waits or a delay lasts."""
-PARAMETER_DIGITS: Final = 2
-"""The significant digits of a counterpart's measured time and probability, so that near values share one fault."""
+PARAMETER_DIGITS: Final = 1
+"""The significant digits of a counterpart's measured time and probability, so that near values share one fault; the
+acceptance's tolerances cover the rounding."""
 COUNT_SLACK: Final = 1.0
 """The executions per repetition two runs may differ by however few there are, below which a fraction says nothing."""
 ABSENT: Final = Load(count=0, mean=0)
@@ -299,18 +300,18 @@ def timed(action: Action, effect: EffectKey, layer: Layer, profile: EffectProfil
             else profile.increase if action.kind == ActionKind.DELAY and effect.metric == Metric.MEAN else 0.0)
     if layer == Layer.UPSTREAM or wait < 1:
         return action
-    return Action.model_validate({**action.model_dump(), WAIT: two_digits(wait)})
+    return Action.model_validate({**action.model_dump(), WAIT: int(rounded(wait))})
 
 
-def two_digits(value: float) -> float:
-    """A measured parameter rounded to two significant digits, so that near values share one fault."""
+def rounded(value: float) -> float:
+    """A measured parameter rounded to its significant digits, so that near values share one fault."""
     return float(f"{value:.{PARAMETER_DIGITS}g}")
 
 
 def counterpart_probability(layer: Layer, profile: EffectProfile) -> float:
     """How often a counterpart acts, so that it fails or slows as large a share of its point's executions as the effect
     had: 1 for an effect on every execution, and for a kernel point, whose rules this search does not thin out."""
-    return 1.0 if layer == Layer.UPSTREAM or not 0 < profile.rate < 1 else min(1.0, two_digits(profile.rate))
+    return 1.0 if layer == Layer.UPSTREAM or not 0 < profile.rate < 1 else min(1.0, rounded(profile.rate))
 
 
 def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, manifest: Manifest | None,
