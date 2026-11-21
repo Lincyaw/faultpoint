@@ -7,7 +7,7 @@ from jsonschema import Draft202012Validator
 from pydantic import BaseModel
 
 from faultpoint.actions import ONE_FAILURE
-from faultpoint.placement import Manifest, PointEntry
+from faultpoint.placement import Manifest
 from faultpoint.rules import STRICT, Rule, RuleSet
 
 KINDS_FILE: Final = ("spec", "kinds.json")
@@ -76,16 +76,20 @@ class KindTable(BaseModel):
 
 
 def manifest_violations(ruleset: RuleSet, manifests: Iterable[Manifest]) -> list[str]:
-    """The rules whose point is narrower than its kind in a manifest and that ask for another action, and those
-    missing from the manifests of their service that list points of their kind; a boundary point, which no
-    manifest lists, is never missing."""
-    points = {point.id: point for manifest in manifests for point in manifest.points}
+    """The rules whose point is narrower than its kind in a manifest and that ask for another action, those that
+    name an error the manifest's build does not register, and those missing from the manifests of their service
+    that list points of their kind; a boundary point, which no manifest lists, is never missing."""
+    points = {point.id: (point, manifest.errors) for manifest in manifests for point in manifest.points}
     listed = {(manifest.service, point.kind) for manifest in manifests for point in manifest.points}
     violations = []
     for rule in ruleset.rules:
-        match points.get(rule.point):
-            case None if (rule.service, rule.kind) in listed:
-                violations.append(f"rule {rule.id}: {rule.point} is in no manifest of {rule.service}")
-            case PointEntry(actions=tuple() as actions) if rule.action.kind not in actions:
-                violations.append(f"rule {rule.id}: {rule.point} implements only {', '.join(actions)}")
+        point, errors = points.get(rule.point, (None, ()))
+        error = rule.action.model_dump().get("error")
+        if point is None and (rule.service, rule.kind) in listed:
+            violations.append(f"rule {rule.id}: {rule.point} is in no manifest of {rule.service}")
+        if point is not None and point.actions is not None and rule.action.kind not in point.actions:
+            violations.append(f"rule {rule.id}: {rule.point} implements only {', '.join(point.actions)}")
+        if errors and error is not None and error not in errors:
+            violations.append(f"rule {rule.id}: {rule.point} fails only with the errors its build registers, "
+                              f"not {error}")
     return violations
