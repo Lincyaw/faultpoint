@@ -389,7 +389,12 @@ class CommandPoints:
         waited = self.waited(pipeline, delay)
         if waited:
             time.sleep(waited)
-        self.fail_unsent(decisions, started, delay, waited)
+        try:
+            self.fail_unsent(decisions, started, delay, waited)
+        except self.exceptions.RedisError:
+            # redis-py empties a pipeline whose execute failed, as this one did before sending.
+            pipeline.reset()
+            raise
         pipeline.command_stack[:] = [queued for queued, decided in zip(stack, decisions, strict=True)
                                      for _ in range(copies(decided))]
         try:
@@ -422,9 +427,14 @@ class CommandPoints:
         decisions = [self.decide(queued_args) for queued_args, _ in stack]
         delay = self.prepare(decisions)
         waited = self.waited(pipeline, delay)
-        if waited:
-            await asyncio.sleep(waited)
-        self.fail_unsent(decisions, started, delay, waited)
+        try:
+            if waited:
+                await asyncio.sleep(waited)
+            self.fail_unsent(decisions, started, delay, waited)
+        except (self.exceptions.RedisError, asyncio.CancelledError):
+            # redis-py empties a pipeline whose execute failed or was cancelled, as this one did before sending.
+            await pipeline.reset()
+            raise
         pipeline.command_stack[:] = [queued for queued, decided in zip(stack, decisions, strict=True)
                                      for _ in range(copies(decided))]
         try:
