@@ -1,7 +1,10 @@
 import asyncio
+import contextlib
+import copy
 import functools
 import importlib.resources
 import re
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
@@ -179,6 +182,16 @@ def delivered_twice(command: Command, reply: Any) -> Any:
     return reply
 
 
+def detached(pipeline: Any, stack: list[Queued]) -> Any:
+    """A copy of a pipeline holding its queued commands, which sends them on a connection of its own, without a
+    WATCH the pipeline holds."""
+    copied = copy.copy(pipeline)
+    copied.command_stack = list(stack)
+    copied.connection = None
+    copied.watching = False
+    return copied
+
+
 def copies(decided: Decided | None) -> int:
     """How often a command is sent: never when dropped or emptied, twice when a write or publish is duplicated; a
     read emptied into an array, whose container type RESP3 decides, or into nils for each item it asks for, is sent
@@ -213,6 +226,47 @@ class CommandPoints:
         # Every parser of redis-py, sync or asyncio, RESP2, RESP3 or hiredis, turns an error reply into an error
         # with the parse_error they inherit.
         self.parser = redis.connection.DefaultParser
+        self.unawaited: set[asyncio.Future[None]] = set()
+
+    def resends(self, decisions: list[Decided | None]) -> bool:
+        """Whether commands whose wait the client cut short are sent all the same: when delays alone made the
+        wait, as the commands reach a slow server anyway; the wait of a fail sends nothing."""
+        return not any(decided is not None and isinstance(decided.action, StoreFail) for decided in decisions)
+
+    def wait(self, decisions: list[Decided | None], delay: float, waited: float, send: Callable[[], Any]) -> None:
+        """Wait before sending; commands whose delay the client's socket timeout cut short are sent in the
+        background, on a connection of their own, with their replies dropped."""
+        if waited:
+            time.sleep(waited)
+        if waited < delay and self.resends(decisions):
+            threading.Thread(target=self.drop_reply, args=(send,), name="faultpoint-unawaited", daemon=True).start()
+
+    def drop_reply(self, send: Callable[[], Any]) -> None:
+        """Send commands nobody waits for any longer and drop the reply, an error reply or a timeout included."""
+        with contextlib.suppress(self.exceptions.RedisError):
+            send()
+
+    async def wait_async(self, decisions: list[Decided | None], delay: float, waited: float,
+                         send: Callable[[], Awaitable[Any]]) -> None:
+        """Wait before sending as wait does, also sending in the background when the caller cancels the wait."""
+        try:
+            if waited:
+                await asyncio.sleep(waited)
+        except asyncio.CancelledError:
+            self.send_unawaited(decisions, send)
+            raise
+        if waited < delay:
+            self.send_unawaited(decisions, send)
+
+    def send_unawaited(self, decisions: list[Decided | None], send: Callable[[], Awaitable[Any]]) -> None:
+        if self.resends(decisions):
+            unawaited = asyncio.ensure_future(self.drop_reply_async(send))
+            self.unawaited.add(unawaited)
+            unawaited.add_done_callback(self.unawaited.discard)
+
+    async def drop_reply_async(self, send: Callable[[], Awaitable[Any]]) -> None:
+        with contextlib.suppress(self.exceptions.RedisError):
+            await send()
 
     def decide(self, args: tuple[Any, ...]) -> Decided | None:
         """The point and decision of a command; none for a command that is not a point."""
@@ -370,8 +424,7 @@ class CommandPoints:
         decisions = [self.decide(args)]
         delay = self.prepare(decisions)
         waited = self.waited(client, delay)
-        if waited:
-            time.sleep(waited)
+        self.wait(decisions, delay, waited, functools.partial(execute_command, *args, **kwargs))
         self.fail_unsent(decisions, started, delay, waited)
         try:
             replies = [execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
@@ -380,15 +433,14 @@ class CommandPoints:
             raise
         return self.settle(client, [(args, kwargs)], decisions, replies, started)[0]
 
-    def execute_pipeline(self, execute: Callable[..., list[Any]], pipeline: Any, args: tuple[Any, ...],
+    def execute_pipeline(self, execute: Any, pipeline: Any, args: tuple[Any, ...],
                          kwargs: dict[str, Any]) -> list[Any]:
         started = time.monotonic()
         stack: list[Queued] = list(pipeline.command_stack)
         decisions = [self.decide(queued_args) for queued_args, _ in stack]
         delay = self.prepare(decisions)
         waited = self.waited(pipeline, delay)
-        if waited:
-            time.sleep(waited)
+        self.wait(decisions, delay, waited, functools.partial(execute.__func__, detached(pipeline, stack)))
         try:
             self.fail_unsent(decisions, started, delay, waited)
         except self.exceptions.RedisError:
@@ -410,8 +462,7 @@ class CommandPoints:
         decisions = [self.decide(args)]
         delay = self.prepare(decisions)
         waited = self.waited(client, delay)
-        if waited:
-            await asyncio.sleep(waited)
+        await self.wait_async(decisions, delay, waited, functools.partial(execute_command, *args, **kwargs))
         self.fail_unsent(decisions, started, delay, waited)
         try:
             replies = [await execute_command(*args, **kwargs) for _ in range(copies(decisions[0]))]
@@ -420,7 +471,7 @@ class CommandPoints:
             raise
         return self.settle(client, [(args, kwargs)], decisions, replies, started)[0]
 
-    async def execute_pipeline_async(self, execute: Callable[..., Awaitable[list[Any]]], pipeline: Any,
+    async def execute_pipeline_async(self, execute: Any, pipeline: Any,
                                      args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
         started = time.monotonic()
         stack: list[Queued] = list(pipeline.command_stack)
@@ -428,8 +479,8 @@ class CommandPoints:
         delay = self.prepare(decisions)
         waited = self.waited(pipeline, delay)
         try:
-            if waited:
-                await asyncio.sleep(waited)
+            await self.wait_async(decisions, delay, waited,
+                                  functools.partial(execute.__func__, detached(pipeline, stack)))
             self.fail_unsent(decisions, started, delay, waited)
         except (self.exceptions.RedisError, asyncio.CancelledError):
             # redis-py empties a pipeline whose execute failed or was cancelled, as this one did before sending.

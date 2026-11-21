@@ -1,6 +1,8 @@
 import asyncio
+import contextlib
 import functools
 import re
+import threading
 import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from enum import StrEnum
@@ -240,6 +242,8 @@ class ClientPoint:
         self.runtime = runtime
         self.options = options
         self.library = library
+        self.unawaited: set[asyncio.Future[None]] = set()
+        """The requests sent in the background whose replies nobody awaits, kept until they end."""
 
     def decide(self, request: Any) -> tuple[str, Decision | None]:
         with self.runtime.own:
@@ -329,11 +333,42 @@ class ClientPoint:
         if timeout is not None and ms / 1000 > timeout:
             raise self.library.ReadTimeout("timed out", request=request)
 
+    def delay(self, send: Callable[[Any], Any], request: Any, ms: int) -> Any:
+        """Send the request as a peer that slow answers it: after the delay, or, when the client's read timeout
+        cuts the delay short, in the background with its reply dropped, as the request reaches a slow peer all the
+        same, while the client times out."""
+        try:
+            self.wait(request, ms)
+        except self.library.ReadTimeout:
+            threading.Thread(target=self.drop_reply, args=(send, request), name="faultpoint-unawaited",
+                             daemon=True).start()
+            raise
+        return send(request)
+
+    def drop_reply(self, send: Callable[[Any], Any], request: Any) -> None:
+        """Send a request nobody waits for any longer and drop its reply, a transport error included."""
+        with contextlib.suppress(self.library.TransportError):
+            send(request).read()
+
+    async def delay_async(self, send: Callable[[Any], Awaitable[Any]], request: Any, ms: int) -> Any:
+        """Send the request as delay does, also in the background when the caller cancels the delay."""
+        try:
+            await self.wait_async(request, ms)
+        except (self.library.ReadTimeout, asyncio.CancelledError):
+            unawaited = asyncio.ensure_future(self.drop_reply_async(send, request))
+            self.unawaited.add(unawaited)
+            unawaited.add_done_callback(self.unawaited.discard)
+            raise
+        return await send(request)
+
+    async def drop_reply_async(self, send: Callable[[Any], Awaitable[Any]], request: Any) -> None:
+        with contextlib.suppress(self.library.TransportError):
+            await (await send(request)).aread()
+
     def exchange(self, send: Callable[[Any], Any], request: Any, decision: Decision | None) -> Any:
         match decision:
             case Decision(action=Delay(ms=ms)):
-                self.wait(request, ms)
-                return send(request)
+                return self.delay(send, request, ms)
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
             case Decision(action=BoundaryFail(ms=ms) as failure):
@@ -368,8 +403,7 @@ class ClientPoint:
                              decision: Decision | None) -> Any:
         match decision:
             case Decision(action=Delay(ms=ms)):
-                await self.wait_async(request, ms)
-                return await send(request)
+                return await self.delay_async(send, request, ms)
             case Decision(action=Crash(code=code)):
                 self.runtime.crash(code)
             case Decision(action=BoundaryFail(ms=ms) as failure):
