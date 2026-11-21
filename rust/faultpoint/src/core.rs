@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use crate::config::Settings;
 use crate::rules::{Rule, RuleSet, point_parts};
 
-const INVALID_RULES_EXIT: i32 = 70;
+/// The exit status of a process faultpoint stops, for rules it cannot obey or an error of its own.
+const ABORT_EXIT: i32 = 70;
 
 /// What tells executions of one outcome apart, by bounded values under the keys spec/kinds.json gives the kind;
 /// its keys are sorted, so that one detail has one form.
@@ -84,6 +85,18 @@ pub struct Core {
 
 static CORE: LazyLock<Core> = LazyLock::new(|| Core::new(Settings::from_environment()));
 static STARTED: Once = Once::new();
+
+/// Run faultpoint's own work where the application's code runs, or on a thread of faultpoint: a panic of it is an
+/// error of faultpoint, never one the application should meet or one that should end a thread alone, so it stops the
+/// process, after the panic hook has printed where it happened.
+pub fn own<T>(work: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|panic| {
+        let message = panic.downcast_ref::<&str>().map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic without a message".to_owned());
+        core().abort(&format!("internal error: {message}"))
+    })
+}
 
 /// The process's core, whose rule sources have delivered their first rule set.
 pub fn core() -> &'static Core {
@@ -216,10 +229,13 @@ impl Core {
         std::process::exit(code)
     }
 
-    /// End the process when rules cannot be obeyed, so that no experiment runs under rules it did not ask for.
+    /// End the process when rules cannot be obeyed, so that no experiment runs under rules it did not ask for; what was
+    /// observed is written first, and the process stops even when writing it panics, whose message the panic hook
+    /// has printed.
     pub fn abort(&self, reason: &str) -> ! {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.flush()));
         eprintln!("faultpoint: {reason}; stopping the process");
-        self.crash(INVALID_RULES_EXIT)
+        std::process::exit(ABORT_EXIT)
     }
 
     /// Write the pending observations; a process calls it before a graceful exit.

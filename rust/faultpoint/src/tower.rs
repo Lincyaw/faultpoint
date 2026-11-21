@@ -14,7 +14,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::core::{Detail, Plugin, core};
+use crate::core::{Detail, Plugin, core, own};
 use crate::rules::{Rule, point_id};
 
 const DEFAULT_FAILURE_STATUS: u16 = 503;
@@ -101,48 +101,56 @@ where
         if !core.enabled {
             return Box::pin(inner.call(request));
         }
-        let parent = PROPAGATOR.extract(&HeaderExtractor(request.headers()));
-        let point = point_id(&core.settings.service, "rpc_server",
-                             &format!("{} {}", request.method(), path_template(request.uri().path())));
-        let rule = {
-            let _attached = parent.clone().attach();
-            core.decide_among(&point, |action| action != "fail_after")
-        };
+        // The inner service is the application's, and its panics are its own; deciding and observing the exchange
+        // around it is faultpoint's own work.
+        let (parent, point, rule) = own(|| {
+            let parent = PROPAGATOR.extract(&HeaderExtractor(request.headers()));
+            let point = point_id(&core.settings.service, "rpc_server",
+                                 &format!("{} {}", request.method(), path_template(request.uri().path())));
+            let rule = {
+                let _attached = parent.clone().attach();
+                core.decide_among(&point, |action| action != "fail_after")
+            };
+            (parent, point, rule)
+        });
         let context = parent.clone();
         Box::pin(async move {
             let mut exchange = Exchange { point, rule, started: Instant::now(), context, answered: None };
             let rule = exchange.rule.clone();
             let kind = rule.as_ref().map(|rule| rule.action.kind.as_str());
             if let (Some(rule), Some("delay")) = (&rule, kind) {
-                tokio::time::sleep(Duration::from_secs_f64(rule.number("ms").unwrap_or_else(|reason| core.abort(&reason)) / 1000.0)).await;
+                let delay = own(|| Duration::from_secs_f64(rule.number("ms").unwrap_or_else(|reason| core.abort(&reason)) / 1000.0));
+                tokio::time::sleep(delay).await;
             }
             if let (Some(rule), Some("crash")) = (&rule, kind) {
                 core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32);
             }
             let response = match (&rule, kind) {
-                (Some(rule), Some("fail")) => Ok(failure(rule.action.parameters.get("status"))),
+                (Some(rule), Some("fail")) => Ok(own(|| failure(rule.action.parameters.get("status")))),
                 _ => inner.call(request).await,
             };
-            // Only a 2xx or 3xx answer is one a fail_after rule replaces and counts.
-            let response = match response {
-                Ok(answer) if answer.status().is_success() || answer.status().is_redirection() => {
-                    match core.decide_among(&exchange.point, |action| action == "fail_after") {
-                        Some(replacing) => {
-                            let replaced = failure(replacing.action.parameters.get("status"));
-                            exchange.rule = Some(replacing);
-                            Ok(replaced)
+            own(|| {
+                // Only a 2xx or 3xx answer is one a fail_after rule replaces and counts.
+                let response = match response {
+                    Ok(answer) if answer.status().is_success() || answer.status().is_redirection() => {
+                        match core.decide_among(&exchange.point, |action| action == "fail_after") {
+                            Some(replacing) => {
+                                let replaced = failure(replacing.action.parameters.get("status"));
+                                exchange.rule = Some(replacing);
+                                Ok(replaced)
+                            }
+                            None => Ok(answer),
                         }
-                        None => Ok(answer),
                     }
-                }
-                other => other,
-            };
-            exchange.answered = Some(match &response {
-                Ok(response) => (status_outcome(response.status()),
-                                 Detail::from([("status", response.status().as_u16().to_string()), ("abandoned", "false".into())])),
-                Err(_) => ("error".to_owned(), Detail::from([("error", type_name::<S::Error>().to_owned()), ("abandoned", "false".into())])),
-            });
-            response
+                    other => other,
+                };
+                exchange.answered = Some(match &response {
+                    Ok(response) => (status_outcome(response.status()),
+                                     Detail::from([("status", response.status().as_u16().to_string()), ("abandoned", "false".into())])),
+                    Err(_) => ("error".to_owned(), Detail::from([("error", type_name::<S::Error>().to_owned()), ("abandoned", "false".into())])),
+                });
+                response
+            })
         }.with_context(parent))
     }
 }
@@ -159,10 +167,12 @@ struct Exchange {
 
 impl Drop for Exchange {
     fn drop(&mut self) {
-        let (outcome, detail) = self.answered.take()
-            .unwrap_or_else(|| ("error".to_owned(), Detail::from([("abandoned", "true".to_owned())])));
-        let _attached = self.context.clone().attach();
-        core().observe(&self.point, &outcome, self.started.elapsed().as_secs_f64() * 1000.0, self.rule.as_ref(), detail);
+        own(|| {
+            let (outcome, detail) = self.answered.take()
+                .unwrap_or_else(|| ("error".to_owned(), Detail::from([("abandoned", "true".to_owned())])));
+            let _attached = self.context.clone().attach();
+            core().observe(&self.point, &outcome, self.started.elapsed().as_secs_f64() * 1000.0, self.rule.as_ref(), detail);
+        });
     }
 }
 

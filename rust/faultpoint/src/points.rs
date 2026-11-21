@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::core::{Detail, Plugin, core};
+use crate::core::{Detail, Plugin, core, own};
 use crate::rules::Rule;
 
 fn number(rule: &Rule, name: &str) -> f64 {
@@ -38,77 +38,85 @@ impl std::error::Error for Injected {}
 
 /// Whether a guarded error path runs: its natural condition, or forced by a fail rule.
 pub fn branch(point: &str, taken: bool) -> bool {
-    let core = core();
-    if !core.enabled {
-        return taken;
-    }
-    let rule = core.decide(point);
-    let taken = match &rule {
-        Some(rule) => {
-            hold(rule);
-            taken || rule.action.kind == "fail"
+    own(|| {
+        let core = core();
+        if !core.enabled {
+            return taken;
         }
-        None => taken,
-    };
-    core.observe(point, if taken { "taken" } else { "not_taken" }, 0.0, rule.as_ref(), Detail::new());
-    taken
+        let rule = core.decide(point);
+        let taken = match &rule {
+            Some(rule) => {
+                hold(rule);
+                taken || rule.action.kind == "fail"
+            }
+            None => taken,
+        };
+        core.observe(point, if taken { "taken" } else { "not_taken" }, 0.0, rule.as_ref(), Detail::new());
+        taken
+    })
 }
 
 /// The result of a detector, negated by a negate rule.
 pub fn check(point: &str, result: bool) -> bool {
-    let core = core();
-    if !core.enabled {
-        return result;
-    }
-    let rule = core.decide(point);
-    let result = match &rule {
-        Some(rule) => {
-            hold(rule);
-            result != (rule.action.kind == "negate")
+    own(|| {
+        let core = core();
+        if !core.enabled {
+            return result;
         }
-        None => result,
-    };
-    core.observe(point, if result { "true" } else { "false" }, 0.0, rule.as_ref(), Detail::new());
-    result
+        let rule = core.decide(point);
+        let result = match &rule {
+            Some(rule) => {
+                hold(rule);
+                result != (rule.action.kind == "negate")
+            }
+            None => result,
+        };
+        core.observe(point, if result { "true" } else { "false" }, 0.0, rule.as_ref(), Detail::new());
+        result
+    })
 }
 
 /// One iteration of a loop, delayed by a delay rule to model contention.
 pub fn loop_iteration(point: &str) {
-    let core = core();
-    if !core.enabled {
-        return;
-    }
-    let rule = core.decide(point);
-    if let Some(rule) = &rule {
-        hold(rule);
-    }
-    core.observe(point, "iteration", 0.0, rule.as_ref(), Detail::new());
+    own(|| {
+        let core = core();
+        if !core.enabled {
+            return;
+        }
+        let rule = core.decide(point);
+        if let Some(rule) = &rule {
+            hold(rule);
+        }
+        core.observe(point, "iteration", 0.0, rule.as_ref(), Detail::new());
+    })
 }
 
 /// A business value, replaced by a set rule or offset by a shift rule.
 pub fn value<T: Serialize + DeserializeOwned>(point: &str, observed: T) -> T {
-    let core = core();
-    if !core.enabled {
-        return observed;
-    }
-    let rule = core.decide(point);
-    let mut result = observed;
-    if let Some(rule) = &rule {
-        hold(rule);
-        let replaced = match rule.action.kind.as_str() {
-            "set" => rule.action.parameters.get("value").cloned(),
-            "shift" => serde_json::to_value(&result).ok().and_then(|current| current.as_f64())
-                .map(|current| Value::from(current + number(rule, "amount"))),
-            _ => None,
-        };
-        if let Some(replaced) = replaced {
-            result = serde_json::from_value(replaced)
-                .unwrap_or_else(|error| core.abort(&format!("rule {} does not fit the value at {point}: {error}", rule.id)));
+    own(|| {
+        let core = core();
+        if !core.enabled {
+            return observed;
         }
-    }
-    let quantity = serde_json::to_value(&result).ok().and_then(|current| current.as_f64()).unwrap_or(0.0);
-    core.observe(point, "observed", quantity, rule.as_ref(), Detail::new());
-    result
+        let rule = core.decide(point);
+        let mut result = observed;
+        if let Some(rule) = &rule {
+            hold(rule);
+            let replaced = match rule.action.kind.as_str() {
+                "set" => rule.action.parameters.get("value").cloned(),
+                "shift" => serde_json::to_value(&result).ok().and_then(|current| current.as_f64())
+                    .map(|current| Value::from(current + number(rule, "amount"))),
+                _ => None,
+            };
+            if let Some(replaced) = replaced {
+                result = serde_json::from_value(replaced)
+                    .unwrap_or_else(|error| core.abort(&format!("rule {} does not fit the value at {point}: {error}", rule.id)));
+            }
+        }
+        let quantity = serde_json::to_value(&result).ok().and_then(|current| current.as_f64()).unwrap_or(0.0);
+        core.observe(point, "observed", quantity, rule.as_ref(), Detail::new());
+        result
+    })
 }
 
 /// A clock reading a shift rule can move.
@@ -132,38 +140,42 @@ impl ClockReading for Instant {
 
 /// A clock reading, moved by a shift rule's seconds.
 pub fn clock<T: ClockReading>(point: &str, reading: T) -> T {
-    let core = core();
-    if !core.enabled {
-        return reading;
-    }
-    let rule = core.decide(point);
-    let mut reading = reading;
-    if let Some(rule) = &rule {
-        hold(rule);
-        if rule.action.kind == "shift" {
-            reading = reading.shifted(number(rule, "amount"));
+    own(|| {
+        let core = core();
+        if !core.enabled {
+            return reading;
         }
-    }
-    core.observe(point, "read", 0.0, rule.as_ref(), Detail::new());
-    reading
+        let rule = core.decide(point);
+        let mut reading = reading;
+        if let Some(rule) = &rule {
+            hold(rule);
+            if rule.action.kind == "shift" {
+                reading = reading.shifted(number(rule, "amount"));
+            }
+        }
+        core.observe(point, "read", 0.0, rule.as_ref(), Detail::new());
+        reading
+    })
 }
 
 /// Whether a resource was acquired: its natural outcome, or rejected by a fail rule.
 pub fn acquire(point: &str, acquired: bool) -> bool {
-    let core = core();
-    if !core.enabled {
-        return acquired;
-    }
-    let rule = core.decide(point);
-    let acquired = match &rule {
-        Some(rule) => {
-            hold(rule);
-            acquired && rule.action.kind != "fail"
+    own(|| {
+        let core = core();
+        if !core.enabled {
+            return acquired;
         }
-        None => acquired,
-    };
-    core.observe(point, if acquired { "acquired" } else { "rejected" }, 0.0, rule.as_ref(), Detail::new());
-    acquired
+        let rule = core.decide(point);
+        let acquired = match &rule {
+            Some(rule) => {
+                hold(rule);
+                acquired && rule.action.kind != "fail"
+            }
+            None => acquired,
+        };
+        core.observe(point, if acquired { "acquired" } else { "rejected" }, 0.0, rule.as_ref(), Detail::new());
+        acquired
+    })
 }
 
 /// What a call point decides before its call: under a fail rule the injected error takes the call's place and
@@ -176,41 +188,45 @@ pub enum Before {
 /// Decide the rule of a call point before its call, so that delay and crash act before the call runs; a fail_after
 /// rule is left to after_call.
 pub fn before_call(point: &str) -> Before {
-    let core = core();
-    if !core.enabled {
-        return Before::Run(None);
-    }
-    let rule = core.decide_among(point, |action| action != "fail_after");
-    if let Some(rule) = &rule {
-        hold(rule);
-    }
-    match rule {
-        Some(rule) if rule.action.kind == "fail" => Before::Fail(rule, Injected { point: point.into() }),
-        rule => Before::Run(rule),
-    }
+    own(|| {
+        let core = core();
+        if !core.enabled {
+            return Before::Run(None);
+        }
+        let rule = core.decide_among(point, |action| action != "fail_after");
+        if let Some(rule) = &rule {
+            hold(rule);
+        }
+        match rule {
+            Some(rule) if rule.action.kind == "fail" => Before::Fail(rule, Injected { point: point.into() }),
+            rule => Before::Run(rule),
+        }
+    })
 }
 
 /// Observe the result of a call; a call that succeeded has its result replaced by the injected error when a
 /// fail_after rule fires now, and any other result is observed under the rule decided before the call.
 pub fn after_call<T, E: From<Injected>>(point: &str, rule: Option<Rule>, result: Result<T, E>) -> Result<T, E> {
-    let core = core();
-    if !core.enabled {
-        return result;
-    }
-    // A fail_after rule acts only on a call that succeeded, so it is decided and counted only then; a call's own
-    // error stays, under the rule decided before the call.
-    let (rule, result) = match result {
-        Ok(value) => match core.decide_among(point, |action| action == "fail_after") {
-            Some(replacing) => (Some(replacing), Err(Injected { point: point.into() }.into())),
-            None => (rule, Ok(value)),
-        },
-        Err(error) => (rule, Err(error)),
-    };
-    match &result {
-        Ok(_) => core.observe(point, "ok", 0.0, rule.as_ref(), Detail::new()),
-        Err(_) => core.observe(point, "error", 0.0, rule.as_ref(), Detail::from([("error", type_name::<E>().to_owned())])),
-    }
-    result
+    own(|| {
+        let core = core();
+        if !core.enabled {
+            return result;
+        }
+        // A fail_after rule acts only on a call that succeeded, so it is decided and counted only then; a call's own
+        // error stays, under the rule decided before the call.
+        let (rule, result) = match result {
+            Ok(value) => match core.decide_among(point, |action| action == "fail_after") {
+                Some(replacing) => (Some(replacing), Err(Injected { point: point.into() }.into())),
+                None => (rule, Ok(value)),
+            },
+            Err(error) => (rule, Err(error)),
+        };
+        match &result {
+            Ok(_) => core.observe(point, "ok", 0.0, rule.as_ref(), Detail::new()),
+            Err(_) => core.observe(point, "error", 0.0, rule.as_ref(), Detail::from([("error", type_name::<E>().to_owned())])),
+        }
+        result
+    })
 }
 
 inventory::submit! {

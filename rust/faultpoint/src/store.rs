@@ -16,7 +16,7 @@ use sqlparser::ast::{ObjectName, Query, Select, Statement, Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::core::{Detail, Plugin, core};
+use crate::core::{Detail, Plugin, core, own};
 use crate::rules::{Rule, point_id, point_parts};
 
 /// spec/redis-commands.json, the table every SDK reads.
@@ -151,7 +151,8 @@ fn number(rule: &Rule, name: &str) -> f64 {
     rule.number(name).unwrap_or_else(|reason| core().abort(&reason))
 }
 
-/// Run a store operation as the point of the given kind and locator.
+/// Run a store operation as the point of the given kind and locator. The operation is the application's, and its
+/// panics are its own; what the point decides and observes around it is faultpoint's own work.
 pub async fn store<T, E, F>(kind: &'static str, locator: String, operation: F, hooks: Hooks<T, E>) -> Result<T, E>
 where
     F: Future<Output = Result<T, E>>,
@@ -160,50 +161,56 @@ where
     if !core.enabled {
         return operation.await;
     }
-    let point = point_id(&core.settings.service, kind, &locator);
-    let rule = core.decide_among(&point, |action| action != "fail_after");
+    let (point, rule, action, delay) = own(|| {
+        let point = point_id(&core.settings.service, kind, &locator);
+        let rule = core.decide_among(&point, |action| action != "fail_after");
+        let action = rule.as_ref().map_or(String::new(), |rule| rule.action.kind.clone());
+        let delay = rule.as_ref().filter(|_| action == "delay").map(|rule| Duration::from_secs_f64(number(rule, "ms") / 1000.0));
+        (point, rule, action, delay)
+    });
     let started = Instant::now();
-    let action = rule.as_ref().map_or(String::new(), |rule| rule.action.kind.clone());
     let result = match &rule {
         None => operation.await,
         Some(rule) => match action.as_str() {
             "delay" => {
-                tokio::time::sleep(Duration::from_secs_f64(number(rule, "ms") / 1000.0)).await;
+                tokio::time::sleep(delay.unwrap_or_default()).await;
                 operation.await
             }
             "crash" => core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32),
-            "fail" => Err(injected(rule, &point, hooks.failure)),
-            "empty" | "drop" => (hooks.substitute)(),
+            "fail" => Err(own(|| injected(rule, &point, hooks.failure))),
+            "empty" | "drop" => own(|| (hooks.substitute)()),
             other => core.abort(&format!("rule {}: {other} is not implemented at {point}", rule.id)),
         },
     };
-    // Only an operation that ran and succeeded is one a fail_after rule replaces and counts.
-    let ran = action != "empty" && action != "drop";
-    let (rule, result) = match result {
-        Ok(value) if ran => match core.decide_among(&point, |action| action == "fail_after") {
-            Some(replacing) => {
-                let error = injected(&replacing, &point, hooks.failure);
-                (Some(replacing), Err(error))
+    own(|| {
+        // Only an operation that ran and succeeded is one a fail_after rule replaces and counts.
+        let ran = action != "empty" && action != "drop";
+        let (rule, result) = match result {
+            Ok(value) if ran => match core.decide_among(&point, |action| action == "fail_after") {
+                Some(replacing) => {
+                    let error = injected(&replacing, &point, hooks.failure);
+                    (Some(replacing), Err(error))
+                }
+                None => (rule, Ok(value)),
+            },
+            other => (rule, other),
+        };
+        // An injected empty reply is empty whatever the client's type tells; otherwise the call site's hook decides.
+        let (outcome, detail) = match &result {
+            Err(error) => {
+                let mut detail = Detail::from([("error", type_name::<E>().to_owned())]);
+                detail.extend((hooks.code)(error).map(|code| ("code", code)));
+                ("error", detail)
             }
-            None => (rule, Ok(value)),
-        },
-        other => (rule, other),
-    };
-    // An injected empty reply is empty whatever the client's type tells; otherwise the call site's hook decides.
-    let (outcome, detail) = match &result {
-        Err(error) => {
-            let mut detail = Detail::from([("error", type_name::<E>().to_owned())]);
-            detail.extend((hooks.code)(error).map(|code| ("code", code)));
-            ("error", detail)
-        }
-        Ok(_) if action == "empty" => ("empty", Detail::new()),
-        Ok(value) if kind == "store_read" || kind == "consume" => {
-            (if (hooks.is_empty)(value) { "empty" } else { "rows" }, Detail::new())
-        }
-        Ok(_) => ("ok", Detail::new()),
-    };
-    core.observe(&point, outcome, started.elapsed().as_secs_f64() * 1000.0, rule.as_ref(), detail);
-    result
+            Ok(_) if action == "empty" => ("empty", Detail::new()),
+            Ok(value) if kind == "store_read" || kind == "consume" => {
+                (if (hooks.is_empty)(value) { "empty" } else { "rows" }, Detail::new())
+            }
+            Ok(_) => ("ok", Detail::new()),
+        };
+        core.observe(&point, outcome, started.elapsed().as_secs_f64() * 1000.0, rule.as_ref(), detail);
+        result
+    })
 }
 
 /// The error a fail or fail_after rule raises, of the rule's code when it names one; a client that cannot make it
@@ -219,7 +226,7 @@ pub async fn sql<T, E, F>(sql: &str, operation: F, hooks: Hooks<T, E>) -> Result
 where
     F: Future<Output = Result<T, E>>,
 {
-    let (kind, locator) = sql_point(sql);
+    let (kind, locator) = own(|| sql_point(sql));
     store(kind, locator, operation, hooks).await
 }
 
@@ -245,8 +252,8 @@ pub async fn redis<T, E, F>(name: &'static str, key: Option<String>, operation: 
 where
     F: Future<Output = Result<T, E>>,
 {
-    match redis_kind(name) {
-        Some(kind) => store(kind, redis_locator(name, key.as_deref()), operation, hooks).await,
+    match own(|| redis_kind(name).map(|kind| (kind, redis_locator(name, key.as_deref())))) {
+        Some((kind, locator)) => store(kind, locator, operation, hooks).await,
         None => operation.await,
     }
 }

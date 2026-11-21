@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::core::RuleSource;
+use crate::core::{RuleSource, own};
 
 pub fn point_id(service: &str, kind: &str, locator: &str) -> String {
     assert!(!service.contains(':'), "faultpoint: a service name cannot contain ':': {service}");
@@ -127,14 +127,14 @@ impl RuleSource for FileRuleSource {
         apply(self.read());
         std::thread::spawn(move || loop {
             std::thread::sleep(self.interval);
-            match self.modified() {
+            own(|| match self.modified() {
                 Ok(time) if Some(time) == modified => {}
                 Ok(time) => {
                     modified = Some(time);
                     apply(self.read());
                 }
                 Err(error) => apply(Err(error)),
-            }
+            });
         });
     }
 }

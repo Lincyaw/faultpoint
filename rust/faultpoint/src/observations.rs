@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Settings;
-use crate::core::{Detail, Observation, ObservationSink, Plugin};
+use crate::core::{Detail, Observation, ObservationSink, Plugin, own};
 
 /// One line of an observation file, as spec/observation.schema.json defines.
 #[derive(Serialize)]
@@ -74,7 +74,7 @@ impl JsonlSink {
         let flushing = Arc::clone(&sink);
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs_f64(options.flush_seconds));
-            flushing.flush();
+            own(|| flushing.flush());
         });
         sink
     }
