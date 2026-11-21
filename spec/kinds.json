@@ -84,28 +84,28 @@
       "outcomes": ["rows", "empty", "error"],
       "errors": ["timeout", "refused"],
       "code": true,
-      "details": ["error", "code"]
+      "details": ["error", "code", "sent"]
     },
     "store_write": {
       "actions": ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
       "outcomes": ["ok", "error"],
       "errors": ["timeout", "refused"],
       "code": true,
-      "details": ["error", "code"]
+      "details": ["error", "code", "sent"]
     },
     "publish": {
       "actions": ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
       "outcomes": ["ok", "error"],
       "errors": ["timeout", "refused"],
       "code": true,
-      "details": ["error", "code"]
+      "details": ["error", "code", "sent"]
     },
     "consume": {
       "actions": ["fail", "fail_after", "duplicate", "empty", "delay", "crash"],
       "outcomes": ["rows", "empty", "error"],
       "errors": ["timeout", "refused"],
       "code": true,
-      "details": ["error", "code"]
+      "details": ["error", "code", "sent"]
     },
     "syscall": {
       "actions": ["fail", "crash"],
