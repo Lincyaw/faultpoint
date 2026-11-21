@@ -20,6 +20,68 @@ const (
 	pointsDirectionINGRESS pointsDirection = 1
 )
 
+type pointsErrorRule uint32
+
+const (
+	pointsErrorRuleNONZERO  pointsErrorRule = 0
+	pointsErrorRuleNEGATIVE pointsErrorRule = 1
+	pointsErrorRuleZERO     pointsErrorRule = 2
+)
+
+type pointsNativeAction uint32
+
+const (
+	pointsNativeActionFAIL   pointsNativeAction = 0
+	pointsNativeActionCRASH  pointsNativeAction = 1
+	pointsNativeActionNEGATE pointsNativeAction = 2
+)
+
+type pointsNativeKey struct {
+	_       structs.HostLayout
+	Point   uint32
+	Rule    uint16
+	Flagged uint16
+	Value   int64
+}
+
+type pointsNativeRule struct {
+	_      structs.HostLayout
+	Rule   uint32
+	Action pointsNativeAction
+	Writes uint32
+	_      [4]byte
+	Write  [4]pointsNativeWrite
+}
+
+type pointsNativeRuleList struct {
+	_     structs.HostLayout
+	Count uint32
+	_     [4]byte
+	Rules [8]pointsNativeRule
+}
+
+type pointsNativeSite struct {
+	_           structs.HostLayout
+	Point       uint32
+	Service     uint32
+	Address     uint64
+	Outcome     pointsRegisterName
+	Type        pointsResultType
+	Error       pointsErrorRule
+	Conditional uint32
+	Condition   pointsRegisterName
+	_           [4]byte
+	Mask        uint64
+	Equals      uint64
+}
+
+type pointsNativeWrite struct {
+	_          structs.HostLayout
+	Target     pointsRegisterName
+	FromMemory uint32
+	Value      uint64
+}
+
 type pointsNaturalKey struct {
 	_       structs.HostLayout
 	Service uint32
@@ -49,6 +111,30 @@ type pointsPacketSide struct {
 	Service   uint32
 	Direction uint32
 }
+
+type pointsRegisterName uint32
+
+const (
+	pointsRegisterNameAX  pointsRegisterName = 0
+	pointsRegisterNameBX  pointsRegisterName = 1
+	pointsRegisterNameCX  pointsRegisterName = 2
+	pointsRegisterNameDX  pointsRegisterName = 3
+	pointsRegisterNameSI  pointsRegisterName = 4
+	pointsRegisterNameDI  pointsRegisterName = 5
+	pointsRegisterNameR8  pointsRegisterName = 6
+	pointsRegisterNameR9  pointsRegisterName = 7
+	pointsRegisterNameR10 pointsRegisterName = 8
+	pointsRegisterNameR11 pointsRegisterName = 9
+)
+
+type pointsResultType uint32
+
+const (
+	pointsResultTypeINT32   pointsResultType = 0
+	pointsResultTypeINT64   pointsResultType = 1
+	pointsResultTypePOINTER pointsResultType = 2
+	pointsResultTypeBOOL    pointsResultType = 3
+)
 
 type pointsSyscallPoint struct {
 	_       structs.HostLayout
@@ -86,12 +172,17 @@ type pointsTrigger struct {
 const (
 	pointsMapCgroupServices  = "cgroup_services"
 	pointsMapMarks           = "marks"
+	pointsMapNativeOutcomes  = "native_outcomes"
+	pointsMapNativeRules     = "native_rules"
+	pointsMapNativeSites     = "native_sites"
 	pointsMapNatural         = "natural"
 	pointsMapPacketRules     = "packet_rules"
 	pointsMapSyscallRules    = "syscall_rules"
 	pointsMapTriggers        = "triggers"
+	pointsProgEnterNative    = "enter_native"
 	pointsProgInjectPacket   = "inject_packet"
 	pointsProgInjectSyscall  = "inject_syscall"
+	pointsProgLeaveNative    = "leave_native"
 	pointsProgObserveSyscall = "observe_syscall"
 	pointsVarCgroupLevels    = "cgroup_levels"
 	pointsVarPacketDirection = "packet_direction"
@@ -140,8 +231,10 @@ type pointsSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type pointsProgramSpecs struct {
+	EnterNative    *ebpf.ProgramSpec `ebpf:"enter_native"`
 	InjectPacket   *ebpf.ProgramSpec `ebpf:"inject_packet"`
 	InjectSyscall  *ebpf.ProgramSpec `ebpf:"inject_syscall"`
+	LeaveNative    *ebpf.ProgramSpec `ebpf:"leave_native"`
 	ObserveSyscall *ebpf.ProgramSpec `ebpf:"observe_syscall"`
 }
 
@@ -151,6 +244,9 @@ type pointsProgramSpecs struct {
 type pointsMapSpecs struct {
 	CgroupServices *ebpf.MapSpec `ebpf:"cgroup_services"`
 	Marks          *ebpf.MapSpec `ebpf:"marks"`
+	NativeOutcomes *ebpf.MapSpec `ebpf:"native_outcomes"`
+	NativeRules    *ebpf.MapSpec `ebpf:"native_rules"`
+	NativeSites    *ebpf.MapSpec `ebpf:"native_sites"`
 	Natural        *ebpf.MapSpec `ebpf:"natural"`
 	PacketRules    *ebpf.MapSpec `ebpf:"packet_rules"`
 	SyscallRules   *ebpf.MapSpec `ebpf:"syscall_rules"`
@@ -188,6 +284,9 @@ func (o *pointsObjects) Close() error {
 type pointsMaps struct {
 	CgroupServices *ebpf.Map `ebpf:"cgroup_services"`
 	Marks          *ebpf.Map `ebpf:"marks"`
+	NativeOutcomes *ebpf.Map `ebpf:"native_outcomes"`
+	NativeRules    *ebpf.Map `ebpf:"native_rules"`
+	NativeSites    *ebpf.Map `ebpf:"native_sites"`
 	Natural        *ebpf.Map `ebpf:"natural"`
 	PacketRules    *ebpf.Map `ebpf:"packet_rules"`
 	SyscallRules   *ebpf.Map `ebpf:"syscall_rules"`
@@ -198,6 +297,9 @@ func (m *pointsMaps) Close() error {
 	return _PointsClose(
 		m.CgroupServices,
 		m.Marks,
+		m.NativeOutcomes,
+		m.NativeRules,
+		m.NativeSites,
 		m.Natural,
 		m.PacketRules,
 		m.SyscallRules,
@@ -218,15 +320,19 @@ type pointsVariables struct {
 //
 // It can be passed to loadPointsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type pointsPrograms struct {
+	EnterNative    *ebpf.Program `ebpf:"enter_native"`
 	InjectPacket   *ebpf.Program `ebpf:"inject_packet"`
 	InjectSyscall  *ebpf.Program `ebpf:"inject_syscall"`
+	LeaveNative    *ebpf.Program `ebpf:"leave_native"`
 	ObserveSyscall *ebpf.Program `ebpf:"observe_syscall"`
 }
 
 func (p *pointsPrograms) Close() error {
 	return _PointsClose(
+		p.EnterNative,
 		p.InjectPacket,
 		p.InjectSyscall,
+		p.LeaveNative,
 		p.ObserveSyscall,
 	)
 }

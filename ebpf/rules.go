@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"maps"
 	"math"
 	"net/netip"
 	"slices"
@@ -25,6 +26,7 @@ const (
 	actionCrash      = "crash"
 	actionDelay      = "delay"
 	actionDrop       = "drop"
+	actionNegate     = "negate"
 	directionEgress  = "egress"
 	directionIngress = "ingress"
 	wildcard         = "*"
@@ -35,8 +37,10 @@ const (
 	fqHorizon = 10 * time.Second
 )
 
-// actions are the actions the agent implements at each kind it serves, as a plugin declares them to the core.
-var actions = map[string][]string{kindSyscall: {actionFail, actionCrash}, kindPacket: {actionDelay, actionDrop}}
+// actions are the actions the agent implements at each kind it serves, as a plugin declares them to the core; it
+// serves call and check points only in native functions.
+var actions = map[string][]string{kindSyscall: {actionFail, actionCrash}, kindPacket: {actionDelay, actionDrop},
+	kindCall: {actionFail, actionCrash}, kindCheck: {actionNegate, actionCrash}}
 
 var directions = map[string]pointsDirection{directionEgress: pointsDirectionEGRESS, directionIngress: pointsDirectionINGRESS}
 
@@ -63,7 +67,8 @@ func (table *syscallTable) number(name string) uint32 {
 	return uint32(index)
 }
 
-// injection is what the observations of a rule's injected executions carry; a crash has no outcome, as in the SDKs.
+// injection is what the observations of a rule's injected executions carry; a crash has no outcome, as in the SDKs,
+// and a native point's programs count its injections with the outcomes they produce.
 type injection struct {
 	rule    string
 	point   string
@@ -78,16 +83,19 @@ type kernelRules struct {
 	syscalls   map[pointsSyscallPoint]*pointsSyscallRuleList
 	packets    map[pointsPacketSide]*pointsPacketRuleList
 	delayed    map[pointsPacketSide]bool
+	natives    map[uint32]*pointsNativeRuleList
 }
 
-// translate keeps the syscall and packet rules of the configured services and checks that the agent can apply them;
-// rules of other services and kinds are left to the processes that serve them.
-func translate(ruleset faultpoint.RuleSet, services []service, syscalls *syscallTable, seed int64) (*kernelRules, error) {
+// translate keeps the syscall, packet and native function rules of the configured services and checks that the agent
+// can apply them; rules of other services and kinds, and call and check rules outside native functions, are left to
+// the processes that serve them.
+func translate(ruleset faultpoint.RuleSet, services []service, syscalls *syscallTable, points []nativePoint, seed int64) (*kernelRules, error) {
 	translated := &kernelRules{
 		experiment: ruleset.Experiment,
 		syscalls:   map[pointsSyscallPoint]*pointsSyscallRuleList{},
 		packets:    map[pointsPacketSide]*pointsPacketRuleList{},
 		delayed:    map[pointsPacketSide]bool{},
+		natives:    map[uint32]*pointsNativeRuleList{},
 	}
 	for _, rule := range ruleset.Rules {
 		name, kind, locator, err := faultpoint.SplitPoint(rule.Point)
@@ -95,8 +103,13 @@ func translate(ruleset faultpoint.RuleSet, services []service, syscalls *syscall
 			return nil, err
 		}
 		served := slices.IndexFunc(services, func(s service) bool { return s.name == name })
-		if served < 0 || actions[kind] == nil {
+		native := slices.IndexFunc(points, func(point nativePoint) bool { return point.id == rule.Point })
+		nativeKind := kind == kindCall || kind == kindCheck
+		if served < 0 || actions[kind] == nil || (nativeKind && native < 0 && !nativeLocator.MatchString(locator)) {
 			continue
+		}
+		if nativeKind && native < 0 {
+			return nil, fmt.Errorf("rule %s: no configured native function has point %s", rule.ID, rule.Point)
 		}
 		if !slices.Contains(actions[kind], rule.Action.Kind) {
 			return nil, fmt.Errorf("rule %s: the agent implements %v at a %s point, not %s", rule.ID, actions[kind], kind, rule.Action.Kind)
@@ -106,10 +119,13 @@ func translate(ruleset faultpoint.RuleSet, services []service, syscalls *syscall
 		}
 		index := uint32(len(translated.triggers))
 		var outcome string
-		if kind == kindSyscall {
+		switch {
+		case kind == kindSyscall:
 			outcome, err = translated.addSyscall(rule, index, services[served].index, syscalls.number(locator))
-		} else {
+		case kind == kindPacket:
 			outcome, err = translated.addPacket(rule, index, services[served], locator)
+		default:
+			err = translated.addNative(rule, index, uint32(native), points[native])
 		}
 		if err != nil {
 			return nil, fmt.Errorf("rule %s: %w", rule.ID, err)
@@ -216,6 +232,51 @@ func (translated *kernelRules) addPacket(rule faultpoint.Rule, index uint32, own
 	list.Rules[list.Count] = entry
 	list.Count++
 	return outcome, nil
+}
+
+// addNative adds a fail rule, which writes the result registers with the words of the error it names, a negate rule,
+// which flips a check's result at its returns, or a crash rule, which kills the process with SIGKILL at the entry.
+func (translated *kernelRules) addNative(rule faultpoint.Rule, index, point uint32, function nativePoint) error {
+	entry := pointsNativeRule{Rule: index}
+	switch rule.Action.Kind {
+	case actionFail:
+		var fail struct {
+			Error string `json:"error"`
+		}
+		if err := decodeParams(rule.Action.Params, &fail); err != nil {
+			return err
+		}
+		writes, known := function.errors[fail.Error]
+		if !known {
+			return fmt.Errorf("%s fails with one of the errors configured for it, %v, not %q", function.id,
+				slices.Sorted(maps.Keys(function.errors)), fail.Error)
+		}
+		entry.Action, entry.Writes = pointsNativeActionFAIL, uint32(copy(entry.Write[:], writes))
+	case actionCrash:
+		var crash struct {
+			Code int `json:"code"`
+		}
+		if err := decodeParams(rule.Action.Params, &crash); err != nil {
+			return err
+		}
+		entry.Action = pointsNativeActionCRASH
+	default:
+		if err := decodeParams(rule.Action.Params, &struct{}{}); err != nil {
+			return err
+		}
+		entry.Action = pointsNativeActionNEGATE
+	}
+	list := translated.natives[point]
+	if list == nil {
+		list = &pointsNativeRuleList{}
+		translated.natives[point] = list
+	}
+	if int(list.Count) == len(list.Rules) {
+		return fmt.Errorf("a native point has at most %d rules", len(list.Rules))
+	}
+	list.Rules[list.Count] = entry
+	list.Count++
+	return nil
 }
 
 // parsePacketLocator reads <egress|ingress>:<ip|*>:<port|*>; an IPv6 address keeps its colons, so the port follows

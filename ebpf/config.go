@@ -15,10 +15,12 @@ const (
 	jsonlOptionsName = "jsonl"
 )
 
-// agentOptions are given under "ebpf" in the file FAULTPOINT_CONFIG names; syscalls are those observed.
+// agentOptions are given under "ebpf" in the file FAULTPOINT_CONFIG names; syscalls are those observed, and functions
+// the native functions of the services' containers that carry points.
 type agentOptions struct {
-	Services map[string]serviceOptions `json:"services"`
-	Syscalls []string                  `json:"syscalls"`
+	Services  map[string]serviceOptions `json:"services"`
+	Syscalls  []string                  `json:"syscalls"`
+	Functions []functionOptions         `json:"functions"`
 }
 
 // serviceOptions say where a service runs: the cgroups of its processes and the devices that carry its packets.
@@ -37,10 +39,11 @@ type deviceOptions struct {
 
 // service is a configured service with its index in the kernel maps.
 type service struct {
-	name    string
-	index   uint32
-	cgroups map[uint64]int
-	devices []deviceOptions
+	name        string
+	index       uint32
+	cgroups     map[uint64]int
+	cgroupPaths []string
+	devices     []deviceOptions
 }
 
 // services resolves each configured service's cgroups to the ids and levels the kernel reports.
@@ -56,7 +59,8 @@ func (options agentOptions) services() ([]service, error) {
 	resolved := make([]service, 0, len(names))
 	for index, name := range names {
 		configured := options.Services[name]
-		next := service{name: name, index: uint32(index), cgroups: map[uint64]int{}, devices: configured.Devices}
+		next := service{name: name, index: uint32(index), cgroups: map[uint64]int{}, cgroupPaths: configured.Cgroups,
+			devices: configured.Devices}
 		for _, path := range configured.Cgroups {
 			id, level, err := cgroupIdentity(path)
 			if err != nil {

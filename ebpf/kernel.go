@@ -1,12 +1,13 @@
 package main
 
 //go:generate sh -c "bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h"
-//go:generate sh -c "go tool bpf2go -tags linux -target bpfel -type trigger -type syscall_point -type syscall_rule -type syscall_rule_list -type packet_side -type packet_rule -type packet_rule_list -type natural_key -cflags \"-O2 -g -Wall -Werror -Wno-missing-declarations -mcpu=v3 -I$(go list -m -f '{{.Dir}}' github.com/cilium/ebpf)/examples/headers\" points bpf/points.bpf.c"
+//go:generate sh -c "go tool bpf2go -tags linux -target bpfel -type trigger -type syscall_point -type syscall_rule -type syscall_rule_list -type packet_side -type packet_rule -type packet_rule_list -type natural_key -type register_name -type result_type -type error_rule -type native_action -type native_site -type native_write -type native_rule -type native_rule_list -type native_key -cflags \"-O2 -g -Wall -Werror -Wno-missing-declarations -mcpu=v3 -I$(go list -m -f '{{.Dir}}' github.com/cilium/ebpf)/examples/headers\" points bpf/points.bpf.c"
 
 import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -26,30 +27,39 @@ const (
 var syscallEntryPrefixes = map[string]string{"amd64": "__x64_sys_", "arm64": "__arm64_sys_"}
 
 // kernel holds what lives as long as the agent, including the triggers, so a rule set's injections stay readable
-// after it is detached.
+// after it is detached, and the native points with the probes at their returns.
 type kernel struct {
 	spec    *ebpf.CollectionSpec
 	objects struct {
 		ObserveSyscall *ebpf.Program `ebpf:"observe_syscall"`
+		LeaveNative    *ebpf.Program `ebpf:"leave_native"`
 		CgroupServices *ebpf.Map     `ebpf:"cgroup_services"`
 		Marks          *ebpf.Map     `ebpf:"marks"`
 		Natural        *ebpf.Map     `ebpf:"natural"`
 		Triggers       *ebpf.Map     `ebpf:"triggers"`
+		NativeSites    *ebpf.Map     `ebpf:"native_sites"`
+		NativeRules    *ebpf.Map     `ebpf:"native_rules"`
+		NativeOutcomes *ebpf.Map     `ebpf:"native_outcomes"`
 	}
-	links []link.Link
+	points []nativePoint
+	links  []link.Link
 }
 
-// injector holds what one rule set attached; closing it detaches every program and removes the qdiscs it installed.
+// injector holds what one rule set attached; closing it detaches every program, removes the qdiscs it installed and
+// the native rules it put.
 type injector struct {
 	objects struct {
 		InjectSyscall *ebpf.Program `ebpf:"inject_syscall"`
+		EnterNative   *ebpf.Program `ebpf:"enter_native"`
 		SyscallRules  *ebpf.Map     `ebpf:"syscall_rules"`
 		PacketRules   *ebpf.Map     `ebpf:"packet_rules"`
 	}
-	programs []*ebpf.Program
-	links    []link.Link
-	handles  []*netlink.Handle
-	qdiscs   []installedQdisc
+	programs    []*ebpf.Program
+	links       []link.Link
+	handles     []*netlink.Handle
+	qdiscs      []installedQdisc
+	nativeRules *ebpf.Map
+	natives     []uint32
 }
 
 type installedQdisc struct {
@@ -101,20 +111,44 @@ func (k *kernel) observe(syscalls syscallTable) error {
 	return nil
 }
 
+// observeFunctions attaches a probe at every return of the native points, which counts their results and negates a
+// check, for as long as the agent runs; the entries are probed only while a rule injects there.
+func (k *kernel) observeFunctions(points []nativePoint, sites []pointsNativeSite) error {
+	k.points = points
+	for cookie, site := range sites {
+		if err := k.objects.NativeSites.Put(uint32(cookie), site); err != nil {
+			return fmt.Errorf("the agent probes at most %d native sites: %w", k.objects.NativeSites.MaxEntries(), err)
+		}
+	}
+	for _, point := range points {
+		attached, err := attachSites(point, point.returns, k.objects.LeaveNative)
+		k.links = append(k.links, attached...)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (k *kernel) Close() error {
 	var errs []error
 	for _, attached := range k.links {
 		errs = append(errs, attached.Close())
 	}
-	errs = append(errs, k.objects.ObserveSyscall.Close(), k.objects.CgroupServices.Close(), k.objects.Marks.Close(),
-		k.objects.Natural.Close(), k.objects.Triggers.Close())
+	for _, point := range k.points {
+		errs = append(errs, closeFiles(point.files))
+	}
+	errs = append(errs, k.objects.ObserveSyscall.Close(), k.objects.LeaveNative.Close(), k.objects.CgroupServices.Close(),
+		k.objects.Marks.Close(), k.objects.Natural.Close(), k.objects.Triggers.Close(), k.objects.NativeSites.Close(),
+		k.objects.NativeRules.Close(), k.objects.NativeOutcomes.Close())
 	return errors.Join(errs...)
 }
 
-// inject loads a rule set's maps and attaches its programs: a kprobe on the entry of each syscall a rule names, and a
-// tc program on the egress of each device that transmits packets a rule names.
+// inject loads a rule set's maps and attaches its programs: a kprobe on the entry of each syscall a rule names, a tc
+// program on the egress of each device that transmits packets a rule names, and a uprobe on the entries of each native
+// point a fail or crash rule names.
 func (k *kernel) inject(rules *kernelRules, services []service, syscalls syscallTable) (*injector, error) {
-	attached := &injector{}
+	attached := &injector{nativeRules: k.objects.NativeRules}
 	if err := attached.attach(k, rules, services, syscalls); err != nil {
 		return nil, errors.Join(err, attached.Close())
 	}
@@ -124,7 +158,8 @@ func (k *kernel) inject(rules *kernelRules, services []service, syscalls syscall
 func (i *injector) attach(k *kernel, rules *kernelRules, services []service, syscalls syscallTable) error {
 	err := k.spec.LoadAndAssign(&i.objects, &ebpf.CollectionOptions{MapReplacements: map[string]*ebpf.Map{
 		pointsMapCgroupServices: k.objects.CgroupServices, pointsMapMarks: k.objects.Marks,
-		pointsMapTriggers: k.objects.Triggers}})
+		pointsMapTriggers: k.objects.Triggers, pointsMapNativeSites: k.objects.NativeSites,
+		pointsMapNativeRules: k.objects.NativeRules, pointsMapNativeOutcomes: k.objects.NativeOutcomes}})
 	if err != nil {
 		return err
 	}
@@ -164,6 +199,22 @@ func (i *injector) attach(k *kernel, rules *kernelRules, services []service, sys
 			if err := i.attachDevice(k, device, side, rules.delayed[side]); err != nil {
 				return fmt.Errorf("device %s in %q: %w", device.Name, device.Netns, err)
 			}
+		}
+	}
+	for point, list := range rules.natives {
+		if err := k.objects.NativeRules.Put(point, list); err != nil {
+			return err
+		}
+		i.natives = append(i.natives, point)
+		if !slices.ContainsFunc(list.Rules[:list.Count], func(rule pointsNativeRule) bool {
+			return rule.Action != pointsNativeActionNEGATE
+		}) {
+			continue
+		}
+		attached, err := attachSites(k.points[point], k.points[point].entries, i.objects.EnterNative)
+		i.links = append(i.links, attached...)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -285,6 +336,9 @@ func (i *injector) Close() error {
 	for _, attached := range i.links {
 		errs = append(errs, attached.Close())
 	}
+	for _, point := range i.natives {
+		errs = append(errs, i.nativeRules.Delete(point))
+	}
 	for _, installed := range i.qdiscs {
 		if err := installed.handle.QdiscDel(installed.qdisc); !errors.Is(err, unix.ENODEV) {
 			errs = append(errs, err)
@@ -296,6 +350,7 @@ func (i *injector) Close() error {
 	for _, program := range i.programs {
 		errs = append(errs, program.Close())
 	}
-	errs = append(errs, i.objects.InjectSyscall.Close(), i.objects.SyscallRules.Close(), i.objects.PacketRules.Close())
+	errs = append(errs, i.objects.InjectSyscall.Close(), i.objects.EnterNative.Close(), i.objects.SyscallRules.Close(),
+		i.objects.PacketRules.Close())
 	return errors.Join(errs...)
 }

@@ -5,6 +5,8 @@
 #define MAX_RULES 256
 #define MAX_POINT_RULES 8
 #define MAX_CGROUP_LEVEL 32
+#define MAX_NATIVE_SITES 4096
+#define MAX_RESULT_REGISTERS 4
 #define SIGKILL 9
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86DD
@@ -12,6 +14,10 @@
 char LICENSE[] SEC("license") = "Dual MIT/GPL";
 
 enum direction { EGRESS, INGRESS };
+enum register_name { AX, BX, CX, DX, SI, DI, R8, R9, R10, R11 };
+enum result_type { INT32, INT64, POINTER, BOOL };
+enum error_rule { NONZERO, NEGATIVE, ZERO };
+enum native_action { FAIL, CRASH, NEGATE };
 
 struct trigger {
 	__u64 skip;
@@ -67,6 +73,49 @@ struct peer {
 	__u16 port;
 };
 
+/* An entry or a return of a native function point; address is its link-time address, so ip - address is the load
+ * bias of the file in the process. */
+struct native_site {
+	__u32 point;
+	__u32 service;
+	__u64 address;
+	enum register_name outcome;
+	enum result_type type;
+	enum error_rule error;
+	__u32 conditional;
+	enum register_name condition;
+	__u64 mask;
+	__u64 equals;
+};
+
+/* A word written into a result register: the value, or the word at the link-time address value. */
+struct native_write {
+	enum register_name target;
+	__u32 from_memory;
+	__u64 value;
+};
+
+struct native_rule {
+	__u32 rule;
+	enum native_action action;
+	__u32 writes;
+	struct native_write write[MAX_RESULT_REGISTERS];
+};
+
+struct native_rule_list {
+	__u32 count;
+	struct native_rule rules[MAX_POINT_RULES];
+};
+
+/* An outcome of a native point: flagged is a failed call or a true check, value the integer result of a failed call,
+ * and rule is 0 for a natural result or the injecting rule's index plus one. */
+struct native_key {
+	__u32 point;
+	__u16 rule;
+	__u16 flagged;
+	__s64 value;
+};
+
 /* Bit n is set when a configured cgroup is n levels below the root. */
 volatile const __u32 cgroup_levels;
 volatile const __u32 packet_service;
@@ -115,6 +164,29 @@ struct {
 	__type(value, struct packet_rule_list);
 } packet_rules SEC(".maps");
 
+/* Indexed by the cookie of a native probe. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_NATIVE_SITES);
+	__type(key, __u32);
+	__type(value, struct native_site);
+} native_sites SEC(".maps");
+
+/* Keyed by native point; read at the returns as well as the entries, so it lives as long as the returns' probes. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_RULES);
+	__type(key, __u32);
+	__type(value, struct native_rule_list);
+} native_rules SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct native_key);
+	__type(value, __u64);
+} native_outcomes SEC(".maps");
+
 static __always_inline __u32 *current_service(void)
 {
 	__u32 *service = NULL;
@@ -147,6 +219,16 @@ static __always_inline bool fires(__u32 rule)
 	if (seen < trigger->skip || (draw(trigger->seed, seen) >> 32) >= trigger->threshold)
 		return false;
 	return __sync_fetch_and_add(&trigger->injections, 1) < trigger->limit;
+}
+
+static __always_inline void increment(void *counts, const void *key)
+{
+	__u64 one = 1;
+	if (bpf_map_update_elem(counts, key, &one, BPF_NOEXIST) == 0)
+		return;
+	__u64 *count = bpf_map_lookup_elem(counts, key);
+	if (count)
+		__sync_fetch_and_add(count, 1);
 }
 
 SEC("kprobe")
@@ -188,12 +270,138 @@ int observe_syscall(struct syscall_trace_exit *ctx)
 		return 0;
 	}
 	struct natural_key key = {.service = *service, .syscall = syscall, .error = ctx->ret < 0 ? -ctx->ret : 0};
-	__u64 one = 1;
-	if (bpf_map_update_elem(&natural, &key, &one, BPF_NOEXIST) == 0)
+	increment(&natural, &key);
+	return 0;
+}
+
+/* The verifier accepts a context access only at a constant offset, so each register has its own instruction. */
+#define LOAD_REGISTER(field) asm volatile("%0 = *(u64 *)(%1 + %2)" : "=r"(value) : "r"(ctx), "i"(__builtin_offsetof(struct pt_regs, field)))
+#define STORE_REGISTER(field) asm volatile("*(u64 *)(%0 + %1) = %2" :: "r"(ctx), "i"(__builtin_offsetof(struct pt_regs, field)), "r"(value) : "memory")
+
+static __always_inline __u64 get_register(struct pt_regs *ctx, enum register_name name)
+{
+	__u64 value;
+	switch (name) {
+	case AX: LOAD_REGISTER(ax); break;
+	case BX: LOAD_REGISTER(bx); break;
+	case CX: LOAD_REGISTER(cx); break;
+	case DX: LOAD_REGISTER(dx); break;
+	case SI: LOAD_REGISTER(si); break;
+	case DI: LOAD_REGISTER(di); break;
+	case R8: LOAD_REGISTER(r8); break;
+	case R9: LOAD_REGISTER(r9); break;
+	case R10: LOAD_REGISTER(r10); break;
+	default: LOAD_REGISTER(r11); break;
+	}
+	return value;
+}
+
+static __always_inline void set_register(struct pt_regs *ctx, enum register_name name, __u64 value)
+{
+	switch (name) {
+	case AX: STORE_REGISTER(ax); break;
+	case BX: STORE_REGISTER(bx); break;
+	case CX: STORE_REGISTER(cx); break;
+	case DX: STORE_REGISTER(dx); break;
+	case SI: STORE_REGISTER(si); break;
+	case DI: STORE_REGISTER(di); break;
+	case R8: STORE_REGISTER(r8); break;
+	case R9: STORE_REGISTER(r9); break;
+	case R10: STORE_REGISTER(r10); break;
+	default: STORE_REGISTER(r11); break;
+	}
+}
+
+/* Returns the site of the probe that fired when the current task belongs to the site's service. */
+static __always_inline struct native_site *current_site(struct pt_regs *ctx)
+{
+	__u32 *service = current_service();
+	if (!service)
+		return NULL;
+	__u32 cookie = bpf_get_attach_cookie(ctx);
+	struct native_site *site = bpf_map_lookup_elem(&native_sites, &cookie);
+	return site && site->service == *service ? site : NULL;
+}
+
+static __always_inline void count_native(const struct native_site *site, __u32 rule, __u64 result)
+{
+	struct native_key key = {.point = site->point, .rule = rule};
+	__s64 value = site->type == INT32 ? (__s32)result : (__s64)result;
+	if (site->type == BOOL)
+		key.flagged = (result & 0xff) != 0;
+	else if (site->error == NEGATIVE)
+		key.flagged = value < 0;
+	else if (site->error == ZERO)
+		key.flagged = value == 0;
+	else
+		key.flagged = value != 0;
+	if (key.flagged && (site->type == INT32 || site->type == INT64))
+		key.value = value;
+	increment(&native_outcomes, &key);
+}
+
+/* Reads the words a rule writes before its trigger counts the execution, so a word that cannot be read skips it. */
+static __always_inline int read_words(const struct native_rule *rule, __u64 bias, __u64 *words)
+{
+	for (__u32 i = 0; i < MAX_RESULT_REGISTERS && i < rule->writes; i++) {
+		const struct native_write *write = &rule->write[i];
+		words[i] = write->value;
+		if (write->from_memory && bpf_probe_read_user(&words[i], sizeof(words[i]), (void *)(write->value + bias)))
+			return -1;
+	}
+	return 0;
+}
+
+/* At a function's entry, a fail rule writes the result registers and returns to the caller as ret would, so the
+ * function's body does not run; a crash rule kills the process before the body runs. */
+SEC("uprobe")
+int enter_native(struct pt_regs *ctx)
+{
+	struct native_site *site = current_site(ctx);
+	if (!site || (site->conditional && (get_register(ctx, site->condition) & site->mask) != site->equals))
 		return 0;
-	__u64 *count = bpf_map_lookup_elem(&natural, &key);
-	if (count)
-		*count += 1;
+	struct native_rule_list *rules = bpf_map_lookup_elem(&native_rules, &site->point);
+	__u64 caller;
+	if (!rules || bpf_probe_read_user(&caller, sizeof(caller), (void *)ctx->sp))
+		return 0;
+	for (__u32 i = 0; i < MAX_POINT_RULES && i < rules->count; i++) {
+		struct native_rule *rule = &rules->rules[i];
+		__u64 words[MAX_RESULT_REGISTERS] = {};
+		if (rule->action == NEGATE || read_words(rule, ctx->ip - site->address, words) || !fires(rule->rule))
+			continue;
+		if (rule->action == CRASH) {
+			bpf_send_signal(SIGKILL);
+			return 0;
+		}
+		for (__u32 w = 0; w < MAX_RESULT_REGISTERS && w < rule->writes; w++)
+			set_register(ctx, rule->write[w].target, words[w]);
+		ctx->ip = caller;
+		ctx->sp += 8;
+		count_native(site, rule->rule + 1, get_register(ctx, site->outcome));
+		return 0;
+	}
+	return 0;
+}
+
+/* At each return of a function, the result is counted; a negate rule flips the low byte of a bool before ret runs. */
+SEC("uprobe")
+int leave_native(struct pt_regs *ctx)
+{
+	struct native_site *site = current_site(ctx);
+	if (!site)
+		return 0;
+	__u64 result = get_register(ctx, site->outcome);
+	struct native_rule_list *rules = bpf_map_lookup_elem(&native_rules, &site->point);
+	for (__u32 i = 0; rules && i < MAX_POINT_RULES && i < rules->count; i++) {
+		struct native_rule *rule = &rules->rules[i];
+		if (rule->action != NEGATE || !fires(rule->rule))
+			continue;
+		result = (result & ~0xffULL) | !(result & 0xff);
+		set_register(ctx, site->outcome, result);
+		count_native(site, rule->rule + 1, result);
+		return 0;
+	}
+	count_native(site, 0, result);
 	return 0;
 }
 

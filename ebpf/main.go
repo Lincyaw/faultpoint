@@ -1,5 +1,6 @@
-// Command fpebpf is the faultpoint eBPF agent: it applies the syscall and packet rules of the services its
-// configuration names to their cgroups and network devices, and reports what the kernel observed at those points.
+// Command fpebpf is the faultpoint eBPF agent: it applies the syscall, packet and native function rules of the services
+// its configuration names to their cgroups, network devices and the files of their containers, and reports what the
+// kernel observed at those points.
 package main
 
 import (
@@ -29,6 +30,7 @@ type agent struct {
 	experiment string
 	sinks      map[string]*faultpoint.JSONLSink
 	natural    map[pointsNaturalKey]uint64
+	outcomes   map[pointsNativeKey]uint64
 	injected   []uint64
 }
 
@@ -57,13 +59,20 @@ func main() {
 	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	points, sites, err := locateFunctions(options.Functions, services)
+	if err != nil {
+		faultpoint.Abort("%v", err)
+	}
 	loaded, err := loadKernel(services)
 	if err != nil {
 		faultpoint.Abort("%v", err)
 	}
 	a := &agent{services: services, seed: seed, kernel: loaded, sinks: map[string]*faultpoint.JSONLSink{},
-		natural: map[pointsNaturalKey]uint64{}}
+		natural: map[pointsNaturalKey]uint64{}, outcomes: map[pointsNativeKey]uint64{}}
 	faultpoint.AtExit(a.shutdown)
+	if err := loaded.observeFunctions(points, sites); err != nil {
+		faultpoint.Abort("%v", err)
+	}
 	for _, name := range options.Syscalls {
 		a.syscalls.number(name)
 	}
@@ -110,7 +119,7 @@ func (a *agent) replace(data []byte) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	rules, err := translate(ruleset, a.services, &a.syscalls, a.seed)
+	rules, err := translate(ruleset, a.services, &a.syscalls, a.kernel.points, a.seed)
 	if err != nil {
 		return fmt.Errorf("rules the agent cannot apply: %w", err)
 	}
