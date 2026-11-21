@@ -34,14 +34,25 @@ class Fail(BaseModel):
     """The registered error a call point returns."""
 
 
-class RaiseFail(BaseModel):
+class Raising(BaseModel):
     """Raising an exception at a call site, constructed with an empty message: the class an importable dotted name
     gives, or else the first class the handlers around the call site name."""
 
     model_config = STRICT
 
-    kind: Literal[ActionKind.FAIL]
     error: ImportString[type[BaseException]] | None = None
+
+
+class RaiseFail(Raising):
+    """Raising instead of running the call site's statement."""
+
+    kind: Literal[ActionKind.FAIL]
+
+
+class RaiseFailAfter(Raising):
+    """Raising once the call site's statement completed, which keeps the exception the statement raised itself."""
+
+    kind: Literal[ActionKind.FAIL_AFTER]
 
 
 class Failure(BaseModel):

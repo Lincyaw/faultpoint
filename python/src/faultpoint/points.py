@@ -6,7 +6,7 @@ from types import TracebackType
 from typing import Any, Final
 
 import faultpoint.runtime
-from faultpoint.actions import Crash, Delay, Fail, Negate, RaiseFail, SetValue, Shift
+from faultpoint.actions import Crash, Delay, Fail, Negate, RaiseFail, RaiseFailAfter, Raising, SetValue, Shift
 from faultpoint.observations import DetailKey, error_type
 from faultpoint.runtime import Decision, Plugin, Runtime, implemented_actions
 
@@ -41,7 +41,7 @@ class PointOutcome(StrEnum):
 
 PLUGIN: Final = Plugin(actions={
     PointKind.BRANCH: implemented_actions(Fail, Delay, Crash),
-    PointKind.CALL: implemented_actions(RaiseFail, Delay, Crash),
+    PointKind.CALL: implemented_actions(RaiseFail, RaiseFailAfter, Delay, Crash),
     PointKind.CHECK: implemented_actions(Negate, Delay, Crash),
     PointKind.LOOP: implemented_actions(Delay, Crash),
     PointKind.VALUE: implemented_actions(SetValue, Shift, Delay, Crash),
@@ -73,8 +73,8 @@ def branch(point: str, taken: bool) -> bool:
 
 
 class CallSite:
-    """A statement with a call inside a try block: a fail rule raises before it runs an exception the try's handlers
-    catch, and whatever exception leaves it is an error."""
+    """A statement with a call inside a try block: a fail rule raises an exception the try's handlers catch before
+    the statement runs, a fail_after rule once it completed, and whatever exception leaves it is an error."""
 
     def __init__(self, runtime: Runtime, point: str, candidates: Callable[[], tuple[type[BaseException], ...]]) -> None:
         self.runtime = runtime
@@ -82,19 +82,24 @@ class CallSite:
         self.candidates = candidates
         self.decision: Decision | None = None
 
+    def raised(self, raising: Raising) -> BaseException:
+        """The exception a rule raises, observed as the call site's error."""
+        raised = self.candidates()[0] if raising.error is None else raising.error
+        self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision, {DetailKey.ERROR: error_type(raised)})
+        return raised(INJECTED_MESSAGE)
+
     def __enter__(self) -> None:
         self.decision = decide_in_process(self.runtime, self.point)
         match self.decision:
-            case Decision(action=RaiseFail(error=error)):
-                raised = self.candidates()[0] if error is None else error
-                self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision,
-                                     {DetailKey.ERROR: error_type(raised)})
-                raise raised(INJECTED_MESSAGE)
+            case Decision(action=RaiseFail() as raising):
+                raise self.raised(raising)
 
     def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
                  trace: TracebackType | None) -> None:
-        match kind:
-            case None:
+        match kind, self.decision:
+            case None, Decision(action=RaiseFailAfter() as raising):
+                raise self.raised(raising)
+            case None, _:
                 self.runtime.observe(self.point, PointOutcome.OK, 0.0, self.decision)
             case _:
                 self.runtime.observe(self.point, PointOutcome.ERROR, 0.0, self.decision,
