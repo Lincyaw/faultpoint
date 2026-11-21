@@ -163,6 +163,9 @@ def validate_command(experiment: Experiment,
                      single_scenario: Annotated[int, typer.Option(help="Best chains one scenario showed.")] = 3,
                      cross_layer: Annotated[int, typer.Option(
                          help="Best stitched-only chains across layers, besides those chosen already.")] = 0,
+                     per_pair: Annotated[int, typer.Option(
+                         help="Most of those chains with the same layer of the first fault and the same last "
+                              "effect.")] = 3,
                      chain: Annotated[list[str], typer.Option(help="A chain to validate besides, by its key.")] = []
                      ) -> None:
     """Inject only the first fault of the best chains of the phased allocation in the workload their conditions
@@ -172,7 +175,7 @@ def validate_command(experiment: Experiment,
     validated = [validation.chain for validation in store.load(Validations, VALIDATIONS).validations] \
         if store.has(VALIDATIONS) else []
     validations = validate(recorded_runner(store),
-                           selected(stitching, stitched_only, single_scenario, cross_layer, chain, validated),
+                           selected(stitching, stitched_only, single_scenario, cross_layer, per_pair, chain, validated),
                            recorded_scenarios(store), stitching.min_count_increase)
     store.save(validations, VALIDATIONS)
     feedback = store.load(MappingFeedback, MAPPING_FEEDBACK) if store.has(MAPPING_FEEDBACK) \

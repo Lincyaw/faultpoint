@@ -122,7 +122,8 @@ class Stitching(BaseModel):
     """How many of the stitched-only chains follow each sequence of layers."""
     top: tuple[Chain, ...]
     top_cross_layer: tuple[Chain, ...]
-    """The best ranked chains whose hops lie in more than one layer and that end in a failure the user sees."""
+    """The best ranked chains whose hops lie in more than one layer and that end in a failure the user sees: as many
+    of those that exist only by stitching, then of those one scenario showed, so that neither crowds out the other."""
     cycles: tuple[Chain, ...]
     min_count_increase: float = 0.0
     """The smallest relative increase of a count that counted as an effect."""
@@ -202,6 +203,7 @@ def stitch(edges: list[Edge], allocation: Allocation, records: list[TreatmentRec
     chains = ranked_chains(trails, allocation, records, min_count_increase)
     stitched_only = sum(chain.stitched_only for chain in chains)
     terminal = [chain for chain in chains if chain.stitched_only and chain.terminal]
+    cross_layer = [chain for chain in chains if chain.crosses_layers and chain.terminal]
     return Stitching(strategy=allocation.strategy, edges=len(edges), chains=len(chains), stitched_only=stitched_only,
                      single_scenario=len(chains) - stitched_only, terminal_stitched_only=len(terminal),
                      stitched_terminal_pairs=tuple(sorted({(chain.hops[0].cause.key, chain.hops[-1].effect.key)
@@ -210,7 +212,8 @@ def stitch(edges: list[Edge], allocation: Allocation, records: list[TreatmentRec
                      layer_paths=dict(Counter(chain.layer_path for chain in chains)),
                      stitched_layer_paths=dict(Counter(chain.layer_path for chain in chains if chain.stitched_only)),
                      top=tuple(chains[:kept]),
-                     top_cross_layer=tuple([chain for chain in chains
-                                            if chain.crosses_layers and chain.terminal][:CROSS_LAYER_KEPT]),
+                     top_cross_layer=tuple(
+                         [chain for chain in cross_layer if chain.stitched_only][:CROSS_LAYER_KEPT]
+                         + [chain for chain in cross_layer if not chain.stitched_only][:CROSS_LAYER_KEPT]),
                      cycles=tuple(ranked_chains(cycle_trails, allocation, records, min_count_increase)),
                      min_count_increase=min_count_increase, refuted_mappings=tuple(sorted(refuted)))
