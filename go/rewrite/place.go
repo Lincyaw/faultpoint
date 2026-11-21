@@ -145,6 +145,7 @@ type placer struct {
 	placement Placement
 	fset      *token.FileSet
 	info      *types.Info
+	file      *ast.File
 	functions []*function
 	anchors   map[ast.Node]string
 	ordinals  map[string]int
@@ -154,7 +155,7 @@ type placer struct {
 // placePoints places the points of a file in its syntax tree and returns them.
 func placePoints(service, relative string, placement Placement, pkg *packages.Package, file *ast.File) []PointEntry {
 	p := &placer{service: service, path: relative, version: undeclaredVersion, placement: placement, fset: pkg.Fset,
-		info: pkg.TypesInfo, anchors: map[ast.Node]string{}, ordinals: map[string]int{}}
+		info: pkg.TypesInfo, file: file, anchors: map[ast.Node]string{}, ordinals: map[string]int{}}
 	// go/packages type-checks a module without a go directive at the toolchain's version, not at the one it compiles at.
 	if pkg.Module.GoVersion != "" {
 		p.version = "go" + pkg.Module.GoVersion
@@ -397,32 +398,22 @@ func (p *placer) placeCondition(cursor *astutil.Cursor, node *ast.IfStmt) {
 	}
 }
 
-// producingCall is the call whose error an `err != nil` checks, in the if's init or in the statement just before
-// it, when the call can be handed to fppoints.Call: the module's Go version has generics, the assignment's only value
-// is a call of a function or method value named without side effects, which is no conversion, builtin or inferred
-// generic instance, whose last result is the error, and which the boundary wiring leaves alone. It is nil otherwise.
+// producingCall is the call whose error an `err != nil` checks, when the call can be handed to fppoints.Call: the
+// module's Go version has generics, and the only value of the producing assignment is a call of a function or method
+// value named without side effects, which is no conversion, builtin or inferred generic instance, whose last result
+// is the error, and which the boundary wiring leaves alone. It is nil otherwise. A chained call, as in
+// QueryRow(...).Scan, stays at its check: the call before it may have done the work, which skipping the last one
+// would not undo.
 func (p *placer) producingCall(cursor *astutil.Cursor, node *ast.IfStmt, variable *ast.Ident) *ast.CallExpr {
 	if version.Compare(p.version, genericsVersion) < 0 {
 		return nil
 	}
-	statement := node.Init
-	if statement == nil && cursor.Index() > 0 {
-		switch parent := cursor.Parent().(type) {
-		case *ast.BlockStmt:
-			statement = parent.List[cursor.Index()-1]
-		case *ast.CaseClause:
-			statement = parent.Body[cursor.Index()-1]
-		case *ast.CommClause:
-			statement = parent.Body[cursor.Index()-1]
-		}
-	}
-	assignment, isAssignment := statement.(*ast.AssignStmt)
-	if !isAssignment || len(assignment.Rhs) != 1 {
+	assignment := p.producingAssignment(cursor, node, p.info.ObjectOf(variable))
+	if assignment == nil || len(assignment.Rhs) != 1 {
 		return nil
 	}
 	call, isCall := assignment.Rhs[0].(*ast.CallExpr)
-	last, isIdent := assignment.Lhs[len(assignment.Lhs)-1].(*ast.Ident)
-	if !isCall || !isIdent || p.info.ObjectOf(last) != p.info.ObjectOf(variable) {
+	if !isCall {
 		return nil
 	}
 	signature, isSignature := p.info.TypeOf(call.Fun).(*types.Signature)
@@ -441,6 +432,82 @@ func (p *placer) producingCall(cursor *astutil.Cursor, node *ast.IfStmt, variabl
 		return nil
 	}
 	return call
+}
+
+// producingAssignment is the assignment whose error an `err != nil` checks: the nearest one whose last target is err,
+// in the if's init or among the statements before the if in its block, when no statement between may assign err.
+// A statement between must not assign err, range into it or take its address, nor bear a label a goto could enter
+// by, and when there is one, err must not escape, so that none of the calls between can assign it.
+func (p *placer) producingAssignment(cursor *astutil.Cursor, node *ast.IfStmt, variable types.Object) *ast.AssignStmt {
+	var statements []ast.Stmt
+	switch parent := cursor.Parent().(type) {
+	case *ast.BlockStmt:
+		statements = parent.List[:cursor.Index()]
+	case *ast.CaseClause:
+		statements = parent.Body[:cursor.Index()]
+	case *ast.CommClause:
+		statements = parent.Body[:cursor.Index()]
+	}
+	if node.Init != nil {
+		statements = append(slices.Clone(statements), node.Init)
+	}
+	for index := len(statements) - 1; index >= 0; index-- {
+		assignment, isAssignment := statements[index].(*ast.AssignStmt)
+		_, labeled := statements[index].(*ast.LabeledStmt)
+		switch {
+		case isAssignment && p.refersTo(assignment.Lhs[len(assignment.Lhs)-1], variable):
+			return assignment
+		// Whether err escapes is asked once, at the first statement between.
+		case labeled || p.assigns(statements[index], variable) || (index == len(statements)-1 && p.escapes(variable)):
+			return nil
+		}
+	}
+	return nil
+}
+
+// refersTo is whether an expression is an identifier of a variable, in parentheses or not.
+func (p *placer) refersTo(expression ast.Expr, variable types.Object) bool {
+	identifier, isIdentifier := ast.Unparen(expression).(*ast.Ident)
+	return isIdentifier && p.info.ObjectOf(identifier) == variable
+}
+
+// assigns is whether a node may assign a variable: it assigns it, ranges into it or takes its address, if only in a
+// function literal.
+func (p *placer) assigns(node ast.Node, variable types.Object) bool {
+	found := false
+	ast.Inspect(node, func(inner ast.Node) bool {
+		var targets []ast.Expr
+		switch inner := inner.(type) {
+		case *ast.AssignStmt:
+			targets = inner.Lhs
+		case *ast.RangeStmt:
+			targets = []ast.Expr{inner.Key, inner.Value}
+		case *ast.UnaryExpr:
+			if inner.Op == token.AND {
+				targets = []ast.Expr{inner.X}
+			}
+		}
+		found = found || slices.ContainsFunc(targets, func(target ast.Expr) bool { return p.refersTo(target, variable) })
+		return !found
+	})
+	return found
+}
+
+// escapes is whether code away from the statements that name a variable may assign it: it is a package variable, the
+// file takes its address, or a function literal it is declared outside of assigns it.
+func (p *placer) escapes(variable types.Object) bool {
+	escapes := variable.Parent() == variable.Pkg().Scope()
+	ast.Inspect(p.file, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.FuncLit:
+			outside := variable.Pos() < node.Pos() || variable.Pos() >= node.End()
+			escapes = escapes || (outside && p.assigns(node.Body, variable))
+		case *ast.UnaryExpr:
+			escapes = escapes || (node.Op == token.AND && p.refersTo(node.X, variable))
+		}
+		return !escapes
+	})
+	return escapes
 }
 
 // plainValue is whether an expression names a value without evaluating anything that could have an effect: an
