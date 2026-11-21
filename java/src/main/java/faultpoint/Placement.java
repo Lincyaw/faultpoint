@@ -415,8 +415,9 @@ public final class Placement implements ClassFileTransformer {
             return calls;
         }
 
-        /** Surround a call with its point: Points.call before it may throw the declared exception, and the
-         * call's own return or throw is observed and then continues unchanged. */
+        /** Surround a call with its point: Points.call before it may throw the declared exception in place of the
+         * call, and the call's own return or throw is observed. A throw continues unchanged; after a return,
+         * Points.returned, outside the handler, may throw the declared exception as if the callee had. */
         void observable(MethodInsnNode invoked, String exception, String id) {
             var start = new LabelNode();
             var end = new LabelNode();

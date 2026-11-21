@@ -131,12 +131,15 @@ public final class Points {
         return acquired;
     }
 
-    /** The rules of the calls in progress on this thread, innermost last, so that a call's outcome is attributed
-     * to the rule decided before it even when the callee holds call points of its own. */
-    private static final ThreadLocal<java.util.ArrayDeque<Object>> CALLS = ThreadLocal.withInitial(java.util.ArrayDeque::new);
-    private static final Object NO_RULE = new Object();
+    /** A call in progress: the rule decided before it, or null, and the checked exception its callee declares. */
+    private record Pending(Rule rule, Class<?> declared) {}
 
-    /** Before a call whose callee declares a checked exception: a fail rule throws that exception here. */
+    /** The calls in progress on this thread, innermost last, so that a call's outcome is attributed to the rule
+     * decided before it even when the callee holds call points of its own. */
+    private static final ThreadLocal<java.util.ArrayDeque<Pending>> CALLS = ThreadLocal.withInitial(java.util.ArrayDeque::new);
+
+    /** Before a call whose callee declares a checked exception: a fail rule throws that exception here, so the
+     * callee does not run. */
     public static void call(String point, Class<?> declared) throws Exception {
         Core core = Core.current();
         if (!core.enabled()) {
@@ -151,7 +154,7 @@ public final class Points {
             core.observe(point, "error", 0, rule, Map.of("error", injected.getClass().getName()));
             throw injected;
         }
-        CALLS.get().push(rule == null ? NO_RULE : rule);
+        CALLS.get().push(new Pending(rule, declared));
     }
 
     private static Exception declaredException(Class<?> declared, String point) throws ReflectiveOperationException {
@@ -164,22 +167,27 @@ public final class Points {
         return (Exception) declared.getConstructor().newInstance();
     }
 
-    private static Rule poppedRule() {
-        Object rule = CALLS.get().pop();
-        return rule == NO_RULE ? null : (Rule) rule;
-    }
-
-    public static void returned(String point) {
+    /** After a call returned: under a fail_after rule the callee has run, and the exception it declares is thrown
+     * in place of its result. */
+    public static void returned(String point) throws Exception {
         Core core = Core.current();
-        if (core.enabled()) {
-            core.observe(point, "ok", 0, poppedRule(), Map.of());
+        if (!core.enabled()) {
+            return;
         }
+        Pending pending = CALLS.get().pop();
+        if (pending.rule() != null && pending.rule().kind().equals("fail_after")) {
+            Exception injected = declaredException(pending.declared(), point);
+            core.observe(point, "error", 0, pending.rule(), Map.of("error", injected.getClass().getName()));
+            throw injected;
+        }
+        core.observe(point, "ok", 0, pending.rule(), Map.of());
     }
 
+    /** After a call threw: its own failure is observed and not replaced. */
     public static void raised(Throwable error, String point) {
         Core core = Core.current();
         if (core.enabled()) {
-            core.observe(point, "error", 0, poppedRule(), Map.of("error", error.getClass().getName()));
+            core.observe(point, "error", 0, CALLS.get().pop().rule(), Map.of("error", error.getClass().getName()));
         }
     }
 
@@ -194,7 +202,7 @@ public final class Points {
         public void install(Installation installation, Map<String, Object> options) {
             installation.core().declare(Map.of(
                     "branch", List.of("fail", "delay", "crash"),
-                    "call", List.of("fail", "delay", "crash"),
+                    "call", List.of("fail", "fail_after", "delay", "crash"),
                     "check", List.of("negate", "delay", "crash"),
                     "loop", List.of("delay", "crash"),
                     "value", List.of("set", "shift", "delay", "crash"),
