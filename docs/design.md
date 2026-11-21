@@ -279,6 +279,45 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 - **去符号的 Go 二进制**：可以从 `.gopclntab` 找回函数，但找不到哨兵变量。
 - **请求范围**：拿不到。
 
+### 6.6 eBPF 可挂载点目录
+
+eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能改变结果。能挂载的位置很多：本机内核约 9.8 万个可追踪函数、2515 个 tracepoint，一个用户态二进制有上万个函数入口和数万到十几万个条件跳转。能改变结果的位置是其中一个小而明确的子集，由挂载机制决定：
+
+| 机制 | 能做什么 | 本机上的范围 |
+| --- | --- | --- |
+| kprobe 的 `bpf_override_return`，或 fmod_ret | 跳过内核函数体，返回给定值 | 内核错误注入名单上的 1039 个函数，其中 981 个是系统调用入口，非系统调用的只有 `__filemap_add_folio` `should_fail_bio` 等少数；fmod_ret 还可用于 331 个 `security_*` 函数，按路径、地址等拒绝操作 |
+| cgroup 程序 | 拒绝或改写 connect、sendmsg、bind、getsockopt、setsockopt、sysctl 和设备访问，丢弃包 | 29 种挂载类型，挂在每个容器的 cgroup 上 |
+| tc、XDP | 丢弃、改写、重定向包；tc 还能按时间戳延迟 | 每个网络设备 |
+| struct_ops | 控制 CPU 调度（sched_ext）、拥塞窗口、队列规则 | 5 种类型；用作条件，不作为故障点 |
+| uprobe 改写寄存器（内核 6.18 及以上） | 让用户态函数在入口直接返回给定值；在任意指令处改写寄存器，包括强制条件跳转 | 每个文件的函数入口和指令 |
+| tracepoint、fentry/fexit、kretprobe、USDT | 只能观测 | 大量 |
+
+本机有三个限制：完整性 lockdown 禁用了 `bpf_probe_write_user`，所以 uprobe 不能设置 errno，系统调用包装函数的失败要在系统调用处注入；BPF LSM 没有启用；内核没有编译故障注入框架，failslab 等都不存在。
+
+- **目录是数据**：每条记录对应一个（目标，机制），给出 id、类别、层、注入和观测的机制、目标（文件、build-id、符号、入口和返回指令的地址、克隆）、签名（来自 DWARF 或 BTF）、允许的动作和取值、开销等级、陷入范围（内核点是整台主机，uprobe 是 inode）和安全说明。`spec/kinds.json` 仍是动作的上界，每条记录只列出其机制允许的子集，规则加载时代理按记录检查。
+- **取值带来源**：错误注入名单的类型（ERRNO 为负 errno，NULL 为 0）；LSM 的返回范围；对照运行中观测到的自然结果，这是首选（见第 6.5 节 Redis 断言的教训）；静态分析得到的常量，置信度较低。`bpf_override_return` 不检查取值，由代理按类型限定。
+- **类别**：复用 `call`（整型、errno、指针返回）、`check`（布尔返回）、`branch`（用 ip 写强制条件跳转）、`syscall`、`packet`。非系统调用的内核名单函数和 `security_*` 记为内核层的 `call`。另加一个只观测的类别 `event`（outcome 为 `fired`，没有动作），用于 USDT 和 tracepoint，把上游组件内部的事件作为效果观测，例如 postgres 的 57 个 USDT 名字中有 `transaction__abort` `deadlock__found` `lock__wait__start`。
+- **生成**：eBPF 代理新增只读的 `scan`。它读服务进程映射的可执行文件（ELF 符号、DWARF、`.gopclntab`、`.note.stapsdt`，以及反汇编得到的返回指令和条件跳转）和宿主内核的清单（kallsyms、ftrace 函数表、错误注入名单、BTF），可选地按 build-id 匹配调试符号。选择哪些记录由配置 `ebpf.hooks` 给出，形式与 `placement.scope`（第 6.4 节）相同。
+- **先观测，并控制开销**：
+  - 系统调用用一个按 cgroup 过滤的 raw_syscalls 退出程序统计（调用号，errno）。
+  - 其余内核候选用 fexit 只计数。
+  - 用户态函数分批挂入口探针，在短时间窗口内记录命中，卸下后只重挂还没见过的函数。开销与执行过的不同函数数成正比，而不是与命中次数成正比。热点函数打上标记，只在低 `limit` 下注入。
+- **值得注入的点**同时满足：
+  - 对照中执行过；
+  - 有合法取值，最好是观测到的非 ok 结果；
+  - 结果被调用方检查；
+  - 是该结果通道上最外层的代表，例如取系统调用 `read` 而不是 libc 的 `read`，libc 只保留它自身的失败（如 `getaddrinfo`）；
+  - 不在热点上，或 `limit` 很低。
+
+  驱动的名单函数、绝大多数内核函数和 JIT 代码不在范围内。JIT 代码位于匿名内存，没有 inode，uprobe 挂不上。
+- **接入搜索**：每条记录导出为清单中的 `PointEntry`，`build_catalog` 不变；层显式记录；取值域参数化动作模板，例如系统调用的 `fail` 使用该调用观测到的 errno，而不是固定的 EIO。
+
+**待验证**：
+- BPF LSM 未启用时，fmod_ret 能否作用于 `security_*`。从源码推断可以，未经运行验证。
+- `should_fail_bio` 的工作常在 kworker 中执行，要按 bio 的 blkcg 而不是当前进程过滤。
+- 按 pid 过滤的 uprobe 能否跟随 fork。
+- Go 的 `debug/dwarf` 能否读 dwz 补充文件。
+
 ## 7. 配置与运行时
 
 常用设置用环境变量给出；其余设置都在 `FAULTPOINT_CONFIG` 指向的 JSON 文件里，包括启用哪些插件和各自的选项，以及放置规则的开关与名单。
@@ -335,6 +374,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | 消息边界 | Redis Streams（经 redis-py） | Redis Streams（经 go-redis） | Redis Streams（经 ioredis） | Redis Streams（经 Lettuce） | Redis Streams（经 redis-rs） | — |
 | 依赖库中的故障点（第 6.4 节） | 已实现，只改写纯 Python 模块；`faultpoint candidates` 列出执行过的候选 | 已实现，模块副本加 `replace` | 已实现 | 已实现 | 已实现，crate 副本加 `[patch]` | — |
 | 原生函数中的故障点（第 6.5 节） | — | — | — | — | — | 已实现：`call`（`fail` `crash`）、`check`（`negate` `crash`），仅 x86-64，内核 6.18 及以上 |
+| eBPF 可挂载点目录（第 6.6 节） | — | — | — | — | — | 规划中 |
 | 接入 | 导入钩子 | 构建副本，自动装配边界 | `--import` 加载钩子 | `-javaagent` | 构建副本 | 特权进程 |
 | 未覆盖 | 非 uvicorn 运行的 ASGI 应用 | 依赖内部创建的服务端和客户端；pgx 的 `CopyFrom` `Commit` `Rollback` | 直接使用 undici | WebClient、Feign、Apache HttpClient、OkHttp | reqwest、`query!` 宏、类型化的 Redis 命令方法 | 自然丢包、32 位兼容系统调用、IPv6（未验证） |
 | 只重放置候选故障点（第 6.4 节第 3 步） | 未实现 | 未实现 | 未实现 | 未实现 | 未实现 | — |
