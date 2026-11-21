@@ -164,9 +164,10 @@ def control_executions(records: Iterable[ObservationRecord], repetitions: int, t
     return {point: count / (repetitions * tenants) for point, count in counts.items()}
 
 
-def service_languages(manifests: Path) -> dict[str, str]:
-    """The language of every service with a manifest; an upstream component has none."""
-    return {manifest.service: manifest.language
+def service_manifests(manifests: Path) -> dict[str, Manifest]:
+    """The manifest of every service that has one, with its language and the errors its build registers; an upstream
+    component has none."""
+    return {manifest.service: manifest
             for manifest in (Manifest.model_validate_json(path.read_text(encoding="utf-8"))
                              for path in sorted(manifests.glob("*.json")))}
 

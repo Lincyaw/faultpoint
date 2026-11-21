@@ -133,7 +133,7 @@ orders 的超时由环境变量 `RESERVE_TIMEOUT_S` 给出，作用于它的整�
 | --- | --- |
 | `branch` taken | `fail` |
 | `call` error（Python、Java、TypeScript、Rust 的服务） | `fail`，抛出细节中的错误类型，例如 Python 可导入的类；细节中没有类型时无对应 |
-| `call` error（Go 的服务，错误是已登记的哨兵或包装了它） | `fail`，返回这个哨兵：Go 的调用方用 `errors.Is` 区分哨兵 |
+| `call` error（Go 的服务，错误是服务的构建登记的哨兵或包装了它） | `fail`，返回这个哨兵：Go 的调用方用 `errors.Is` 区分哨兵 |
 | `call` error（Go 的服务，其他错误，细节中是它的类型名） | 不带错误的 `fail`：Go 代码按惯例只区分已登记的哨兵，其余只判断不为 nil；这是由验证检验的假设 |
 | `call` error（上游组件的原生函数） | `fail`，写入代理配置给出的、与自然失败相同的值 |
 | `check` 出现对照中没有的结果 | `negate` |
@@ -150,7 +150,7 @@ orders 的超时由环境变量 `RESERVE_TIMEOUT_S` 给出，作用于它的整�
 | `syscall` EIO | `fail` EIO |
 | 依赖库中的 `branch` `call` `check` `loop` 的结果 | 无：拼接经过接收这个结果的业务调用点 |
 
-Go 的已登记哨兵是 `shop/inventory.ErrOutOfStock` 和 puddle 的 `ErrClosedPool`、`ErrNotAvailable`，列在效果映射中；它们是 `a4bc35e` 构建中 fprewrite 登记的哨兵，是这个构建的性质。存储的错误仍对应不带参数的 `fail`：存储的 `fail` 只接受 timeout 和 refused，不能给出指定的 SQLSTATE 或驱动错误。
+一个错误是否是已登记的哨兵，由服务的清单判断：构建登记的错误名列在清单的 `errors` 中（inventory 的是 `shop/inventory.ErrOutOfStock` 和 puddle 的 `ErrClosedPool`、`ErrNotAvailable`），它们是构建的性质，不写在效果映射里。存储的错误仍对应不带参数的 `fail`：存储的 `fail` 只接受 timeout 和 refused，不能给出指定的 SQLSTATE 或驱动错误。
 
 没有可注入对应物的效果：`branch` not_taken、`call` ok、`store_read` rows 的增加只说明执行次数变多；`check` 已有结果的增加同样可能只是执行变多；`rpc_*` 的 2xx/3xx 增加；`rpc_*` error 没有命名的动作；存储每次执行的行数增加是数据的变化，没有存储动作产生它。入口服务（gateway）`rpc_server` 的 4xx、5xx、error 是用户可见的终点。
 
@@ -271,7 +271,7 @@ Go 的已登记哨兵是 `shop/inventory.ErrOutOfStock` 和 puddle 的 `ErrClose
 
 ## 6. 第三轮结果：观测细节与原生函数点
 
-证据范围：一次实验，`runs/search/shop-details/`；SDK `a4bc35e` 的 worktree，五个 SDK 都记录细节，eBPF 代理带原生函数点，服务和 `faultsearch` 使用的 faultpoint 都来自它；shop 与搜索的代码来自主检出（`a4bc35e` 之后只改了 `examples/shop` 和 `search`，SDK 的文件相同）。重放第二轮的 360 个（故障，场景）对（21 次对照、1080 次处理，59 分钟），覆盖目录中新增的故障，注入 237 个对应故障（约 33 分钟），再验证 13 条链（3 分钟）；每个故障单独运行，3 次对照、3 次处理，8 个部署并行。
+证据范围：一次实验，`runs/search/shop-details/`；SDK `a4bc35e` 的 worktree，五个 SDK 都记录细节，eBPF 代理带原生函数点，服务和 `faultsearch` 使用的 faultpoint 都来自它；shop 与搜索的代码来自主检出（`a4bc35e` 之后只改了 `examples/shop` 和 `search`，SDK 的文件相同）。这个构建的清单还没有 `errors`，所以这一轮的效果映射直接列出了它登记的三个哨兵名，与之后清单给出的相同。重放第二轮的 360 个（故障，场景）对（21 次对照、1080 次处理，59 分钟），覆盖目录中新增的故障，注入 237 个对应故障（约 33 分钟），再验证 13 条链（3 分钟）；每个故障单独运行，3 次对照、3 次处理，8 个部署并行。
 
 ### 6.1 规模
 
@@ -306,7 +306,7 @@ Go 的已登记哨兵是 `shop/inventory.ErrOutOfStock` 和 puddle 的 `ErrClose
 - 计数的下限是固定的 20%：上游后台工作随运行时长的增加大多在 5% 以内，被它去掉；低于 20% 的真实增加（例如 33 次 Redis 命令多出 3 次）也被去掉。按运行时长归一化范围之外的计数，可以不靠这个下限。
 - 效果映射不知道调用方看到失败时工作是否已经完成：`check` 的结果没有细节，调用点上注入的时机由放置决定（第 6.2 节）。依赖库中的结果不对应故障，也是因为这一点。
 - 注入的错误以 SDK 自己的类型出现在下游的细节中（`faultpoint/internal/action.ErrInjected`、`*fppoints.injectedError`），与自然错误的类型不同，经过这类效果的拼接在键上就与自然的传播不一致。
-- Go 的非哨兵错误对应不带错误的 `fail`，是按 Go 惯例的假设；已登记的哨兵名在效果映射中按 `a4bc35e` 构建列出。
+- Go 的非哨兵错误对应不带错误的 `fail`，是按 Go 惯例的假设。
 - 验证反馈按（效果，对应的故障，后果）三元组排除被否定的步，同一个不忠实的对应可以经由下一个后果再次出现；反馈只能逐步收敛，不能推广到同一类对应。
 - 依赖库中的热路径故障点没有延迟动作；库中的 `fail` 可能使连接池进入真实系统不会进入的状态，结论限于它实际表现出的行为。
 - 一次重复最多发送 120 s 的结账，使整个服务停住的故障只观测到前 120 s。

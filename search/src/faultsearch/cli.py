@@ -9,7 +9,7 @@ from shop.workload import Scenarios
 
 from faultsearch.allocation import (Allocation, AllocationSettings, Exploration, Strategy, extended_allocation,
                                     phased_allocation, random_allocation)
-from faultsearch.catalog import ActionTable, Catalog, build_catalog, control_executions, service_languages
+from faultsearch.catalog import ActionTable, Catalog, build_catalog, control_executions, service_manifests
 from faultsearch.chains import Stitching, stitch
 from faultsearch.counterfactual import NamedWorkload, Runner, RunSettings, treatment_record
 from faultsearch.edges import EdgeSet, EffectMap, build_edges, counterpart_assignments
@@ -130,7 +130,7 @@ def stitch_command(experiment: Experiment, strategy: Chosen = Strategy.PHASED,
     edges = build_edges(records, recorded_scenarios(store),
                         store.record_input(EffectMap.read(), INPUTS, EFFECTS_INPUT), store.load(Catalog, CATALOG),
                         KindTable.installed(), UPSTREAM_SERVICES, UNSCOPED_TARGETS, SERVICES_BY_PORT,
-                        service_languages(MANIFESTS), min_count_increase)
+                        service_manifests(MANIFESTS), min_count_increase)
     store.save(EdgeSet(strategy=strategy, edges=tuple(edges)), edges_file(strategy))
     refuted = store.load(MappingFeedback, MAPPING_FEEDBACK).refuted() if store.has(MAPPING_FEEDBACK) else frozenset()
     stitching = stitch(edges, allocation, records, width, max_hops, kept, min_count_increase, refuted)
