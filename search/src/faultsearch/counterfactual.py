@@ -259,6 +259,18 @@ def treatment_record(store: Store, fault: Fault, workload: str) -> TreatmentReco
     return store.load(TreatmentRecord, TREATMENTS, workload, f"{fault.digest}.json")
 
 
+type Job = tuple[str, Workload, RuleSet]
+"""A repetition to run: its label, its workload and its rules."""
+type Running = list[tuple[str, Future[Statuses]]]
+"""Repetitions submitted, by label."""
+
+
+def finish(running: Running) -> None:
+    """Wait for repetitions to end, showing each one's statuses, and raise what failed in one."""
+    for label, future in running:
+        print(label, future.result().tenants, flush=True)
+
+
 def control_labels(workload: NamedWorkload, repetitions: int) -> list[str]:
     return [f"{workload.name}.control.{index}" for index in range(repetitions)]
 
@@ -309,21 +321,30 @@ class Runner:
     def statuses(self, label: str) -> Statuses:
         return Statuses.model_validate_json((self.store.repetition(label) / STATUSES_FILE).read_text())
 
-    def repeat(self, jobs: list[tuple[str, Workload, RuleSet]]) -> None:
-        """Run the repetitions not run before."""
+    def pending(self, jobs: list[Job]) -> list[Job]:
+        """The repetitions not run before, every rule of which the kind table allows."""
         pending = [job for job in jobs if not (self.store.repetition(job[0]) / STATUSES_FILE).exists()
                    and not (self.store.repetition(job[0]) / REFUSAL_FILE).exists()]
         for _, _, ruleset in pending:
             violations = self.kinds.violations(ruleset)
             if violations:
                 raise ValueError(f"{ruleset.experiment}: {violations}")
+        return pending
+
+    def start(self, pool: ThreadPoolExecutor, jobs: list[Job], started: list[Future[Statuses]]) -> Running:
+        """Submit repetitions, each once the host's load allows, adding them to those started."""
+        running = []
+        for job in jobs:
+            self.wait_for_load(started)
+            future = pool.submit(self.repetition, job)
+            started.append(future)
+            running.append((job[0], future))
+        return running
+
+    def repeat(self, jobs: list[Job]) -> None:
+        """Run the repetitions not run before."""
         with ThreadPoolExecutor(self.settings.workers) as pool:
-            started: list[Future[Statuses]] = []
-            for job in pending:
-                self.wait_for_load(started)
-                started.append(pool.submit(self.repetition, job))
-            for (label, _, _), future in zip(pending, started, strict=True):
-                print(label, future.result().tenants, flush=True)
+            finish(self.start(pool, self.pending(jobs), []))
 
     def rerecord(self, pairs: list[tuple[Fault, NamedWorkload]]) -> None:
         """Record again, from the repetitions they ran, the treatments of faults in workloads, which runs only the
@@ -397,22 +418,37 @@ class Runner:
                 rates=effects_rates(observed, labels, {tenant, UNSCOPED}, effects)))
         return records
 
+    def settle(self, group: Group, running: Running) -> Group | None:
+        """Once a group's repetitions ended, keep its faults' records, or, for a packed group whose untreated tenant
+        changed, the leak, returning the group so that its faults run again alone."""
+        finish(running)
+        records = self.group_records(group)
+        if len(group.faults) > 1 and records[0].leakage:
+            self.store.save(Leak(group=group, leakage=records[0].leakage), LEAKS, group.workload.name,
+                            f"{group.digest}.json")
+            return group
+        for record in records:
+            self.store.save(record, TREATMENTS, record.workload, f"{record.fault.digest}.json")
+        return None
+
     def run_groups(self, groups: list[Group]) -> list[Group]:
-        """Run groups and keep their faults' records; returns the packed groups whose untreated tenant changed, whose
-        faults must run again alone."""
+        """Run groups and keep every group's records as soon as its repetitions end, so that a run stopped or failing
+        midway keeps the groups it finished; returns the packed groups whose untreated tenant changed, whose faults
+        must run again alone."""
         self.controls(list({group.workload.name: group.workload for group in groups}.values()))
-        self.repeat([(label, group.workload.workload, group.ruleset(label)) for group in groups
-                     for label in group.labels(self.settings.repetitions)])
-        leaking = []
-        for group in groups:
-            records = self.group_records(group)
-            if len(group.faults) > 1 and records[0].leakage:
-                self.store.save(Leak(group=group, leakage=records[0].leakage), LEAKS, group.workload.name,
-                                f"{group.digest}.json")
-                leaking.append(group)
-                continue
-            for record in records:
-                self.store.save(record, TREATMENTS, record.workload, f"{record.fault.digest}.json")
+        jobs = [self.pending([(label, group.workload.workload, group.ruleset(label))
+                              for label in group.labels(self.settings.repetitions)]) for group in groups]
+        leaking: list[Group] = []
+        unsettled: list[tuple[Group, Running]] = []
+        started: list[Future[Statuses]] = []
+        with ThreadPoolExecutor(self.settings.workers) as pool:
+            for group, group_jobs in zip(groups, jobs, strict=True):
+                unsettled.append((group, self.start(pool, group_jobs, started)))
+                ended = [all(future.done() for _, future in running) for _, running in unsettled]
+                leaking += [leak for (waiting, running), done in zip(unsettled, ended, strict=True)
+                            if done and (leak := self.settle(waiting, running)) is not None]
+                unsettled = [entry for entry, done in zip(unsettled, ended, strict=True) if not done]
+            leaking += [leak for waiting, running in unsettled if (leak := self.settle(waiting, running)) is not None]
         return leaking
 
     def recorded(self, pairs: list[tuple[Fault, NamedWorkload]]) -> list[TreatmentRecord]:
