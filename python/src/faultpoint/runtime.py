@@ -289,14 +289,33 @@ def start() -> None:
         source = provided((plugin.source for plugin in plugins.values()), file_rule_source)(settings, config)
         if source is not None:
             RUNTIME.reload(source)
-            threading.Thread(target=repeat, args=(POLL_INTERVAL_S, functools.partial(RUNTIME.reload, source)),
-                             name="faultpoint-rules", daemon=True).start()
         if RUNTIME.sink is not None:
             atexit.register(RUNTIME.sink.flush)
-            threading.Thread(target=repeat, args=(RUNTIME.sink.interval, RUNTIME.sink.flush),
-                             name="faultpoint-observations", daemon=True).start()
-            for signum, disposition in DEFAULT_DISPOSITIONS.items():
-                if signal.getsignal(signum) is disposition:
-                    signal.signal(signum, functools.partial(flush_then_resignal, RUNTIME.sink))
+        serve_in_background(RUNTIME, source)
+        os.register_at_fork(after_in_child=functools.partial(restart_in_child, RUNTIME, source))
     except Exception as error:
         stop(error)
+
+
+def serve_in_background(runtime: Runtime, source: RuleSource | None) -> None:
+    """Poll the rules and write the observations from threads of their own, and write them on a stopping signal
+    whose disposition is still the default."""
+    if source is not None:
+        threading.Thread(target=repeat, args=(POLL_INTERVAL_S, functools.partial(runtime.reload, source)),
+                         name="faultpoint-rules", daemon=True).start()
+    if runtime.sink is not None:
+        threading.Thread(target=repeat, args=(runtime.sink.interval, runtime.sink.flush),
+                         name="faultpoint-observations", daemon=True).start()
+        for signum, disposition in DEFAULT_DISPOSITIONS.items():
+            if signal.getsignal(signum) is disposition:
+                signal.signal(signum, functools.partial(flush_then_resignal, runtime.sink))
+
+
+def restart_in_child(runtime: Runtime, source: RuleSource | None) -> None:
+    """Continue in a child forked from this process, as a gunicorn worker is, which has none of the parent's
+    threads: with locks no parent thread holds, the sink as a process of its own, and the background work
+    started again."""
+    runtime.rules.lock = threading.Lock()
+    if runtime.sink is not None:
+        runtime.sink.forked()
+    serve_in_background(runtime, source)

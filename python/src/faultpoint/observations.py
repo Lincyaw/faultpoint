@@ -91,6 +91,15 @@ class ObservationSink(Protocol):
 
     def flush(self) -> None: ...
 
+    def forked(self) -> None:
+        """Continue in a forked child as a process of its own, without the parent's unwritten observations, which
+        the parent writes."""
+        ...
+
+
+def process_identity() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}"
+
 
 class JsonlOptions(BaseModel):
     model_config = STRICT
@@ -117,7 +126,7 @@ class JsonlSink:
     def __init__(self, path: Path, service: str, options: JsonlOptions) -> None:
         self.path = path
         self.service = service
-        self.process = f"{socket.gethostname()}:{os.getpid()}"
+        self.process = process_identity()
         self.interval = options.flush_seconds
         self.options = options
         self.lock = threading.Lock()
@@ -148,6 +157,13 @@ class JsonlSink:
             lines = "".join(record.model_dump_json() + "\n" for record in records)
             with self.path.open("a", encoding="utf-8") as stream:
                 stream.write(lines)
+
+    def forked(self) -> None:
+        # A thread of the parent that held the lock at the fork does not exist in the child to release it.
+        self.lock = threading.Lock()
+        self.process = process_identity()
+        self.tally = {}
+        self.window_start = time.time()
 
 
 def read_records(paths: Iterable[Path]) -> list[ObservationRecord]:
