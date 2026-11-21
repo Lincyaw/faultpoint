@@ -20,7 +20,8 @@ public final class Lettuce {
 
     private static final List<String> ANSWERS = List.of("fail", "empty", "drop");
     /** The prefix of an error reply, which Redis writes as an upper-case word. */
-    private static final Pattern REPLY_PREFIX = Pattern.compile("([A-Z][A-Z0-9_]*)(?: |$)");
+    private static final Pattern REPLY_CODE = Pattern.compile("[A-Z][A-Z0-9_]*");
+    private static final Pattern REPLY_PREFIX = Pattern.compile("(" + REPLY_CODE.pattern() + ")(?: |$)");
     private static volatile Pattern identifier = Pattern.compile(RedisCommands.TABLE.key_identifier());
 
     private Lettuce() {}
@@ -64,19 +65,38 @@ public final class Lettuce {
         return ANSWERS.contains(call.action());
     }
 
-    /** How the command is answered without reaching Redis: "fail", "empty" or "drop", or null when it is sent. */
+    /** How the command is answered without reaching Redis: "fail", "empty" or "drop", or null when it is sent; a
+     * fail is observed when its error is made. */
     public static String answer(Object call) {
         if (!(call instanceof Call running) || !answered(running)) {
             return null;
         }
-        String outcome = switch (running.action()) {
-            case "fail" -> "error";
-            case "empty" -> "empty";
-            default -> "ok";
-        };
-        Core.current().observe(running.point(), outcome, 0, running.rule(),
-                outcome.equals("error") ? Map.of("error", running.replyError().getName()) : Map.of());
+        if (!running.action().equals("fail")) {
+            Core.current().observe(running.point(), running.action().equals("empty") ? "empty" : "ok", 0, running.rule(), Map.of());
+        }
         return running.action();
+    }
+
+    /** The error reply a fail rule answers with; its code is the prefix, so that Lettuce makes the exception it
+     * makes for a reply of that code. */
+    public static String errorReply(Object call) {
+        String code = ((Call) call).rule().text("code");
+        return code == null ? "faultpoint: injected Redis failure" : code + " faultpoint: injected Redis failure";
+    }
+
+    /** Observe the error a fail rule answers with. */
+    public static void failed(Object call, Throwable failure) {
+        Call running = (Call) call;
+        Core.current().observe(running.point(), "error", 0, running.rule(), running.failureDetail(failure));
+    }
+
+    /** Why a rule at a Redis point cannot be obeyed: a code that is not an upper-case word, which is not the prefix of
+     * an error reply. */
+    static String refusal(Rule rule) {
+        String code = rule.text("code");
+        Command command = RedisCommands.TABLE.commands().get(rule.locator().split(" ", 2)[0]);
+        return code == null || command == null || !command.kind().equals(rule.pointKind()) || REPLY_CODE.matcher(code).matches()
+                ? null : "code " + code + " at " + rule.point() + " is not the prefix of a Redis error reply, an upper-case word";
     }
 
     /** Observe a sent command's reply when it completes. */
@@ -114,6 +134,7 @@ public final class Lettuce {
                     "store_write", List.of("fail", "drop", "delay", "crash"),
                     "publish", List.of("fail", "drop", "delay", "crash"),
                     "consume", List.of("fail", "empty", "delay", "crash")));
+            installation.core().check(Lettuce::refusal);
             Advices.install(installation.instrumentation(),
                     ElementMatchers.named("io.lettuce.core.RedisChannelHandler"),
                     ElementMatchers.named("dispatch").and(ElementMatchers.takesArguments(1))

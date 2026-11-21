@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.TreeSet;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 import net.bytebuddy.matcher.ElementMatchers;
 import net.sf.jsqlparser.JSQLParserException;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
@@ -35,6 +36,9 @@ public final class Jdbc {
     /** A pool's statement proxy calls the driver's statement; only the outermost execution is a point. */
     private static final ThreadLocal<int[]> DEPTH = ThreadLocal.withInitial(() -> new int[1]);
     private static final String BATCH = "-#batch";
+    /** The locators statementPoint makes, and the batch locator. */
+    private static final Pattern STATEMENT_LOCATOR = Pattern.compile("[^ ]+#([0-9a-f]{8}|batch)");
+    private static final Pattern SQLSTATE = Pattern.compile("[0-9A-Z]{5}");
 
     private Jdbc() {}
 
@@ -101,12 +105,49 @@ public final class Jdbc {
         }
         Execution execution = new Execution(point, kind.kind(), rule, System.nanoTime());
         if (execution.action().equals("fail")) {
-            SQLException injected = new SQLException("faultpoint: injected store failure", "08006");
-            core.observe(point, "error", 0, rule, failureDetail(injected));
             depth[0] -= 1;
+            SQLException injected = injectedError(statement, rule, "faultpoint: injected store failure");
+            core.observe(point, "error", 0, rule, failureDetail(injected));
             throw injected;
         }
         return execution;
+    }
+
+    /** The error a fail or fail_after rule raises. With a code it is the driver's own error for a server error of that
+     * SQLSTATE: PSQLException made from the fields PostgreSQL sends when the statement is PostgreSQL's driver, otherwise
+     * an SQLException with that state. Without one it is a connection failure, 08006. */
+    static SQLException injectedError(Object statement, Rule rule, String message) throws SQLException {
+        String code = rule.text("code");
+        if (code == null) {
+            return new SQLException(message, "08006");
+        }
+        ClassLoader driver = statement.getClass().getClassLoader();
+        Class<?> postgresStatement;
+        try {
+            postgresStatement = Class.forName("org.postgresql.PGStatement", false, driver);
+        } catch (ClassNotFoundException absent) {
+            return new SQLException(message, code);
+        }
+        if (!((java.sql.Statement) statement).isWrapperFor(postgresStatement)) {
+            return new SQLException(message, code);
+        }
+        try {
+            Object fields = Class.forName("org.postgresql.util.ServerErrorMessage", true, driver).getConstructor(String.class)
+                    .newInstance("SERROR\0VERROR\0C" + code + "\0M" + message + "\0");
+            return (SQLException) Class.forName("org.postgresql.util.PSQLException", true, driver)
+                    .getConstructor(fields.getClass()).newInstance(fields);
+        } catch (ReflectiveOperationException unavailable) {
+            throw new IllegalStateException("faultpoint: cannot make PostgreSQL's driver error", unavailable);
+        }
+    }
+
+    /** Why a rule at a statement point cannot be obeyed: a code that is not a SQLSTATE, which no driver reports. */
+    static String refusal(Rule rule) {
+        String code = rule.text("code");
+        boolean statementPoint = (rule.pointKind().equals("store_read") || rule.pointKind().equals("store_write"))
+                && STATEMENT_LOCATOR.matcher(rule.locator()).matches();
+        return code == null || !statementPoint || SQLSTATE.matcher(code).matches() ? null
+                : "code " + code + " at " + rule.point() + " is not a SQLSTATE, five digits or upper-case letters";
     }
 
     /** A failed statement's exception type and, for an SQLException, its SQLSTATE. */
@@ -142,7 +183,7 @@ public final class Jdbc {
     }
 
     public static Outcome exit(Object execution, Object statement, Method method, Object[] arguments, Object dropped,
-                               Object returned, Throwable thrown) {
+                               Object returned, Throwable thrown) throws SQLException {
         DEPTH.get()[0] -= 1;
         if (!(execution instanceof Execution running)) {
             return new Outcome(returned, thrown);
@@ -169,7 +210,7 @@ public final class Jdbc {
             return new Outcome(returned, thrown);
         }
         if (running.action().equals("fail_after")) {
-            SQLException injected = new SQLException("faultpoint: store failed after the statement ran", "08006");
+            SQLException injected = injectedError(statement, running.rule(), "faultpoint: store failed after the statement ran");
             core.observe(running.point(), "error", running.elapsed(), running.rule(), failureDetail(injected));
             return new Outcome(returned, injected);
         }
@@ -250,6 +291,7 @@ public final class Jdbc {
             installation.core().declare(Map.of(
                     "store_read", List.of("fail", "empty", "delay", "crash"),
                     "store_write", List.of("fail", "fail_after", "drop", "duplicate", "delay", "crash")));
+            installation.core().check(Jdbc::refusal);
             Advices.install(installation.instrumentation(),
                     ElementMatchers.hasSuperType(ElementMatchers.named("java.sql.Statement")).and(ElementMatchers.not(ElementMatchers.isInterface())),
                     ElementMatchers.isPublic().and(ElementMatchers.not(ElementMatchers.isAbstract()))

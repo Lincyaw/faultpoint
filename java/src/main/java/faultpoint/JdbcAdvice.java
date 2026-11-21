@@ -20,7 +20,7 @@ final class JdbcAdvice {
     static void exit(@Advice.This Object statement, @Advice.Origin Method method, @Advice.AllArguments Object[] arguments,
                      @Advice.Local("execution") Object execution, @Advice.Enter Object dropped,
                      @Advice.Return(readOnly = false, typing = Assigner.Typing.DYNAMIC) Object returned,
-                     @Advice.Thrown(readOnly = false) Throwable thrown) {
+                     @Advice.Thrown(readOnly = false) Throwable thrown) throws java.sql.SQLException {
         Jdbc.Outcome outcome = Jdbc.exit(execution, statement, method, arguments, dropped, returned, thrown);
         returned = outcome.returned();
         thrown = outcome.thrown();

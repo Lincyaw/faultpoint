@@ -1,6 +1,7 @@
 package faultpoint;
 
 import io.lettuce.core.RedisCommandExecutionException;
+import io.lettuce.core.internal.ExceptionFactory;
 import io.lettuce.core.protocol.RedisCommand;
 import java.nio.charset.StandardCharsets;
 import net.bytebuddy.asm.Advice;
@@ -17,7 +18,9 @@ final class LettuceAdvice {
                 command.getArgs() == null ? null : command.getArgs().getFirstEncodedKey(), RedisCommandExecutionException.class);
         String answer = Lettuce.answer(call);
         if ("fail".equals(answer)) {
-            command.completeExceptionally(new RedisCommandExecutionException("faultpoint: injected Redis failure"));
+            RedisCommandExecutionException failure = ExceptionFactory.createExecutionException(Lettuce.errorReply(call));
+            Lettuce.failed(call, failure);
+            command.completeExceptionally(failure);
             return command;
         }
         if (answer != null) {

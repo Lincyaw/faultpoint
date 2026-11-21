@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /** Obtains rules, selects the rule of an execution and hands observations to the sink; every kind's
  * semantics lives in the plugins, which declare the kinds they serve and the actions they implement. */
@@ -54,6 +55,8 @@ public final class Core {
 
     public final Settings settings;
     private final Map<String, Set<String>> declared = new HashMap<>();
+    /** Each answers why its plugin cannot obey a rule, or null; a plugin passes over the kinds it does not serve. */
+    private final List<Function<Rule, String>> checks = new ArrayList<>();
     private final List<RuleSource> sources = new ArrayList<>();
     private final Map<String, Counter> counters = new HashMap<>();
     private volatile RuleState state = new RuleState("", Map.of());
@@ -89,6 +92,12 @@ public final class Core {
         }));
     }
 
+    /** A check of every rule of this service when its rule set loads, for what an action's parameters ask that a
+     * plugin cannot do, so that the rule set is refused rather than one point failing to obey it. */
+    public void check(Function<Rule, String> refusal) {
+        checks.add(refusal);
+    }
+
     public void useRuleSource(RuleSource source) {
         sources.add(source);
     }
@@ -119,6 +128,12 @@ public final class Core {
             if (!actions.contains(rule.kind())) {
                 abort("rule " + rule.id() + ": not every plugin of this process serving it implements " + rule.kind() + " at a "
                         + rule.pointKind() + " point");
+            }
+            for (Function<Rule, String> check : checks) {
+                String refusal = check.apply(rule);
+                if (refusal != null) {
+                    abort("rule " + rule.id() + ": " + refusal);
+                }
             }
             rules.computeIfAbsent(rule.point(), ignored -> new ArrayList<>()).add(rule);
         }

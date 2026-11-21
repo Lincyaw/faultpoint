@@ -48,6 +48,11 @@ public record RuleSet(String experiment, List<Rule> rules) {
             return rest.substring(0, rest.indexOf(':'));
         }
 
+        public String locator() {
+            String rest = point.substring(point.indexOf(':') + 1);
+            return rest.substring(rest.indexOf(':') + 1);
+        }
+
         public double number(String name) {
             if (!(action.get(name) instanceof Number number)) {
                 throw new IllegalArgumentException("rule " + id + ": a " + kind() + " action needs a numeric " + name);
