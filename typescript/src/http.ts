@@ -17,6 +17,8 @@ const DEFAULT_FAILURE_STATUS = 503;
 /** The fetch exchange in progress, and the exchange of each request undici creates for it; undici creates a request
  * in the context of the fetch that sends it, and announces it sent once its headers and body are written. */
 const EXCHANGES = new AsyncLocalStorage<{ sent: boolean }>();
+/** A signal nothing aborts, for a wait that runs to its end. */
+const STAYING = new AbortController().signal;
 const REQUEST_EXCHANGES = new WeakMap<object, { sent: boolean }>();
 
 export const HttpOptions = z.strictObject({
@@ -49,19 +51,15 @@ class HttpBoundaries {
   async serve(handler: Handler, request: IncomingMessage, response: ServerResponse): Promise<void> {
     const requestContext = context.active();
     const started = performance.now();
-    const left = new AbortController();
     let observed: Rule | null = null;
     const rule = CORE.own(() => {
       const point = pointId(CORE.settings.service, "rpc_server", `${request.method} ${this.pathTemplate(request.url ?? "/")}`);
       const decided = CORE.decideAmong(point, ACTS_BEFORE);
       observed = decided;
       // A response that closes before it finished was abandoned: its connection closed first.
-      response.on("close", () => CORE.own(() => {
-        left.abort();
-        context.with(requestContext, () => observeExchange(point,
-          response.writableFinished ? statusOutcome(response.statusCode) : "error", started, observed,
-          response.writableFinished ? { status: String(response.statusCode), abandoned: "false" } : { abandoned: "true" }));
-      }));
+      response.on("close", () => CORE.own(() => context.with(requestContext, () => observeExchange(point,
+        response.writableFinished ? statusOutcome(response.statusCode) : "error", started, observed,
+        response.writableFinished ? { status: String(response.statusCode), abandoned: "false" } : { abandoned: "true" }))));
       if (decided?.action.kind !== "fail") {
         answerOnceWritten(response, () => context.with(requestContext, () => CORE.decideAmong(point, ACTS_AFTER)), (replacing) => {
           observed = replacing;
@@ -69,15 +67,12 @@ class HttpBoundaries {
       }
       return decided;
     });
-    // A client that leaves ends the wait, and the handler runs all the same, as a server runs it for a client gone,
-    // left to notice the closed response itself; a failure has no one left to answer.
+    // A server's wait runs to its end whoever leaves, as a slow server goes on for a client gone.
     if (rule !== null) {
-      await wait(rule, left.signal);
+      await wait(rule, STAYING);
     }
     if (rule?.action.kind === "fail") {
-      if (!left.signal.aborted) {
-        CORE.own(() => response.writeHead(failureStatus(rule)).end());
-      }
+      CORE.own(() => response.writeHead(failureStatus(rule)).end());
       return;
     }
     await handler(request, response);
@@ -103,10 +98,16 @@ class HttpBoundaries {
       if (rule !== null) {
         await wait(rule, request.signal);
       }
-      // A caller that gave up during the wait gets what fetch rejects with when it is aborted before sending.
+      // A caller that gave up during the wait gets what fetch rejects with when it is aborted. A delay stands for a slow
+      // peer, which has the request already and runs it, so the request is sent all the same and its answer dropped; a
+      // fail with ms sends nothing.
       if (rule !== null && request.signal.aborted) {
         const reason: unknown = request.signal.reason;
-        CORE.own(() => observeExchange(point, errorOutcome(reason), started, rule, { error: errorName(reason), sent: "false" }));
+        const sent = kind === "delay";
+        if (sent) {
+          base(new Request(request, { signal: null })).then((dropped) => dropped.body?.cancel(), () => undefined);
+        }
+        CORE.own(() => observeExchange(point, errorOutcome(reason), started, rule, { error: errorName(reason), sent: String(sent) }));
         throw reason;
       }
       if (rule !== null && kind === "fail") {
@@ -161,15 +162,19 @@ class HttpBoundaries {
         if (rule?.action.kind === "crash") {
           CORE.crash(typeof rule.action.code === "number" ? rule.action.code : 1);
         }
-        if (rule?.action.kind === "delay") {
-          deferSending(clientRequest, numberParameter(rule, "ms"));
-        }
         if (rule?.action.kind === "fail") {
           answerInstead(clientRequest, rule, observe);
           return clientRequest;
         }
         // A request finishes when its headers and body have been handed to the operating system.
         const exchange = { sent: false, replaced: false };
+        if (rule?.action.kind === "delay") {
+          // The same request again, without the caller's callback, signal or timeout, as no one takes its answer.
+          const resend = (): ClientRequest => original.apply(this, arguments_.filter((argument) => typeof argument !== "function")
+            .map((argument) => (argument !== null && typeof argument === "object" && !(argument instanceof URL)
+              ? { ...argument, signal: undefined, timeout: undefined } : argument)) as Parameters<typeof http.request>);
+          deferSending(clientRequest, numberParameter(rule, "ms"), exchange, resend);
+        }
         clientRequest.once("finish", () => {
           exchange.sent = true;
         });
@@ -314,30 +319,57 @@ function syntheticResponse(status: number): IncomingMessage {
   return response;
 }
 
-/** Hold back what the caller writes until the delay passes, so that the request leaves late. */
-function deferSending(clientRequest: ClientRequest, ms: number): void {
+/** Hold back what the caller writes until the delay passes, so that the request leaves late. A caller that gives up
+ * during the delay destroys the request, its timeout's or its abort's error reaching it as from a slow peer; a delay
+ * stands for a slow peer, which has the request already and runs it, so a request the caller had ended is sent again
+ * with the same headers and body by resend, and its answer dropped. */
+function deferSending(clientRequest: ClientRequest, ms: number, exchange: { sent: boolean }, resend: () => ClientRequest): void {
+  type Writer = (this: ClientRequest, ...arguments_: unknown[]) => unknown;
   const { write, end } = clientRequest;
-  const pending: Array<() => void> = [];
+  const pending: Array<{ ends: boolean; arguments_: unknown[] }> = [];
   let ready = false;
   const timer = setTimeout(() => {
     ready = true;
     Object.assign(clientRequest, { write, end });
-    pending.forEach((send) => send());
+    pending.forEach((each) => ((each.ends ? end : write) as Writer).apply(clientRequest, each.arguments_));
   }, ms);
-  // A caller that gives up during the delay destroys the request, which then is never sent.
-  clientRequest.once("close", () => clearTimeout(timer));
+  const truncated = (): void => CORE.own(() => {
+    if (ready) {
+      return;
+    }
+    ready = true;
+    clearTimeout(timer);
+    if (!pending.some((each) => each.ends)) {
+      return;
+    }
+    exchange.sent = true;
+    const again = resend();
+    for (const [name, value] of Object.entries(clientRequest.getHeaders())) {
+      if (value !== undefined) {
+        again.setHeader(name, value);
+      }
+    }
+    again.on("response", (dropped) => dropped.resume());
+    again.on("error", () => undefined);
+    // The caller's write callbacks belong to the request it gave up.
+    for (const each of pending) {
+      ((each.ends ? again.end : again.write) as Writer).apply(again, each.arguments_.filter((argument) => typeof argument !== "function"));
+    }
+  });
+  clientRequest.once("error", truncated);
+  clientRequest.once("close", truncated);
   clientRequest.write = ((...arguments_: Parameters<typeof write>) => {
     if (ready) {
       return write.apply(clientRequest, arguments_);
     }
-    pending.push(() => write.apply(clientRequest, arguments_));
+    pending.push({ ends: false, arguments_ });
     return true;
   }) as typeof write;
   clientRequest.end = ((...arguments_: Parameters<typeof end>) => {
     if (ready) {
       return end.apply(clientRequest, arguments_);
     }
-    pending.push(() => end.apply(clientRequest, arguments_));
+    pending.push({ ends: true, arguments_ });
     return clientRequest;
   }) as typeof end;
 }

@@ -26,7 +26,19 @@ interface Command {
   promise: Promise<unknown>;
   resolve(value: unknown): void;
   reject(error: Error): void;
+  /** Arm ioredis's command timeout, which rejects the command with its own error unless an earlier timer is armed. */
+  setTimeout(ms: number): void;
   [HANDLED]?: boolean;
+}
+
+/** The client's command timeout, which ends a wait as it ends a slow reply, with ioredis's own error: armed from the
+ * start of the wait, it counts the wait as the reply's latency; cut runs when it ends the wait first. */
+function truncate(client: unknown, command: Command, cut: () => void): void {
+  const timeout = (client as { options?: { commandTimeout?: unknown } }).options?.commandTimeout;
+  if (typeof timeout === "number") {
+    command.setTimeout(timeout);
+    command.promise.catch(cut);
+  }
 }
 
 type SendCommand = (this: unknown, command: Command, stream?: unknown) => unknown;
@@ -138,19 +150,22 @@ function instrumentSendCommand(original: SendCommand, identifier: RegExp, ReplyE
         const elapsed = performance.now() - started;
         CORE.observe(point, outcome, elapsed, elapsed, rule, detail);
       });
+      // A delayed command is always sent, when its delay passes or when the command timeout cuts it, and a failed one never.
+      const sent: Record<string, string> = rule?.action.kind === "delay" ? { sent: "true" } : rule?.action.kind === "fail" ? { sent: "false" } : {};
       command.promise.then((reply) => CORE.own(() => observe(spec.empty === undefined ? "ok" : empty(spec.empty, reply) ? "empty" : "rows", {})),
-        (error: unknown) => CORE.own(() => observe("error", failureDetail(error, ReplyError))));
+        (error: unknown) => CORE.own(() => observe("error", { ...failureDetail(error, ReplyError), ...sent })));
       switch (rule?.action.kind) {
         case "fail": {
           // With a code the error is the one ioredis makes for that error reply, which carries the command.
           const code = stringParameter(rule, "code");
           const failure = code === undefined ? new Error("faultpoint: injected Redis failure")
             : Object.assign(new ReplyError(`${code} faultpoint: injected Redis failure`), { command: { name: command.name, args: command.args } });
-          // A fail with ms waits as a delay does, before it fails.
+          // A fail with ms waits as a delay does, before it fails; cut short by the command timeout, it sends nothing.
           if (rule.action.ms === undefined) {
             command.reject(failure);
           } else {
-            setTimeout(() => command.reject(failure), numberParameter(rule, "ms"));
+            const failing = setTimeout(() => command.reject(failure), numberParameter(rule, "ms"));
+            truncate(this, command, () => clearTimeout(failing));
           }
           return true;
         }
@@ -163,9 +178,23 @@ function instrumentSendCommand(original: SendCommand, identifier: RegExp, ReplyE
         case "drop":
           command.resolve("OK");
           return true;
-        case "delay":
-          setTimeout(() => original.call(this, command, stream), numberParameter(rule, "ms"));
+        case "delay": {
+          // A delay stands for a slow server, which has the command already and runs it: cut short by the command
+          // timeout, the command is sent at once and its reply, which the rejected command no longer takes, dropped.
+          let sent = false;
+          const send = (): void => {
+            sent = true;
+            original.call(this, command, stream);
+          };
+          const sending = setTimeout(send, numberParameter(rule, "ms"));
+          truncate(this, command, () => {
+            if (!sent) {
+              clearTimeout(sending);
+              send();
+            }
+          });
           return true;
+        }
         case "crash":
           return CORE.crash(typeof rule.action.code === "number" ? rule.action.code : 1);
         case "fail_after":
