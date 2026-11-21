@@ -14,7 +14,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::core::{Detail, Plugin, core, own};
+use crate::core::{Detail, Plugin, core, millis_since, own};
 use crate::rules::{Rule, point_id};
 
 const DEFAULT_FAILURE_STATUS: u16 = 503;
@@ -118,7 +118,9 @@ where
             let mut exchange = Exchange { point, rule, started: Instant::now(), context, answered: None };
             let rule = exchange.rule.clone();
             let kind = rule.as_ref().map(|rule| rule.action.kind.as_str());
-            if let (Some(rule), Some("delay")) = (&rule, kind) {
+            // A fail rule with ms waits as a delay does, before it fails.
+            if let Some(rule) = rule.as_ref().filter(|rule| kind == Some("delay")
+                || (kind == Some("fail") && rule.action.parameters.contains_key("ms"))) {
                 let delay = own(|| Duration::from_secs_f64(rule.number("ms").unwrap_or_else(|reason| core.abort(&reason)) / 1000.0));
                 tokio::time::sleep(delay).await;
             }
@@ -171,7 +173,8 @@ impl Drop for Exchange {
             let (outcome, detail) = self.answered.take()
                 .unwrap_or_else(|| ("error".to_owned(), Detail::from([("abandoned", "true".to_owned())])));
             let _attached = self.context.clone().attach();
-            core().observe(&self.point, &outcome, self.started.elapsed().as_secs_f64() * 1000.0, self.rule.as_ref(), detail);
+            let elapsed = millis_since(self.started);
+            core().observe(&self.point, &outcome, elapsed, elapsed, self.rule.as_ref(), detail);
         });
     }
 }

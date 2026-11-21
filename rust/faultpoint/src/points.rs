@@ -6,17 +6,19 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::core::{Detail, Plugin, core, own};
+use crate::core::{Detail, Plugin, core, millis_since, own};
 use crate::rules::Rule;
 
 fn number(rule: &Rule, name: &str) -> f64 {
     rule.number(name).unwrap_or_else(|reason| core().abort(&reason))
 }
 
-/// Perform delay and crash, blocking the thread as contention does.
+/// Perform delay and crash, blocking the thread as contention does; a fail rule with ms waits the same way before it
+/// fails.
 fn hold(rule: &Rule) {
     match rule.action.kind.as_str() {
         "delay" => std::thread::sleep(Duration::from_secs_f64(number(rule, "ms") / 1000.0)),
+        "fail" if rule.action.parameters.contains_key("ms") => std::thread::sleep(Duration::from_secs_f64(number(rule, "ms") / 1000.0)),
         "crash" => core().crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32),
         _ => {}
     }
@@ -51,7 +53,7 @@ pub fn branch(point: &str, taken: bool) -> bool {
             }
             None => taken,
         };
-        core.observe(point, if taken { "taken" } else { "not_taken" }, 0.0, rule.as_ref(), Detail::new());
+        core.observe(point, if taken { "taken" } else { "not_taken" }, 0.0, 0.0, rule.as_ref(), Detail::new());
         taken
     })
 }
@@ -71,7 +73,7 @@ pub fn check(point: &str, result: bool) -> bool {
             }
             None => result,
         };
-        core.observe(point, if result { "true" } else { "false" }, 0.0, rule.as_ref(), Detail::new());
+        core.observe(point, if result { "true" } else { "false" }, 0.0, 0.0, rule.as_ref(), Detail::new());
         result
     })
 }
@@ -79,6 +81,7 @@ pub fn check(point: &str, result: bool) -> bool {
 /// One iteration of a loop, delayed by a delay rule to model contention.
 pub fn loop_iteration(point: &str) {
     own(|| {
+        let started = Instant::now();
         let core = core();
         if !core.enabled {
             return;
@@ -87,7 +90,7 @@ pub fn loop_iteration(point: &str) {
         if let Some(rule) = &rule {
             hold(rule);
         }
-        core.observe(point, "iteration", 0.0, rule.as_ref(), Detail::new());
+        core.observe(point, "iteration", 0.0, millis_since(started), rule.as_ref(), Detail::new());
     })
 }
 
@@ -114,7 +117,7 @@ pub fn value<T: Serialize + DeserializeOwned>(point: &str, observed: T) -> T {
             }
         }
         let quantity = serde_json::to_value(&result).ok().and_then(|current| current.as_f64()).unwrap_or(0.0);
-        core.observe(point, "observed", quantity, rule.as_ref(), Detail::new());
+        core.observe(point, "observed", quantity, 0.0, rule.as_ref(), Detail::new());
         result
     })
 }
@@ -153,7 +156,7 @@ pub fn clock<T: ClockReading>(point: &str, reading: T) -> T {
                 reading = reading.shifted(number(rule, "amount"));
             }
         }
-        core.observe(point, "read", 0.0, rule.as_ref(), Detail::new());
+        core.observe(point, "read", 0.0, 0.0, rule.as_ref(), Detail::new());
         reading
     })
 }
@@ -161,6 +164,7 @@ pub fn clock<T: ClockReading>(point: &str, reading: T) -> T {
 /// Whether a resource was acquired: its natural outcome, or rejected by a fail rule.
 pub fn acquire(point: &str, acquired: bool) -> bool {
     own(|| {
+        let started = Instant::now();
         let core = core();
         if !core.enabled {
             return acquired;
@@ -173,40 +177,47 @@ pub fn acquire(point: &str, acquired: bool) -> bool {
             }
             None => acquired,
         };
-        core.observe(point, if acquired { "acquired" } else { "rejected" }, 0.0, rule.as_ref(), Detail::new());
+        core.observe(point, if acquired { "acquired" } else { "rejected" }, 0.0, millis_since(started), rule.as_ref(), Detail::new());
         acquired
     })
+}
+
+/// A call point entered: the rule decided before its call, if any, and when it was entered.
+pub struct Entered {
+    rule: Option<Rule>,
+    started: Instant,
 }
 
 /// What a call point decides before its call: under a fail rule the injected error takes the call's place and
 /// the call does not run; otherwise the call runs under the rule decided, if any.
 pub enum Before {
-    Fail(Rule, Injected),
-    Run(Option<Rule>),
+    Fail(Entered, Injected),
+    Run(Entered),
 }
 
 /// Decide the rule of a call point before its call, so that delay and crash act before the call runs; a fail_after
 /// rule is left to after_call.
 pub fn before_call(point: &str) -> Before {
     own(|| {
+        let started = Instant::now();
         let core = core();
         if !core.enabled {
-            return Before::Run(None);
+            return Before::Run(Entered { rule: None, started });
         }
         let rule = core.decide_among(point, |action| action != "fail_after");
         if let Some(rule) = &rule {
             hold(rule);
         }
         match rule {
-            Some(rule) if rule.action.kind == "fail" => Before::Fail(rule, Injected { point: point.into() }),
-            rule => Before::Run(rule),
+            Some(rule) if rule.action.kind == "fail" => Before::Fail(Entered { rule: Some(rule), started }, Injected { point: point.into() }),
+            rule => Before::Run(Entered { rule, started }),
         }
     })
 }
 
 /// Observe the result of a call; a call that succeeded has its result replaced by the injected error when a
 /// fail_after rule fires now, and any other result is observed under the rule decided before the call.
-pub fn after_call<T, E: From<Injected>>(point: &str, rule: Option<Rule>, result: Result<T, E>) -> Result<T, E> {
+pub fn after_call<T, E: From<Injected>>(point: &str, entered: Entered, result: Result<T, E>) -> Result<T, E> {
     own(|| {
         let core = core();
         if !core.enabled {
@@ -217,13 +228,14 @@ pub fn after_call<T, E: From<Injected>>(point: &str, rule: Option<Rule>, result:
         let (rule, result) = match result {
             Ok(value) => match core.decide_among(point, |action| action == "fail_after") {
                 Some(replacing) => (Some(replacing), Err(Injected { point: point.into() }.into())),
-                None => (rule, Ok(value)),
+                None => (entered.rule, Ok(value)),
             },
-            Err(error) => (rule, Err(error)),
+            Err(error) => (entered.rule, Err(error)),
         };
+        let elapsed = millis_since(entered.started);
         match &result {
-            Ok(_) => core.observe(point, "ok", 0.0, rule.as_ref(), Detail::new()),
-            Err(_) => core.observe(point, "error", 0.0, rule.as_ref(), Detail::from([("error", type_name::<E>().to_owned())])),
+            Ok(_) => core.observe(point, "ok", 0.0, elapsed, rule.as_ref(), Detail::new()),
+            Err(_) => core.observe(point, "error", 0.0, elapsed, rule.as_ref(), Detail::from([("error", type_name::<E>().to_owned())])),
         }
         result
     })

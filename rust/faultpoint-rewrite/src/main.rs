@@ -315,10 +315,9 @@ impl VisitMut for Placer<'_> {
             // A match, not a closure, decides before the call, so that an .await in the call stays legal; the names it
             // binds are in scope while the call runs, so they are ones the call cannot mean.
             *node = parse_quote!((match ::faultpoint::before_call(#id) {
-                ::faultpoint::Before::Fail(__faultpoint_rule, __faultpoint_injected) => ::faultpoint::after_call(#id,
-                    ::core::option::Option::Some(__faultpoint_rule),
-                    ::core::result::Result::Err(<#error as ::core::convert::From<_>>::from(__faultpoint_injected))),
-                ::faultpoint::Before::Run(__faultpoint_rule) => ::faultpoint::after_call(#id, __faultpoint_rule,
+                ::faultpoint::Before::Fail(__faultpoint_entered, __faultpoint_injected) => ::faultpoint::after_call(#id,
+                    __faultpoint_entered, ::core::result::Result::Err(<#error as ::core::convert::From<_>>::from(__faultpoint_injected))),
+                ::faultpoint::Before::Run(__faultpoint_entered) => ::faultpoint::after_call(#id, __faultpoint_entered,
                     (#inner).map_err(<#error as ::core::convert::From<_>>::from)),
             })?);
             return;

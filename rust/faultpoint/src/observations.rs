@@ -24,6 +24,7 @@ pub struct ObservationRecord {
     pub rule: Option<String>,
     pub count: u64,
     pub total: f64,
+    pub elapsed: f64,
     pub exemplars: Vec<String>,
     pub detail: Detail,
 }
@@ -88,11 +89,12 @@ impl ObservationSink for Arc<JsonlSink> {
         let record = tally.records.entry(key).or_insert_with(|| ObservationRecord {
             experiment: observation.experiment.into(), service: self.service.clone(), process: self.process.clone(),
             start: 0.0, end: 0.0, point: observation.point.into(), outcome: observation.outcome.into(),
-            scope: observation.scope, rule: observation.rule.map(str::to_owned), count: 0, total: 0.0, exemplars: vec![],
-            detail: observation.detail,
+            scope: observation.scope, rule: observation.rule.map(str::to_owned), count: 0, total: 0.0, elapsed: 0.0,
+            exemplars: vec![], detail: observation.detail,
         });
         record.count += 1;
         record.total += observation.quantity;
+        record.elapsed += observation.elapsed;
         // A trace is sampled by its id, so that every process keeps or skips the same traces.
         let sampled = |trace_id: &String| u64::from_str_radix(&trace_id[trace_id.len().saturating_sub(8)..], 16)
             .is_ok_and(|tail| ((tail % 10_000) as f64) < self.exemplar_rate * 10_000.0);

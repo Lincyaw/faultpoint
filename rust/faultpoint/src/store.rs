@@ -16,7 +16,7 @@ use sqlparser::ast::{ObjectName, Query, Select, Statement, Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::core::{Detail, Plugin, core, own};
+use crate::core::{Detail, Plugin, core, millis_since, own};
 use crate::rules::{Rule, point_id, point_parts};
 
 /// spec/redis-commands.json, the table every SDK reads.
@@ -165,7 +165,9 @@ where
         let point = point_id(&core.settings.service, kind, &locator);
         let rule = core.decide_among(&point, |action| action != "fail_after");
         let action = rule.as_ref().map_or(String::new(), |rule| rule.action.kind.clone());
-        let delay = rule.as_ref().filter(|_| action == "delay").map(|rule| Duration::from_secs_f64(number(rule, "ms") / 1000.0));
+        // A fail rule with ms waits as a delay does, before it fails.
+        let delay = rule.as_ref().filter(|rule| action == "delay" || (action == "fail" && rule.action.parameters.contains_key("ms")))
+            .map(|rule| Duration::from_secs_f64(number(rule, "ms") / 1000.0));
         (point, rule, action, delay)
     });
     let started = Instant::now();
@@ -177,7 +179,12 @@ where
                 operation.await
             }
             "crash" => core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32),
-            "fail" => Err(own(|| injected(rule, &point, hooks.failure))),
+            "fail" => {
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                Err(own(|| injected(rule, &point, hooks.failure)))
+            }
             "empty" | "drop" => own(|| (hooks.substitute)()),
             other => core.abort(&format!("rule {}: {other} is not implemented at {point}", rule.id)),
         },
@@ -208,7 +215,8 @@ where
             }
             Ok(_) => ("ok", Detail::new()),
         };
-        core.observe(&point, outcome, started.elapsed().as_secs_f64() * 1000.0, rule.as_ref(), detail);
+        let elapsed = millis_since(started);
+        core.observe(&point, outcome, elapsed, elapsed, rule.as_ref(), detail);
         result
     })
 }

@@ -23,6 +23,7 @@ pub struct Observation<'a> {
     pub scope: String,
     pub rule: Option<&'a str>,
     pub quantity: f64,
+    pub elapsed: f64,
     pub trace_id: Option<String>,
     pub detail: Detail,
 }
@@ -97,6 +98,11 @@ pub fn own<T>(work: impl FnOnce() -> T) -> T {
             .unwrap_or_else(|| "a panic without a message".to_owned());
         core().abort(&format!("internal error: {message}"))
     })
+}
+
+/// The milliseconds since a point was entered at started.
+pub(crate) fn millis_since(started: std::time::Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 /// The process's core, whose rule sources have delivered their first rule set.
@@ -213,11 +219,13 @@ impl Core {
         None
     }
 
-    pub fn observe(&self, point: &str, outcome: &str, quantity: f64, rule: Option<&Rule>, detail: Detail) {
+    /// Observe one execution of a point; elapsed is the milliseconds from entering the point to its result, injected
+    /// waits included, and 0 for a kind without duration.
+    pub fn observe(&self, point: &str, outcome: &str, quantity: f64, elapsed: f64, rule: Option<&Rule>, detail: Detail) {
         let Some(sink) = &self.sink else { return };
         let state = self.state.read().unwrap().clone();
         sink.add(Observation {
-            experiment: &state.experiment, point, outcome, quantity, rule: rule.map(|rule| rule.id.as_str()),
+            experiment: &state.experiment, point, outcome, quantity, elapsed, rule: rule.map(|rule| rule.id.as_str()),
             scope: self.baggage(&self.settings.scope_key).unwrap_or_default(),
             trace_id: self.context.as_ref().and_then(|context| context.trace_id()), detail,
         });
