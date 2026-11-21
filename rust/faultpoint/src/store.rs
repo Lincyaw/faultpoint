@@ -174,10 +174,10 @@ where
     let result = match &rule {
         None => operation.await,
         Some(rule) => match action.as_str() {
-            "delay" => {
-                tokio::time::sleep(delay.unwrap_or_default()).await;
-                operation.await
-            }
+            // A delay stands for a slow peer, which has the operation already and runs it: the operation goes out at once
+            // and its result waits out the delay, so that a caller dropping the future during the wait has sent it, as
+            // to a slow peer; the future borrows the caller's connection and cannot be sent once the caller is gone.
+            "delay" => tokio::join!(operation, tokio::time::sleep(delay.unwrap_or_default())).0,
             "crash" => core.crash(rule.action.parameters.get("code").and_then(Value::as_i64).unwrap_or(1) as i32),
             "fail" => {
                 if let Some(delay) = delay {
@@ -207,6 +207,10 @@ where
             Err(error) => {
                 let mut detail = Detail::from([("error", type_name::<E>().to_owned())]);
                 detail.extend((hooks.code)(error).map(|code| ("code", code)));
+                // Under a rule it is known whether the operation was sent: a delayed one always is, and a failed one never.
+                if action == "delay" || action == "fail" {
+                    detail.insert("sent", (action == "delay").to_string());
+                }
                 ("error", detail)
             }
             Ok(_) if action == "empty" => ("empty", Detail::new()),
