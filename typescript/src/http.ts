@@ -4,7 +4,6 @@ import http, { type ClientRequest, IncomingMessage, type ServerResponse } from "
 import https from "node:https";
 import { syncBuiltinESMExports } from "node:module";
 import { Socket } from "node:net";
-import { setTimeout as sleep } from "node:timers/promises";
 
 import { ROOT_CONTEXT, context, defaultTextMapGetter, defaultTextMapSetter } from "@opentelemetry/api";
 import { z } from "zod";
@@ -50,15 +49,19 @@ class HttpBoundaries {
   async serve(handler: Handler, request: IncomingMessage, response: ServerResponse): Promise<void> {
     const requestContext = context.active();
     const started = performance.now();
+    const left = new AbortController();
     let observed: Rule | null = null;
     const rule = CORE.own(() => {
       const point = pointId(CORE.settings.service, "rpc_server", `${request.method} ${this.pathTemplate(request.url ?? "/")}`);
       const decided = CORE.decideAmong(point, ACTS_BEFORE);
       observed = decided;
       // A response that closes before it finished was abandoned: its connection closed first.
-      response.on("close", () => CORE.own(() => context.with(requestContext, () => observeExchange(point,
-        response.writableFinished ? statusOutcome(response.statusCode) : "error", started, observed,
-        response.writableFinished ? { status: String(response.statusCode), abandoned: "false" } : { abandoned: "true" }))));
+      response.on("close", () => CORE.own(() => {
+        left.abort();
+        context.with(requestContext, () => observeExchange(point,
+          response.writableFinished ? statusOutcome(response.statusCode) : "error", started, observed,
+          response.writableFinished ? { status: String(response.statusCode), abandoned: "false" } : { abandoned: "true" }));
+      }));
       if (decided?.action.kind !== "fail") {
         answerOnceWritten(response, () => context.with(requestContext, () => CORE.decideAmong(point, ACTS_AFTER)), (replacing) => {
           observed = replacing;
@@ -66,11 +69,15 @@ class HttpBoundaries {
       }
       return decided;
     });
+    // A client that leaves ends the wait, and the handler runs all the same, as a server runs it for a client gone,
+    // left to notice the closed response itself; a failure has no one left to answer.
     if (rule !== null) {
-      await wait(rule);
+      await wait(rule, left.signal);
     }
     if (rule?.action.kind === "fail") {
-      CORE.own(() => response.writeHead(failureStatus(rule)).end());
+      if (!left.signal.aborted) {
+        CORE.own(() => response.writeHead(failureStatus(rule)).end());
+      }
       return;
     }
     await handler(request, response);
@@ -94,7 +101,13 @@ class HttpBoundaries {
       const kind = rule?.action.kind;
       const started = performance.now();
       if (rule !== null) {
-        await wait(rule);
+        await wait(rule, request.signal);
+      }
+      // A caller that gave up during the wait gets what fetch rejects with when it is aborted before sending.
+      if (rule !== null && request.signal.aborted) {
+        const reason: unknown = request.signal.reason;
+        CORE.own(() => observeExchange(point, errorOutcome(reason), started, rule, { error: errorName(reason), sent: "false" }));
+        throw reason;
       }
       if (rule !== null && kind === "fail") {
         return failFetch(point, rule, started);
@@ -187,13 +200,26 @@ function waits(rule: Rule): boolean {
   return rule.action.kind === "delay" || (rule.action.kind === "fail" && rule.action.ms !== undefined);
 }
 
-/** Delay without blocking other requests, since a boundary delay models a slow peer; a fail with ms waits the same way. */
-function wait(rule: Rule): Promise<void> {
+/** Delay without blocking other requests, since a boundary delay models a slow peer; a fail with ms waits the same way.
+ * The wait ends early when the signal aborts, as a slow peer's does for a caller that gives up or a client that leaves. */
+function wait(rule: Rule, signal: AbortSignal): Promise<void> {
   return CORE.own(() => {
     if (rule.action.kind === "crash") {
       CORE.crash(typeof rule.action.code === "number" ? rule.action.code : 1);
     }
-    return waits(rule) ? sleep(numberParameter(rule, "ms")) : Promise.resolve();
+    if (!waits(rule) || signal.aborted) {
+      return Promise.resolve();
+    }
+    const ms = numberParameter(rule, "ms");
+    return new Promise<void>((resolve) => {
+      const ended = (): void => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", ended);
+        resolve();
+      };
+      const timer = setTimeout(ended, ms);
+      signal.addEventListener("abort", ended, { once: true });
+    });
   });
 }
 
@@ -293,11 +319,13 @@ function deferSending(clientRequest: ClientRequest, ms: number): void {
   const { write, end } = clientRequest;
   const pending: Array<() => void> = [];
   let ready = false;
-  setTimeout(() => {
+  const timer = setTimeout(() => {
     ready = true;
     Object.assign(clientRequest, { write, end });
     pending.forEach((send) => send());
   }, ms);
+  // A caller that gives up during the delay destroys the request, which then is never sent.
+  clientRequest.once("close", () => clearTimeout(timer));
   clientRequest.write = ((...arguments_: Parameters<typeof write>) => {
     if (ready) {
       return write.apply(clientRequest, arguments_);
@@ -320,7 +348,9 @@ function answerInstead(clientRequest: ClientRequest, rule: Rule,
   clientRequest.write = (() => true) as typeof clientRequest.write;
   clientRequest.end = (() => clientRequest) as typeof clientRequest.end;
   // The response event runs the application's listeners, whose errors are their own.
+  let answered = false;
   const answering = (): void => {
+    answered = true;
     const answer = CORE.own((): IncomingMessage | Error => {
       if (typeof rule.action.status === "number") {
         observe(statusOutcome(rule.action.status), { status: String(rule.action.status), sent: "false" }, rule);
@@ -337,9 +367,16 @@ function answerInstead(clientRequest: ClientRequest, rule: Rule,
     }
     clientRequest.destroy(answer);
   };
-  // A fail with ms answers once it has waited, on a timer as a delay sends late.
+  // A fail with ms answers once it has waited, on a timer as a delay sends late; a caller that gives up during the
+  // wait destroys the request, and meets the request's own error, which is observed in place of the answer.
   if (waits(rule)) {
-    setTimeout(answering, numberParameter(rule, "ms"));
+    const timer = setTimeout(answering, numberParameter(rule, "ms"));
+    clientRequest.once("close", () => clearTimeout(timer));
+    clientRequest.once("error", (error) => {
+      if (!answered) {
+        observe(errorOutcome(error), { error: errorName(error), sent: "false" }, rule);
+      }
+    });
   } else {
     process.nextTick(answering);
   }
