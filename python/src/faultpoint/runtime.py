@@ -8,10 +8,12 @@ import time
 import traceback
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
+from enum import StrEnum
 from importlib.metadata import entry_points
 from typing import Annotated, Final, NoReturn, Union
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
+from pydantic_core import ErrorDetails
 
 from faultpoint.config import Config, Settings
 from faultpoint.context import ContextProvider, OtelContext
@@ -66,6 +68,30 @@ class RulesInForce:
         return fired
 
 
+class RuleRefused(ValueError):
+    """A rule set this process cannot obey, with one line per refused rule, as every SDK words a refusal."""
+
+
+class IssueType(StrEnum):
+    """The pydantic error types a refusal words itself."""
+
+    UNKNOWN_ACTION = "union_tag_invalid"
+    UNIMPORTABLE = "import_error"
+
+
+def refusal(kind: str, issue: ErrorDetails) -> str:
+    """One rule a kind's plugins refused, in an operator's words."""
+    rule, *location = issue["loc"]
+    match issue:
+        case {"type": IssueType.UNKNOWN_ACTION, "ctx": {"tag": action}}:
+            problem = f"no plugin of this process implements {action} at a {kind} point"
+        case {"type": IssueType.UNIMPORTABLE, "input": name, "ctx": {"error": reason}}:
+            problem = f"cannot import the error class {name}: {reason}"
+        case _:
+            problem = f"{'.'.join(map(str, location))}: {issue['msg']}"
+    return f"rule {rule}: {problem}"
+
+
 class Runtime:
     """The kinds this process's plugins serve, the rules it obeys, and where its observations go."""
 
@@ -87,7 +113,10 @@ class Runtime:
         actions: dict[str, BaseModel] = {}
         for kind, adapters in self.kinds.items():
             declared = {rule.id: rule.action.model_dump() for rule in applicable if rule.kind == kind}
-            parsed = [adapter.validate_python(declared) for adapter in adapters]
+            try:
+                parsed = [adapter.validate_python(declared) for adapter in adapters]
+            except ValidationError as error:
+                raise RuleRefused("\n".join(refusal(kind, issue) for issue in error.errors())) from error
             actions |= parsed[0]
         if self.sink is not None:
             self.sink.flush()
@@ -161,8 +190,13 @@ def file_rule_source(settings: Settings, config: Config) -> RuleSource | None:
 
 
 def stop() -> NoReturn:
-    """End the process, so that no experiment runs without the rules and plugins it asked for."""
-    traceback.print_exc()
+    """End the process, so that no experiment runs without the rules and plugins it asked for; a refused rule set
+    is reported rule by rule, any other failure by its traceback."""
+    error = sys.exception()
+    if isinstance(error, RuleRefused):
+        print("\n".join(f"faultpoint: {line}" for line in str(error).splitlines()), file=sys.stderr)
+    else:
+        traceback.print_exc()
     print("faultpoint: stopping the process", file=sys.stderr, flush=True)
     os._exit(STOP_EXIT_CODE)
 
