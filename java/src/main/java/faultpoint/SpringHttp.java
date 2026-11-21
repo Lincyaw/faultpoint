@@ -133,11 +133,11 @@ public final class SpringHttp {
         Integer status = running.rule().integer("status");
         if (status == null) {
             IOException error = boundaryError(running.rule());
-            Core.current().observe(running.point(), outcome(error), 0, running.rule(),
+            Core.current().observe(running.point(), outcome(error), 0, running.elapsed(), running.rule(),
                     Map.of("error", error.getClass().getName(), "sent", "false"));
             return error;
         }
-        Core.current().observe(running.point(), (status / 100) + "xx", 0, running.rule(),
+        Core.current().observe(running.point(), (status / 100) + "xx", 0, running.elapsed(), running.rule(),
                 Map.of("status", String.valueOf(status), "sent", "false"));
         return synthetic(responseType, status);
     }
@@ -153,24 +153,24 @@ public final class SpringHttp {
         }
         Core core = Core.current();
         if (thrown != null) {
-            core.observe(running.point(), outcome(thrown), running.elapsed(), running.rule(),
+            core.observe(running.point(), outcome(thrown), running.elapsed(), running.elapsed(), running.rule(),
                     HttpClients.failureDetail(thrown, running.written().get()));
             return null;
         }
         Rule replacing = HttpClients.succeeded(status) ? core.decide(running.point(), Core.ACTS_AFTER) : null;
         if (replacing == null) {
-            core.observe(running.point(), (status / 100) + "xx", running.elapsed(), running.rule(),
+            core.observe(running.point(), (status / 100) + "xx", running.elapsed(), running.elapsed(), running.rule(),
                     Map.of("status", String.valueOf(status)));
             return null;
         }
         Integer forced = replacing.integer("status");
         if (forced != null) {
-            core.observe(running.point(), (forced / 100) + "xx", running.elapsed(), replacing,
+            core.observe(running.point(), (forced / 100) + "xx", running.elapsed(), running.elapsed(), replacing,
                     Map.of("status", forced.toString(), "sent", "true"));
             return synthetic(responseType, forced);
         }
         IOException error = boundaryError(replacing);
-        core.observe(running.point(), outcome(error), running.elapsed(), replacing,
+        core.observe(running.point(), outcome(error), running.elapsed(), running.elapsed(), replacing,
                 Map.of("error", error.getClass().getName(), "sent", "true"));
         return error;
     }

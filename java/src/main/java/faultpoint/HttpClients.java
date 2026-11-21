@@ -160,12 +160,12 @@ public final class HttpClients {
         Integer status = rule.integer("status");
         String sent = String.valueOf(rule.kind().equals("fail_after"));
         if (status != null) {
-            Core.current().observe(call.point(), (status / 100) + "xx", call.elapsed(), rule,
+            Core.current().observe(call.point(), (status / 100) + "xx", call.elapsed(), call.elapsed(),rule,
                     Map.of("status", status.toString(), "sent", sent));
             return new SyntheticResponse<>(status, call.request());
         }
         IOException error = boundaryError(rule);
-        Core.current().observe(call.point(), outcome(error), call.elapsed(), rule,
+        Core.current().observe(call.point(), outcome(error), call.elapsed(), call.elapsed(),rule,
                 Map.of("error", error.getClass().getName(), "sent", sent));
         throw error;
     }
@@ -178,7 +178,7 @@ public final class HttpClients {
         if (replacing != null) {
             return failure(call, replacing);
         }
-        core.observe(call.point(), (response.statusCode() / 100) + "xx", call.elapsed(), call.rule(),
+        core.observe(call.point(), (response.statusCode() / 100) + "xx", call.elapsed(), call.elapsed(),call.rule(),
                 Map.of("status", String.valueOf(response.statusCode())));
         return response;
     }
@@ -209,7 +209,7 @@ public final class HttpClients {
             }
         } catch (IOException failure) {
             own(() -> {
-                core.observe(call.point(), outcome(failure), call.elapsed(), call.rule(), failureDetail(failure, call.sent()));
+                core.observe(call.point(), outcome(failure), call.elapsed(), call.elapsed(),call.rule(), failureDetail(failure, call.sent()));
                 return null;
             });
             throw failure;
@@ -233,7 +233,8 @@ public final class HttpClients {
             if (kind.equals("crash")) {
                 Points.hold(core, rule);
             }
-            return kind.equals("delay")
+            // A fail rule with ms waits as a delay does, before it fails.
+            return kind.equals("delay") || (kind.equals("fail") && rule.integer("ms") != null)
                     ? CompletableFuture.runAsync(() -> {}, CompletableFuture.delayedExecutor((long) rule.number("ms"), TimeUnit.MILLISECONDS))
                     : CompletableFuture.completedFuture(null);
         });
@@ -254,7 +255,7 @@ public final class HttpClients {
                     if (failure != null) {
                         unchecked(() -> {
                             Throwable cause = failure.getCause() == null ? failure : failure.getCause();
-                            core.observe(call.point(), outcome(cause), call.elapsed(), rule, failureDetail(cause, call.sent()));
+                            core.observe(call.point(), outcome(cause), call.elapsed(), call.elapsed(),rule, failureDetail(cause, call.sent()));
                             return null;
                         });
                         throw new java.util.concurrent.CompletionException(failure);

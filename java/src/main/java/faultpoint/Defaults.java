@@ -76,6 +76,7 @@ final class Defaults {
         private static final class Tally {
             long count;
             double total;
+            double elapsed;
             final List<String> exemplars = new ArrayList<>();
         }
 
@@ -127,6 +128,7 @@ final class Defaults {
                         ignored -> new Tally());
                 entry.count += 1;
                 entry.total += observation.quantity();
+                entry.elapsed += observation.elapsed();
                 if (observation.traceId() != null && entry.exemplars.size() < exemplars && sampled(observation.traceId())) {
                     entry.exemplars.add(observation.traceId());
                 }
@@ -164,6 +166,7 @@ final class Defaults {
                 record.put("rule", key.rule());
                 record.put("count", entry.count);
                 record.put("total", entry.total);
+                record.put("elapsed", entry.elapsed);
                 record.put("exemplars", entry.exemplars);
                 record.put("detail", key.detail());
                 try {

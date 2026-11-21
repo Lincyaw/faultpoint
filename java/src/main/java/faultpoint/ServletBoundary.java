@@ -79,6 +79,7 @@ public final class ServletBoundary {
     /** Begin a request, or return null when it is nested, a dispatch the container makes itself, such as an async
      * or error dispatch, or faultpoint is off. */
     public static Entry enter(String method, String uri, Map<String, String> headers, boolean clientRequest) {
+        long started = System.nanoTime();
         Core core = Core.current();
         int depth = DEPTH.get();
         DEPTH.set(depth + 1);
@@ -92,7 +93,7 @@ public final class ServletBoundary {
         if (rule != null) {
             Points.hold(core, rule);
         }
-        Entry entry = new Entry(point, rule, context, scope, System.nanoTime(),
+        Entry entry = new Entry(point, rule, context, scope, started,
                 rule != null && rule.kind().equals("fail") ? failureStatus(rule) : 0, new Answer());
         SERVING.set(entry);
         return entry;
@@ -158,8 +159,8 @@ public final class ServletBoundary {
         if (abandoned) {
             detail.put("abandoned", "true");
         }
-        Core.current().observe(entry.point(), thrown != null ? "error" : (status / 100) + "xx",
-                (System.nanoTime() - entry.started()) / 1e6, rule, detail);
+        double elapsed = Points.since(entry.started());
+        Core.current().observe(entry.point(), thrown != null ? "error" : (status / 100) + "xx", elapsed, elapsed, rule, detail);
     }
 
     /** Whether a failure is, or is caused by, the container's report that the client went away during a write. */

@@ -12,9 +12,15 @@ public final class Points {
 
     private Points() {}
 
-    /** Perform delay and crash, blocking the thread as contention does. */
+    /** The milliseconds since a point was entered, at nanoTime started. */
+    static double since(long started) {
+        return (System.nanoTime() - started) / 1e6;
+    }
+
+    /** Perform delay and crash, blocking the thread as contention does; a fail rule with ms waits the same way before
+     * it fails. */
     static void hold(Core core, Rule rule) {
-        if (rule.kind().equals("delay")) {
+        if (rule.kind().equals("delay") || (rule.kind().equals("fail") && rule.integer("ms") != null)) {
             try {
                 Thread.sleep((long) rule.number("ms"));
             } catch (InterruptedException interrupted) {
@@ -39,7 +45,7 @@ public final class Points {
                 hold(core, rule);
                 taken = taken || rule.kind().equals("fail");
             }
-            core.observe(point, taken ? "taken" : "not_taken", 0, rule, Map.of());
+            core.observe(point, taken ? "taken" : "not_taken", 0, 0, rule, Map.of());
             return taken;
         } catch (RuntimeException | Error unexpected) {
             throw Core.internalError(unexpected);
@@ -58,7 +64,7 @@ public final class Points {
                 hold(core, rule);
                 result = result != rule.kind().equals("negate");
             }
-            core.observe(point, result ? "true" : "false", 0, rule, Map.of());
+            core.observe(point, result ? "true" : "false", 0, 0, rule, Map.of());
             return result;
         } catch (RuntimeException | Error unexpected) {
             throw Core.internalError(unexpected);
@@ -68,6 +74,7 @@ public final class Points {
     /** One iteration of a loop, delayed by a delay rule to model contention. */
     public static void loop(String point) {
         try {
+            long started = System.nanoTime();
             Core core = Core.current();
             if (!core.enabled()) {
                 return;
@@ -76,7 +83,7 @@ public final class Points {
             if (rule != null) {
                 hold(core, rule);
             }
-            core.observe(point, "iteration", 0, rule, Map.of());
+            core.observe(point, "iteration", 0, since(started), rule, Map.of());
         } catch (RuntimeException | Error unexpected) {
             throw Core.internalError(unexpected);
         }
@@ -99,7 +106,7 @@ public final class Points {
                     default -> observed;
                 };
             }
-            core.observe(point, "observed", result, rule, Map.of());
+            core.observe(point, "observed", result, 0, rule, Map.of());
             return result;
         } catch (RuntimeException | Error unexpected) {
             throw Core.internalError(unexpected);
@@ -112,7 +119,7 @@ public final class Points {
         if (rule != null) {
             hold(core, rule);
         }
-        core.observe(point, "read", 0, rule, Map.of());
+        core.observe(point, "read", 0, 0, rule, Map.of());
         return rule != null && rule.kind().equals("shift") ? rule : null;
     }
 
@@ -145,6 +152,7 @@ public final class Points {
     /** Whether a resource was acquired: its natural outcome, or rejected by a fail rule. */
     public static boolean acquire(boolean acquired, String point) {
         try {
+            long started = System.nanoTime();
             Core core = Core.current();
             if (!core.enabled()) {
                 return acquired;
@@ -154,15 +162,16 @@ public final class Points {
                 hold(core, rule);
                 acquired = acquired && !rule.kind().equals("fail");
             }
-            core.observe(point, acquired ? "acquired" : "rejected", 0, rule, Map.of());
+            core.observe(point, acquired ? "acquired" : "rejected", 0, since(started), rule, Map.of());
             return acquired;
         } catch (RuntimeException | Error unexpected) {
             throw Core.internalError(unexpected);
         }
     }
 
-    /** A call in progress: the rule decided before it, or null, and the checked exception its callee declares. */
-    private record Pending(Rule rule, Class<?> declared) {}
+    /** A call in progress: the rule decided before it, or null, the checked exception its callee declares, and the
+     * nanoTime its point was entered. */
+    private record Pending(Rule rule, Class<?> declared, long started) {}
 
     /** The calls in progress on this thread, innermost last, so that a call's outcome is attributed to the rule
      * decided before it even when the callee holds call points of its own. */
@@ -173,6 +182,7 @@ public final class Points {
     public static void call(String point, Class<?> declared) throws Exception {
         Exception injected;
         try {
+            long started = System.nanoTime();
             Core core = Core.current();
             if (!core.enabled()) {
                 return;
@@ -182,11 +192,11 @@ public final class Points {
                 hold(core, rule);
             }
             if (rule == null || !rule.kind().equals("fail")) {
-                CALLS.get().push(new Pending(rule, declared));
+                CALLS.get().push(new Pending(rule, declared, started));
                 return;
             }
             injected = declaredException(declared, point);
-            core.observe(point, "error", 0, rule, Map.of("error", injected.getClass().getName()));
+            core.observe(point, "error", 0, since(started), rule, Map.of("error", injected.getClass().getName()));
         } catch (RuntimeException | Error | ReflectiveOperationException unexpected) {
             throw Core.internalError(unexpected);
         }
@@ -215,11 +225,11 @@ public final class Points {
             Pending pending = CALLS.get().pop();
             Rule replacing = core.decide(point, Core.ACTS_AFTER);
             if (replacing == null) {
-                core.observe(point, "ok", 0, pending.rule(), Map.of());
+                core.observe(point, "ok", 0, since(pending.started()), pending.rule(), Map.of());
                 return;
             }
             injected = declaredException(pending.declared(), point);
-            core.observe(point, "error", 0, replacing, Map.of("error", injected.getClass().getName()));
+            core.observe(point, "error", 0, since(pending.started()), replacing, Map.of("error", injected.getClass().getName()));
         } catch (RuntimeException | Error | ReflectiveOperationException unexpected) {
             throw Core.internalError(unexpected);
         }
@@ -232,7 +242,8 @@ public final class Points {
         try {
             Core core = Core.current();
             if (core.enabled()) {
-                core.observe(point, "error", 0, CALLS.get().pop().rule(), Map.of("error", error.getClass().getName()));
+                Pending pending = CALLS.get().pop();
+                core.observe(point, "error", 0, since(pending.started()), pending.rule(), Map.of("error", error.getClass().getName()));
             }
         } catch (RuntimeException | Error unexpected) {
             throw Core.internalError(unexpected);

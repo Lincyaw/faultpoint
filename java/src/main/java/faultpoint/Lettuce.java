@@ -44,6 +44,7 @@ public final class Lettuce {
 
     /** Begin a command, or return null when it is not a point. */
     public static Object enter(String name, ByteBuffer firstKey, Class<?> replyError) {
+        long started = System.nanoTime();
         Core core = Core.current();
         Command command = RedisCommands.TABLE.commands().get(name);
         if (!core.enabled() || command == null) {
@@ -58,7 +59,7 @@ public final class Lettuce {
                 core.abort("rule " + rule.id() + ": " + rule.kind() + " at " + point + " cannot resend a Lettuce command");
             }
         }
-        return new Call(point, command, rule, System.nanoTime(), Context.current(), replyError);
+        return new Call(point, command, rule, started, Context.current(), replyError);
     }
 
     private static boolean answered(Call call) {
@@ -72,7 +73,8 @@ public final class Lettuce {
             return null;
         }
         if (!running.action().equals("fail")) {
-            Core.current().observe(running.point(), running.action().equals("empty") ? "empty" : "ok", 0, running.rule(), Map.of());
+            Core.current().observe(running.point(), running.action().equals("empty") ? "empty" : "ok", 0,
+                    Points.since(running.started()), running.rule(), Map.of());
         }
         return running.action();
     }
@@ -87,7 +89,7 @@ public final class Lettuce {
     /** Observe the error a fail rule answers with. */
     public static void failed(Object call, Throwable failure) {
         Call running = (Call) call;
-        Core.current().observe(running.point(), "error", 0, running.rule(), running.failureDetail(failure));
+        Core.current().observe(running.point(), "error", 0, Points.since(running.started()), running.rule(), running.failureDetail(failure));
     }
 
     /** Why a rule at a Redis point cannot be obeyed: a code that is not an upper-case word, which is not the prefix of
@@ -115,7 +117,8 @@ public final class Lettuce {
                 } else {
                     outcome = RedisCommands.empty(running.command(), value) ? "empty" : "rows";
                 }
-                Core.current().observe(running.point(), outcome, (System.nanoTime() - running.started()) / 1e6, running.rule(),
+                double elapsed = Points.since(running.started());
+                Core.current().observe(running.point(), outcome, elapsed, elapsed, running.rule(),
                         error == null ? Map.of() : running.failureDetail(error));
             } catch (RuntimeException | Error unexpected) {
                 throw Core.internalError(unexpected);

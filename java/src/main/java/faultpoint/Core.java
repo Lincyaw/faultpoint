@@ -23,7 +23,7 @@ public final class Core {
     /** One execution of a point, as the core hands it to the observation sink; the detail tells executions of one
      * outcome apart by bounded values under the keys spec/kinds.json gives the kind. */
     public record Observation(String experiment, String point, String outcome, String scope, String rule,
-                              double quantity, String traceId, Map<String, String> detail) {}
+                              double quantity, double elapsed, String traceId, Map<String, String> detail) {}
 
     public interface RuleSource {
         /** Deliver the first rule set before returning, then every change; a failure is an unusable rule set. */
@@ -204,13 +204,15 @@ public final class Core {
         return null;
     }
 
-    public void observe(String point, String outcome, double quantity, Rule rule, Map<String, String> detail) {
+    /** Observe one execution of a point; elapsed is the milliseconds from entering the point to its result, injected
+     * waits included, and 0 for a kind without duration. */
+    public void observe(String point, String outcome, double quantity, double elapsed, Rule rule, Map<String, String> detail) {
         if (sink == null) {
             return;
         }
         String scope = baggage(settings.scopeKey());
         sink.add(new Observation(state.experiment(), point, outcome, scope == null ? "" : scope,
-                rule == null ? null : rule.id(), quantity, context == null ? null : context.traceId(), detail));
+                rule == null ? null : rule.id(), quantity, elapsed, context == null ? null : context.traceId(), detail));
     }
 
     private String baggage(String key) {

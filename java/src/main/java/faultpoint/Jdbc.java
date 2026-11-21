@@ -137,6 +137,7 @@ public final class Jdbc {
     /** Enter a statement execution; a fail rule's error is made here, so that the driver does not run and the exit
      * advice throws it. */
     public static Object enter(Object statement, Object[] arguments) throws SQLException {
+        long started = System.nanoTime();
         int[] depth = DEPTH.get();
         depth[0] += 1;
         Core core = Core.current();
@@ -154,9 +155,9 @@ public final class Jdbc {
         SQLException injected = rule != null && rule.kind().equals("fail")
                 ? injectedError(statement, rule, "faultpoint: injected store failure") : null;
         if (injected != null) {
-            core.observe(point, "error", 0, rule, failureDetail(injected));
+            core.observe(point, "error", 0, Points.since(started), rule, failureDetail(injected));
         }
-        return new Execution(point, kind.kind(), rule, System.nanoTime(), injected);
+        return new Execution(point, kind.kind(), rule, started, injected);
     }
 
     /** The error a fail or fail_after rule raises. With a code it is the driver's own error for a server error of that
@@ -246,7 +247,7 @@ public final class Jdbc {
         }
         Core core = Core.current();
         if (skipped != null) {
-            core.observe(running.point(), "ok", 1, running.rule(), Map.of());
+            core.observe(running.point(), "ok", 1, running.elapsed(), running.rule(), Map.of());
             return new Outcome(droppedResult(method.getReturnType()), null);
         }
         if (thrown == null && running.action().equals("duplicate")) {
@@ -262,23 +263,23 @@ public final class Jdbc {
             }
         }
         if (thrown != null) {
-            core.observe(running.point(), "error", running.elapsed(), running.rule(), failureDetail(thrown));
+            core.observe(running.point(), "error", running.elapsed(), running.elapsed(), running.rule(), failureDetail(thrown));
             return new Outcome(returned, thrown);
         }
         Rule replacing = core.decide(running.point(), Core.ACTS_AFTER);
         if (replacing != null) {
             SQLException injected = injectedError(statement, replacing, "faultpoint: store failed after the statement ran");
-            core.observe(running.point(), "error", running.elapsed(), replacing, failureDetail(injected));
+            core.observe(running.point(), "error", running.elapsed(), running.elapsed(), replacing, failureDetail(injected));
             return new Outcome(returned, injected);
         }
         if (running.kind().equals("store_write")) {
-            core.observe(running.point(), "ok", affected(returned), running.rule(), Map.of());
+            core.observe(running.point(), "ok", affected(returned), running.elapsed(), running.rule(), Map.of());
             return new Outcome(returned, null);
         }
         if (returned instanceof ResultSet rows) {
-            return new Outcome(observed(rows, running), null);
+            return new Outcome(observed(rows, running, running.elapsed()), null);
         }
-        core.observe(running.point(), Boolean.TRUE.equals(returned) ? "rows" : "empty", 0, running.rule(), Map.of());
+        core.observe(running.point(), Boolean.TRUE.equals(returned) ? "rows" : "empty", 0, running.elapsed(), running.rule(), Map.of());
         return new Outcome(returned, null);
     }
 
@@ -292,9 +293,9 @@ public final class Jdbc {
         return returned instanceof long[] counts ? java.util.Arrays.stream(counts).sum() : 0;
     }
 
-    /** A result set that counts its rows and observes the read once it is exhausted or closed; under an
-     * empty rule it yields no row. */
-    private static ResultSet observed(ResultSet rows, Execution execution) {
+    /** A result set that counts its rows and observes the read once it is exhausted or closed, with the elapsed time
+     * of the statement until the driver returned it; under an empty rule it yields no row. */
+    private static ResultSet observed(ResultSet rows, Execution execution, double elapsed) {
         InvocationHandler handler = new InvocationHandler() {
             int seen;
             boolean recorded;
@@ -332,7 +333,7 @@ public final class Jdbc {
             void record() {
                 if (!recorded) {
                     recorded = true;
-                    Core.current().observe(execution.point(), seen > 0 ? "rows" : "empty", seen, execution.rule(), Map.of());
+                    Core.current().observe(execution.point(), seen > 0 ? "rows" : "empty", seen, elapsed, execution.rule(), Map.of());
                 }
             }
         };
