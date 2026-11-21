@@ -76,7 +76,7 @@ func openInContainer(cgroup, path string, hostRoot int) (*os.File, string, error
 	}
 	pid, _, _ := strings.Cut(string(procs), "\n")
 	if pid == "" || pid == "0" {
-		return nil, "", fmt.Errorf("the agent sees no process in %s; it runs in the host's pid namespace", cgroup)
+		return nil, "", fmt.Errorf("the agent sees no process of %s, which it needs the host's pid namespace for", cgroup)
 	}
 	root, rootMount, err := openRoot(pid)
 	if err != nil {
