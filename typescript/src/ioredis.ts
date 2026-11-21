@@ -107,11 +107,28 @@ type ReplyError = new (message: string) => Error;
 /** The prefix of an error reply, which Redis writes as an upper-case word. */
 const REPLY_CODE = /^[A-Z][A-Z0-9_]*$/;
 
-/** A failed command's error and, for an error reply of Redis, its prefix, the word before the first space. */
-function failureDetail(error: unknown, ReplyError: ReplyError): Record<string, string> {
-  return error instanceof ReplyError
-    ? { error: errorName(error), code: error.message.split(" ")[0] }
-    : { error: errorName(error) };
+/** A failed command's error, for an error reply of Redis its prefix, the word before the first space, and whether it
+ * had reached Redis, when that is known. */
+function failureDetail(error: unknown, ReplyError: ReplyError, sent: boolean | undefined): Record<string, string> {
+  return {
+    error: errorName(error),
+    ...(error instanceof ReplyError ? { code: error.message.split(" ")[0] } : {}),
+    ...(sent === undefined ? {} : { sent: String(sent) }),
+  };
+}
+
+/** Whether a command that failed of itself had reached Redis: it had when Redis replied with an error, and when its
+ * command timeout passed after a ready client wrote it, as ioredis writes a command at once when ready, a delayed one
+ * included when the timeout cuts its delay; it had not when it waited in the offline queue, or ioredis gave up
+ * retrying to connect. Undefined when the failure does not tell. */
+function reached(error: unknown, ReplyError: ReplyError, ready: boolean): boolean | undefined {
+  if (error instanceof ReplyError) {
+    return true;
+  }
+  if (error instanceof Error && error.message === "Command timed out") {
+    return ready;
+  }
+  return error instanceof Error && error.name === "MaxRetriesPerRequestError" ? false : undefined;
 }
 
 /** Whether a locator has the shape the adapter makes: its first word is a command of the table. */
@@ -137,6 +154,7 @@ function instrumentSendCommand(original: SendCommand, identifier: RegExp, ReplyE
       return original.call(this, command, stream);
     }
     command[HANDLED] = true;
+    const ready = (this as { status?: unknown }).status === "ready";
     // The client sends the command and its errors reach the application; whether and how it is answered instead is
     // faultpoint's own work, as is observing the reply.
     const answered = CORE.own(() => {
@@ -150,10 +168,10 @@ function instrumentSendCommand(original: SendCommand, identifier: RegExp, ReplyE
         const elapsed = performance.now() - started;
         CORE.observe(point, outcome, elapsed, elapsed, rule, detail);
       });
-      // A delayed command is always sent, when its delay passes or when the command timeout cuts it, and a failed one never.
-      const sent: Record<string, string> = rule?.action.kind === "delay" ? { sent: "true" } : rule?.action.kind === "fail" ? { sent: "false" } : {};
+      // A command a fail rule answers was never sent.
       command.promise.then((reply) => CORE.own(() => observe(spec.empty === undefined ? "ok" : empty(spec.empty, reply) ? "empty" : "rows", {})),
-        (error: unknown) => CORE.own(() => observe("error", { ...failureDetail(error, ReplyError), ...sent })));
+        (error: unknown) => CORE.own(() => observe("error", failureDetail(error, ReplyError,
+          rule?.action.kind === "fail" ? false : reached(error, ReplyError, ready)))));
       switch (rule?.action.kind) {
         case "fail": {
           // With a code the error is the one ioredis makes for that error reply, which carries the command.

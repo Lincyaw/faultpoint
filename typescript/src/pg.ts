@@ -114,9 +114,27 @@ function injectedError(DatabaseError: DatabaseError, rule: Rule, message: string
 }
 
 /** A failed statement's error and, for an error response of PostgreSQL, its SQLSTATE. */
-function failureDetail(error: unknown, DatabaseError: DatabaseError): Record<string, string> {
-  return error instanceof DatabaseError && typeof error.code === "string"
-    ? { error: errorName(error), code: error.code } : { error: errorName(error) };
+function failureDetail(error: unknown, DatabaseError: DatabaseError, sent: boolean | undefined): Record<string, string> {
+  return {
+    error: errorName(error),
+    ...(error instanceof DatabaseError && typeof error.code === "string" ? { code: error.code } : {}),
+    ...(sent === undefined ? {} : { sent: String(sent) }),
+  };
+}
+
+/** The codes of a connection node-postgres could not make, before any statement was sent. */
+const UNCONNECTED = new Set(["ECONNREFUSED", "ENOTFOUND", "EHOSTUNREACH", "ENETUNREACH"]);
+
+/** Whether a statement that failed of itself had reached the server: it had when the server answered with an error,
+ * or when the client's query_timeout passed while it waited for the answer, and it had not when no connection could
+ * be made, or the pool gave none in time; undefined when the failure does not tell. */
+function reached(error: unknown, DatabaseError: DatabaseError): boolean | undefined {
+  const code = (error as { code?: unknown } | null)?.code;
+  const message = error instanceof Error ? error.message : "";
+  if (error instanceof DatabaseError || message === "Query read timeout") {
+    return true;
+  }
+  return (typeof code === "string" && UNCONNECTED.has(code)) || message === "timeout exceeded when trying to connect" ? false : undefined;
 }
 
 /** Run a query under the rule decided before it; a dropped write is acknowledged without reaching the database. */
@@ -175,7 +193,7 @@ function instrumentQuery(original: Query, DatabaseError: DatabaseError): Query {
         const replacing = rule?.action.kind === "drop" ? null : context.with(requestContext, () => CORE.decideAmong(point, ACTS_AFTER));
         if (replacing !== null) {
           const error = injectedError(DatabaseError, replacing, "store failed after the statement ran");
-          observe("error", performance.now() - started, replacing, failureDetail(error, DatabaseError));
+          observe("error", performance.now() - started, replacing, failureDetail(error, DatabaseError, true));
           return error;
         }
         const each = results(answer);
@@ -192,7 +210,9 @@ function instrumentQuery(original: Query, DatabaseError: DatabaseError): Query {
       }
       return answer;
     }, (error: unknown) => {
-      CORE.own(() => observe("error", performance.now() - started, rule, failureDetail(error, DatabaseError)));
+      // A statement a fail rule answered was never sent.
+      CORE.own(() => observe("error", performance.now() - started, rule,
+        failureDetail(error, DatabaseError, rule?.action.kind === "fail" ? false : reached(error, DatabaseError))));
       throw error;
     });
     if (done === undefined) {
