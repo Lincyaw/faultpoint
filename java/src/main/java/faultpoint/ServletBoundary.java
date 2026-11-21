@@ -180,7 +180,7 @@ public final class ServletBoundary {
             if (options.get("identifier_segment") instanceof String pattern) {
                 identifierSegment = Pattern.compile(pattern);
             }
-            installation.core().declare(Map.of("rpc_server", List.of("fail", "fail_after", "delay", "crash")));
+            installation.core().declare(Map.of("rpc_server", List.of("fail", "fail_after", "delay", "crash")), Core.EVERY_LOCATOR);
             Advices.install(installation.instrumentation(), ElementMatchers.named("jakarta.servlet.http.HttpServlet"),
                     ElementMatchers.named("service").and(ElementMatchers.takesArguments(2))
                             .and(ElementMatchers.takesArgument(0, ElementMatchers.named("jakarta.servlet.ServletRequest"))),

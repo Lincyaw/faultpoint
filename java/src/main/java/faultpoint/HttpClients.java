@@ -256,7 +256,8 @@ public final class HttpClients {
 
         @Override
         public void install(Installation installation, Map<String, Object> options) {
-            installation.core().declare(Map.of("rpc_client", List.of("fail", "fail_after", "duplicate", "delay", "crash")));
+            installation.core().declare(Map.of("rpc_client", List.of("fail", "fail_after", "duplicate", "delay", "crash")),
+                    Core.EVERY_LOCATOR);
             Placement placement = installation.placement();
             placement.replaceCalls(OWNERS, "send", SEND, HttpClients.class, "send",
                     "(Ljava/net/http/HttpClient;" + SEND.substring(1));

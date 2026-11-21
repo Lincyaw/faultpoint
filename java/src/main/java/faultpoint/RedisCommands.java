@@ -33,6 +33,11 @@ final class RedisCommands {
         return Pattern.compile(options.get("key_identifier") instanceof String pattern ? pattern : TABLE.key_identifier());
     }
 
+    /** Whether a locator has the shape locator makes: its first word is a command of the table. */
+    static boolean commandLocator(String locator) {
+        return TABLE.commands().containsKey(locator.split(" ", 2)[0]);
+    }
+
     /** The locator of a command: its name and its key with identifiers templated, so that one key shape is one point. */
     static String locator(String name, String key, Pattern identifier) {
         return key == null ? name : name + " " + identifier.matcher(key).replaceAll("{}");

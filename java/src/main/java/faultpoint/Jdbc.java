@@ -141,11 +141,16 @@ public final class Jdbc {
         }
     }
 
+    /** Whether a locator has the shape statementPoint makes, which is the points this plugin serves. */
+    static boolean statementLocator(String locator) {
+        return STATEMENT_LOCATOR.matcher(locator).matches();
+    }
+
     /** Why a rule at a statement point cannot be obeyed: a code that is not a SQLSTATE, which no driver reports. */
     static String refusal(Rule rule) {
         String code = rule.text("code");
         boolean statementPoint = (rule.pointKind().equals("store_read") || rule.pointKind().equals("store_write"))
-                && STATEMENT_LOCATOR.matcher(rule.locator()).matches();
+                && statementLocator(rule.locator());
         return code == null || !statementPoint || SQLSTATE.matcher(code).matches() ? null
                 : "code " + code + " at " + rule.point() + " is not a SQLSTATE, five digits or upper-case letters";
     }
@@ -290,7 +295,7 @@ public final class Jdbc {
         public void install(Installation installation, Map<String, Object> options) {
             installation.core().declare(Map.of(
                     "store_read", List.of("fail", "empty", "delay", "crash"),
-                    "store_write", List.of("fail", "fail_after", "drop", "duplicate", "delay", "crash")));
+                    "store_write", List.of("fail", "fail_after", "drop", "duplicate", "delay", "crash")), Jdbc::statementLocator);
             installation.core().check(Jdbc::refusal);
             Advices.install(installation.instrumentation(),
                     ElementMatchers.hasSuperType(ElementMatchers.named("java.sql.Statement")).and(ElementMatchers.not(ElementMatchers.isInterface())),

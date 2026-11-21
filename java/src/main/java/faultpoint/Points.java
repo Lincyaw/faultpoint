@@ -207,7 +207,7 @@ public final class Points {
                     "loop", List.of("delay", "crash"),
                     "value", List.of("set", "shift", "delay", "crash"),
                     "clock", List.of("shift", "delay", "crash"),
-                    "acquire", List.of("fail", "delay", "crash")));
+                    "acquire", List.of("fail", "delay", "crash")), Core.EVERY_LOCATOR);
             installation.placement().placePoints();
         }
     }

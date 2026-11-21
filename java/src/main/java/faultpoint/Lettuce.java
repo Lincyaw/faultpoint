@@ -133,7 +133,7 @@ public final class Lettuce {
                     "store_read", List.of("fail", "empty", "delay", "crash"),
                     "store_write", List.of("fail", "drop", "delay", "crash"),
                     "publish", List.of("fail", "drop", "delay", "crash"),
-                    "consume", List.of("fail", "empty", "delay", "crash")));
+                    "consume", List.of("fail", "empty", "delay", "crash")), RedisCommands::commandLocator);
             installation.core().check(Lettuce::refusal);
             Advices.install(installation.instrumentation(),
                     ElementMatchers.named("io.lettuce.core.RedisChannelHandler"),

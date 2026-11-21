@@ -179,7 +179,7 @@ public final class SpringHttp {
 
         @Override
         public void install(Installation installation, Map<String, Object> options) {
-            installation.core().declare(Map.of("rpc_client", List.of("fail", "fail_after", "delay", "crash")));
+            installation.core().declare(Map.of("rpc_client", List.of("fail", "fail_after", "delay", "crash")), Core.EVERY_LOCATOR);
             Advices.install(installation.instrumentation(),
                     ElementMatchers.hasSuperType(ElementMatchers.named("org.springframework.http.client.ClientHttpRequest"))
                             .and(ElementMatchers.not(ElementMatchers.isInterface())),

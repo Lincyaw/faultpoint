@@ -7,12 +7,11 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /** Obtains rules, selects the rule of an execution and hands observations to the sink; every kind's
  * semantics lives in the plugins, which declare the kinds they serve and the actions they implement. */
@@ -53,8 +52,14 @@ public final class Core {
     private static volatile Core current = new Core(new Settings("", null, null, List.of(), "fp.scope", 0,
             new Settings.Config(null, null, null)));
 
+    /** The locators of every point of a kind, for a plugin that serves them all. */
+    public static final Predicate<String> EVERY_LOCATOR = locator -> true;
+
+    /** The kinds one plugin serves with the actions it implements there, at the points whose locators it serves. */
+    private record Declaration(Map<String, List<String>> kinds, Predicate<String> locators) {}
+
     public final Settings settings;
-    private final Map<String, Set<String>> declared = new HashMap<>();
+    private final List<Declaration> declarations = new ArrayList<>();
     /** Each answers why its plugin cannot obey a rule, or null; a plugin passes over the kinds it does not serve. */
     private final List<Function<Rule, String>> checks = new ArrayList<>();
     private final List<RuleSource> sources = new ArrayList<>();
@@ -83,13 +88,11 @@ public final class Core {
         return settings.enabled();
     }
 
-    /** A kind served by several plugins accepts only the actions every one of them implements, so that a rule
-     * is rejected when its rule set loads rather than at the one point that cannot obey it. */
-    public void declare(Map<String, List<String>> kinds) {
-        kinds.forEach((kind, actions) -> declared.merge(kind, new HashSet<>(actions), (known, offered) -> {
-            known.retainAll(offered);
-            return known;
-        }));
+    /** The kinds a plugin serves with the actions it implements there, at the points whose locators have the shape
+     * its adapter makes. A point served by several plugins accepts only the actions every one of them implements,
+     * so that a rule is rejected when its rule set loads rather than at the one point that cannot obey it. */
+    public void declare(Map<String, List<String>> kinds, Predicate<String> locators) {
+        declarations.add(new Declaration(kinds, locators));
     }
 
     /** A check of every rule of this service when its rule set loads, for what an action's parameters ask that a
@@ -116,18 +119,20 @@ public final class Core {
         }
     }
 
-    /** Install a rule set; a rule of this service for a kind a plugin serves must use an action that
-     * plugin implements, and rules of other services or kinds are left to the processes that serve them. */
+    /** Install a rule set; a rule of this service at a point plugins serve must use an action each of those plugins
+     * implements, and rules of other services or of points no plugin here serves are left to their processes. */
     void apply(RuleSet ruleset) {
         var rules = new HashMap<String, List<Rule>>();
         for (Rule rule : ruleset.rules()) {
-            Set<String> actions = declared.get(rule.pointKind());
-            if (actions == null || !rule.service().equals(settings.service())) {
+            List<List<String>> serving = declarations.stream()
+                    .filter(declaration -> declaration.kinds().containsKey(rule.pointKind()) && declaration.locators().test(rule.locator()))
+                    .map(declaration -> declaration.kinds().get(rule.pointKind())).toList();
+            if (serving.isEmpty() || !rule.service().equals(settings.service())) {
                 continue;
             }
-            if (!actions.contains(rule.kind())) {
-                abort("rule " + rule.id() + ": not every plugin of this process serving it implements " + rule.kind() + " at a "
-                        + rule.pointKind() + " point");
+            if (!serving.stream().allMatch(actions -> actions.contains(rule.kind()))) {
+                abort("rule " + rule.id() + ": not every plugin of this process serving its point implements " + rule.kind()
+                        + " at " + rule.point());
             }
             for (Function<Rule, String> check : checks) {
                 String refusal = check.apply(rule);
