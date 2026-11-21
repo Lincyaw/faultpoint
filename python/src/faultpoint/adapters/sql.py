@@ -17,7 +17,7 @@ from sqlglot.errors import ErrorLevel
 from faultpoint.actions import (BoundaryError, Crash, Delay, Drop, Duplicate, Empty, StoreFail, StoreFailAfter,
                                 StoreFailure)
 from faultpoint.adapters.store import StoreKind, StoreOutcome, read_actions, write_actions
-from faultpoint.observations import DetailKey, elapsed_ms, error_type
+from faultpoint.observations import DetailKey, elapsed_ms, error_type, flag
 from faultpoint.rules import point_id
 from faultpoint.runtime import Decision, Runtime
 
@@ -53,13 +53,6 @@ CLASSIFICATION_FILTER: Final = ClassificationFilter()
 
 def quiet_classification() -> None:
     logging.getLogger(SQLGLOT_LOGGER).addFilter(CLASSIFICATION_FILTER)
-
-
-def error_detail(error: Exception) -> dict[str, str]:
-    """The error type, and the code the database returned with it: psycopg's SQLSTATE or sqlite3's error name,
-    since DB-API names no common attribute."""
-    codes = [code for name in ERROR_CODE_ATTRIBUTES if isinstance(code := getattr(error, name, None), str)]
-    return {DetailKey.ERROR: error_type(error), **({DetailKey.CODE: codes[0]} if codes else {})}
 
 
 @functools.lru_cache(maxsize=STATEMENT_CACHE_SIZE)
@@ -168,9 +161,30 @@ class Store:
                 rows = 1 if statement.dropped else max(cursor.rowcount, 0)
                 self.runtime.observe(point, StoreOutcome.OK, rows, statement.elapsed, decision)
 
+    def error_detail(self, error: Exception, decision: Decision | None) -> dict[str, str]:
+        """The error type; the code the database returned with it, psycopg's SQLSTATE or sqlite3's error name,
+        since DB-API names no common attribute; and whether the statement was sent: not when a fail rule failed
+        it, after a fail_after rule's statement ran, and for a natural error when the error tells, as an error
+        the database returned with a code was sent and an interface error, raised without the database, was
+        not."""
+        codes = [code for name in ERROR_CODE_ATTRIBUTES if isinstance(code := getattr(error, name, None), str)]
+        match decision:
+            case Decision(action=StoreFail()):
+                sent = {DetailKey.SENT: flag(False)}
+            case Decision(action=StoreFailAfter()):
+                sent = {DetailKey.SENT: flag(True)}
+            case _ if codes:
+                sent = {DetailKey.SENT: flag(True)}
+            case _ if isinstance(error, self.driver.InterfaceError):
+                sent = {DetailKey.SENT: flag(False)}
+            case _:
+                sent = {}
+        return {DetailKey.ERROR: error_type(error), **({DetailKey.CODE: codes[0]} if codes else {}), **sent}
+
     def failed(self, point: str, decision: Decision | None, error: Exception, started: float) -> None:
         with self.runtime.own:
-            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, elapsed_ms(started), decision, error_detail(error))
+            self.runtime.observe(point, StoreOutcome.ERROR, 0.0, elapsed_ms(started), decision,
+                                 self.error_detail(error, decision))
 
     def completed(self, point: str, decision: Decision | None, started: float) -> Decision | None:
         """The decision of a statement that completed: the one made before it ran, or else a fail_after rule's,

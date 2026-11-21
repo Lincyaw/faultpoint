@@ -18,7 +18,7 @@ from faultpoint.actions import (INJECTED_MESSAGE, BoundaryError, Crash, Delay, D
                                 StoreFailAfter, StoreFailure, Wait)
 from faultpoint.adapters.store import (MessageKind, StoreKind, StoreOutcome, consume_actions, read_actions,
                                        write_actions)
-from faultpoint.observations import DetailKey, elapsed_ms, error_type
+from faultpoint.observations import DetailKey, elapsed_ms, error_type, flag
 from faultpoint.rules import point_id
 from faultpoint.runtime import Decision, Plugin, Runtime
 
@@ -34,6 +34,9 @@ CONTAINERS: Final = (list, tuple, dict, set)
 REPLY_CODE: Final = r"[A-Z][A-Z0-9_]*"
 """The code of an error reply, its first word in capitals."""
 ERROR_CODE: Final = re.compile(rf"^{REPLY_CODE}(?= )")
+# redis-py tells whether its connection or timeout error came after or before sending only in the message.
+SENT_MESSAGE: Final = re.compile(r"^(Timeout reading|Error while reading|Connection closed by server)")
+UNSENT_MESSAGE: Final = re.compile(r"connecting to|^Timeout connecting")
 ReplyCode = Annotated[str, StringConstraints(pattern=rf"^{REPLY_CODE}$")]
 
 type Queued = tuple[tuple[Any, ...], dict[str, Any]]
@@ -301,9 +304,11 @@ class CommandPoints:
                                           f"sends with the code: {reason}")
         return error
 
-    def error_detail(self, error: BaseException) -> dict[str, str]:
-        """The error type, and the code of an error reply: the prefix redis-py parsed off, or else the leading
-        word of a reply it kept whole."""
+    def error_detail(self, error: BaseException, decision: Decision | None) -> dict[str, str]:
+        """The error type; the code of an error reply, the prefix redis-py parsed off or else the leading word of
+        a reply it kept whole; and whether the command was sent: not when a fail rule failed it, after a fail_after
+        rule's command ran, and for a natural error when the error tells, as an error reply or a failed read
+        came after sending and a failed connect before."""
         with self.runtime.own:
             match error:
                 case self.exceptions.RedisError(status_code=str() as code):
@@ -312,7 +317,18 @@ class CommandPoints:
                     codes = ERROR_CODE.findall(str(error))
                 case _:
                     codes = []
-            return {DetailKey.ERROR: error_type(error), **({DetailKey.CODE: codes[0]} if codes else {})}
+            match decision:
+                case Decision(action=StoreFail()):
+                    sent = {DetailKey.SENT: flag(False)}
+                case Decision(action=StoreFailAfter()):
+                    sent = {DetailKey.SENT: flag(True)}
+                case _ if codes or SENT_MESSAGE.search(str(error)):
+                    sent = {DetailKey.SENT: flag(True)}
+                case _ if UNSENT_MESSAGE.search(str(error)):
+                    sent = {DetailKey.SENT: flag(False)}
+                case _:
+                    sent = {}
+            return {DetailKey.ERROR: error_type(error), **({DetailKey.CODE: codes[0]} if codes else {}), **sent}
 
     def prepare(self, decisions: list[Decided | None]) -> float:
         """Crash before anything is sent, and the seconds to wait before sending or failing."""
@@ -341,7 +357,7 @@ class CommandPoints:
                 case Decided(decision=Decision(action=StoreFail()) as decision):
                     raised = self.failure(decision)
                     self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, elapsed_ms(started), decision,
-                                         self.error_detail(raised))
+                                         self.error_detail(raised, decision))
                     raise raised
 
     def failed(self, decisions: list[Decided | None], error: Exception, started: float) -> None:
@@ -349,7 +365,7 @@ class CommandPoints:
         for decided in decisions:
             if decided is not None:
                 self.runtime.observe(decided.point, StoreOutcome.ERROR, 0.0, elapsed, decided.decision,
-                                     self.error_detail(error))
+                                     self.error_detail(error, decided.decision))
 
     def settle(self, client: Any, queue: list[Queued], decisions: list[Decided | None], replies: list[Any],
                started: float) -> list[Any]:
@@ -399,9 +415,10 @@ class CommandPoints:
         match decision, reply:
             case Decision(action=StoreFailAfter()), _:
                 self.runtime.observe(point, StoreOutcome.ERROR, 0.0, elapsed, decision,
-                                     self.error_detail(self.failure(decision)))
+                                     self.error_detail(self.failure(decision), decision))
             case _, Exception():
-                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, elapsed, decision, self.error_detail(reply))
+                self.runtime.observe(point, StoreOutcome.ERROR, 0.0, elapsed, decision,
+                                     self.error_detail(reply, decision))
             case _:
                 self.observe_result(command, point, reply, decision, elapsed)
 
