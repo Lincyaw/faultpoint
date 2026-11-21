@@ -132,7 +132,7 @@ class Runtime:
             servers = [server for server in self.kinds[rule.kind]
                        if server.serves is None or server.serves(rule.locator)]
             if not servers:
-                problems.append(f"rule {rule.id}: no plugin of this process serves the point {rule.point}")
+                problems.append(f"rule {rule.id}: no plugin of this process serves {rule.point}")
             for server in servers:
                 try:
                     actions |= server.actions.validate_python({rule.id: rule.action.model_dump()})
