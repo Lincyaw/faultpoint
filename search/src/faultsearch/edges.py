@@ -3,35 +3,48 @@ from enum import StrEnum
 from pathlib import Path
 from statistics import fmean
 from typing import Final, Self
+from urllib.parse import urlsplit
 
 from faultpoint.rules import Action
 from faultpoint.tools.analysis import Effect, Metric, Verdict
+from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, JsonValue
 from shop.workload import Scenarios
 
-from faultsearch.allocation import Strategy
+from faultsearch.allocation import Assignment, Phase, Strategy
 from faultsearch.catalog import DATA, FROZEN, Catalog, Fault, Layer, point_kind, point_layer, point_service
-from faultsearch.counterfactual import TreatmentRecord
+from faultsearch.counterfactual import EffectKey, TreatmentRecord
 
 EFFECTS_FILE: Final = DATA / "effects.json"
+RPC_CLIENT: Final = "rpc_client"
+RPC_SERVER: Final = "rpc_server"
+STATUS: Final = "status"
+"""The action parameter of an exact status code: a number in a rule, a string in a detail."""
 
 type Condition = dict[str, JsonValue]
+type DetailValues = dict[str, tuple[str, ...]]
+"""For every detail key named, the values a detail may have there."""
 
 
-class EffectKey(BaseModel):
+def shows(detail: dict[str, str], required: DetailValues) -> bool:
+    return all(detail.get(name) in values for name, values in required.items())
+
+
+def peer_point(client: str, services: dict[int, str]) -> str:
+    """The server point a client point calls: the service listening on the locator's port, at the same method and
+    path."""
+    method, target = client.split(":", 2)[2].split(" ", 1)
+    address = urlsplit(f"//{target}")
+    return f"{services[address.port]}:{RPC_SERVER}:{method} {address.path}"
+
+
+class PeerEffect(BaseModel):
+    """An effect the server point a client point called must show in every run where the client effect held."""
+
     model_config = FROZEN
 
-    point: str
-    outcome: str
-    metric: Metric
-
-    @property
-    def key(self) -> str:
-        return f"{self.point} {self.outcome} {self.metric}"
-
-    @classmethod
-    def of(cls, effect: Effect) -> Self:
-        return cls(point=effect.point, outcome=effect.outcome, metric=effect.metric)
+    outcomes: tuple[str, ...]
+    details: DetailValues = {}
 
 
 class EffectRule(BaseModel):
@@ -45,8 +58,30 @@ class EffectRule(BaseModel):
     verdicts: tuple[Verdict, ...] = (Verdict.NEW, Verdict.INCREASE)
     layers: tuple[Layer, ...] = tuple(Layer)
     """The layers of the effect's point the rule covers."""
+    details: DetailValues = {}
+    """The detail values the effect must show."""
+    parameters: dict[str, str] = {}
+    """Action parameters the effect's detail gives, by the detail key that gives each; the rule covers only effects
+    whose detail has those keys."""
+    peer: PeerEffect | None = None
     faults: tuple[Action, ...]
     reason: str
+
+    def covers(self, effect: EffectKey, verdicts: set[Verdict], layer: Layer, peer_effects: list[EffectKey]) -> bool:
+        """Whether the rule covers an effect that held with these verdicts, beside these effects of the called
+        server point."""
+        return (self.kind == point_kind(effect.point) and effect.outcome in self.outcomes
+                and self.metric == effect.metric and bool(verdicts & set(self.verdicts)) and layer in self.layers
+                and shows(effect.detail, self.details) and set(self.parameters.values()) <= effect.detail.keys()
+                and (self.peer is None
+                     or any(peer.outcome in self.peer.outcomes and shows(peer.detail, self.peer.details)
+                            for peer in peer_effects)))
+
+    def actions(self, effect: EffectKey) -> list[Action]:
+        """The rule's faults with the parameters the effect's detail gives."""
+        given = {name: int(effect.detail[key]) if name == STATUS else effect.detail[key]
+                 for name, key in self.parameters.items()}
+        return [Action.model_validate({**template.model_dump(), **given}) for template in self.faults]
 
 
 class EffectMap(BaseModel):
@@ -61,13 +96,9 @@ class EffectMap(BaseModel):
     def read(cls, path: Path = EFFECTS_FILE) -> Self:
         return cls.model_validate_json(path.read_text(encoding="utf-8"))
 
-    def matching(self, effect: EffectKey, verdicts: set[Verdict], layer: Layer) -> list[EffectRule]:
-        return [rule for rule in self.rules if rule.kind == point_kind(effect.point) and effect.outcome in rule.outcomes
-                and rule.metric == effect.metric and verdicts & set(rule.verdicts) and layer in rule.layers]
-
     def terminal(self, effect: EffectKey) -> bool:
         """Whether an effect is a failure the user sees: a non-2xx response of the entry service."""
-        return (point_service(effect.point) == self.entry_service and point_kind(effect.point) == "rpc_server"
+        return (point_service(effect.point) == self.entry_service and point_kind(effect.point) == RPC_SERVER
                 and effect.outcome in self.terminal_outcomes)
 
 
@@ -75,7 +106,8 @@ class Counterpart(StrEnum):
     INJECTABLE = "injectable"
     """Faults of the catalog correspond to the effect."""
     OUTSIDE_CATALOG = "outside-catalog"
-    """The effect map names actions, but the catalog does not try them at this point."""
+    """Faults correspond to the effect, some of them actions the catalog does not try at this point, such as a status
+    or an error type a detail gives; the counterpart phase injects them."""
     NONE = "none"
     """The effect map says no action produces the effect."""
     UNMAPPED = "unmapped"
@@ -155,21 +187,36 @@ def holds(effect: Effect, min_count_increase: float) -> bool:
             or fmean(effect.treatment) >= (1 + min_count_increase) * fmean(effect.control))
 
 
-def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, effects: EffectMap,
-                 catalog: Catalog) -> tuple[Counterpart, tuple[Fault, ...]]:
-    rules = effects.matching(effect, verdicts, layer)
-    templates = [template for rule in rules for template in rule.faults]
-    faults = tuple(fault for fault in catalog.faults
-                   if any(fault.instance_of(effect.point, template) for template in templates))
-    if faults:
-        return Counterpart.INJECTABLE, faults
-    if templates:
-        return Counterpart.OUTSIDE_CATALOG, ()
-    return (Counterpart.NONE if rules else Counterpart.UNMAPPED), ()
+def peer_effects(effect: EffectKey, runs: list[dict[str, Effect]], services: dict[int, str]) -> list[EffectKey]:
+    """For a client point's effect, the effects of the server point it called that every run where it held showed."""
+    if point_kind(effect.point) != RPC_CLIENT:
+        return []
+    peer = peer_point(effect.point, services)
+    return [EffectKey.of(found) for key, found in runs[0].items()
+            if found.point == peer and all(key in run for run in runs)]
+
+
+def counterparts(effect: EffectKey, verdicts: set[Verdict], layer: Layer, peer_effects: list[EffectKey],
+                 effects: EffectMap, catalog: Catalog, kinds: KindTable) -> tuple[Counterpart, tuple[Fault, ...]]:
+    """The faults that, injected at an effect's point, produce the effect: the catalog's instances of every action
+    the effect map names for it, or the action itself where the catalog has none."""
+    rules = [rule for rule in effects.rules if rule.covers(effect, verdicts, layer, peer_effects)]
+    found = [([fault for fault in catalog.faults if fault.instance_of(effect.point, action)], action)
+             for rule in rules for action in rule.actions(effect)]
+    faults = {fault.key: fault for instances, action in found
+              for fault in instances or [Fault(point=effect.point, action=action, layer=layer,
+                                               scoped=kinds.kinds[point_kind(effect.point)].scope)]}
+    if not rules:
+        return Counterpart.UNMAPPED, ()
+    if not found:
+        return Counterpart.NONE, ()
+    return (Counterpart.INJECTABLE if all(instances for instances, _ in found) else Counterpart.OUTSIDE_CATALOG,
+            tuple(faults.values()))
 
 
 def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: EffectMap, catalog: Catalog,
-                upstream: frozenset[str], targets: dict[str, str], min_count_increase: float) -> list[Edge]:
+                kinds: KindTable, upstream: frozenset[str], targets: dict[str, str], services: dict[int, str],
+                min_count_increase: float) -> list[Edge]:
     """Every (fault, effect) pair the exercised records show, over the scenarios each fault was tested in."""
     by_fault: dict[str, list[TreatmentRecord]] = defaultdict(list)
     for record in records:
@@ -177,20 +224,28 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
             by_fault[record.fault.key].append(record)
     edges = []
     for runs in by_fault.values():
-        sightings: dict[str, list[Sighting]] = defaultdict(list)
-        for run in runs:
-            for effect in run.effects:
-                if holds(effect, min_count_increase):
-                    sightings[EffectKey.of(effect).key].append(Sighting(scenario=run.workload, effect=effect))
-        for held in sightings.values():
+        shown = {run.workload: {EffectKey.of(effect).key: effect for effect in run.effects
+                                if holds(effect, min_count_increase)} for run in runs}
+        for key in dict.fromkeys(key for in_run in shown.values() for key in in_run):
+            held = [Sighting(scenario=name, effect=in_run[key]) for name, in_run in shown.items() if key in in_run]
             effect = EffectKey.of(held[0].effect)
             layer = point_layer(effect.point, upstream)
             held_in = [sighting.scenario for sighting in held]
             not_held = [run.workload for run in runs if run.workload not in held_in]
-            counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, layer, effects,
-                                               catalog)
+            counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, layer,
+                                               peer_effects(effect, [shown[name] for name in held_in], services),
+                                               effects, catalog, kinds)
             edges.append(Edge(cause=runs[0].fault, effect=effect, held=tuple(held), not_held=tuple(not_held),
                               conditions=learn_conditions(held_in, not_held, scenarios), counterpart=counterpart,
                               counterparts=faults, terminal=effects.terminal(effect), effect_layer=layer,
                               acts_on=None if runs[0].fault.scoped else targets[point_service(runs[0].fault.point)]))
     return edges
+
+
+def counterpart_assignments(edges: list[Edge], assigned: set[str]) -> list[Assignment]:
+    """The faults no assignment tried that correspond to an effect a chain could continue from, each in the scenarios
+    where the effect appeared."""
+    return list({(fault.key, scenario): Assignment(fault=fault, scenario=scenario, phase=Phase.COUNTERPART)
+                 for edge in edges if not edge.terminal
+                 for fault in edge.counterparts if fault.key not in assigned
+                 for scenario in sorted(edge.held_in)}.values())

@@ -6,8 +6,8 @@ from pydantic import BaseModel
 
 from faultsearch.allocation import Allocation, Strategy
 from faultsearch.catalog import FROZEN, Fault, Layer, point_service
-from faultsearch.counterfactual import TreatmentRecord
-from faultsearch.edges import Condition, Edge, EffectKey, holds
+from faultsearch.counterfactual import EffectKey, TreatmentRecord
+from faultsearch.edges import Condition, Edge, holds
 
 LAYER_PATH_SEPARATOR: Final = " > "
 CROSS_LAYER_KEPT: Final = 300

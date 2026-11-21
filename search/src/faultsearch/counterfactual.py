@@ -3,11 +3,11 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
-from typing import Final
+from typing import Final, Self
 
 from faultpoint.observations import ObservationRecord, read_records
 from faultpoint.rules import Rule, RuleSet
-from faultpoint.tools.analysis import Comparison, Effect, Selection, compare
+from faultpoint.tools.analysis import Comparison, Effect, Metric, Selection, compare
 from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, Field
 from shop.deployment import REFUSAL_FILE, SCOPE_KEY, STATUSES_FILE, Statuses, refusal, repetition
@@ -71,6 +71,27 @@ class TreatmentRecord(BaseModel):
     @property
     def exercised(self) -> bool:
         return all(self.injected)
+
+
+class EffectKey(BaseModel):
+    """What identifies an effect across runs: its point, its outcome, the metric that grew and what else the
+    executions had in common."""
+
+    model_config = FROZEN
+
+    point: str
+    outcome: str
+    metric: Metric
+    detail: dict[str, str] = {}
+
+    @property
+    def key(self) -> str:
+        return " ".join([self.point, self.outcome,
+                         *(f"{name}={value}" for name, value in sorted(self.detail.items())), self.metric])
+
+    @classmethod
+    def of(cls, effect: Effect) -> Self:
+        return cls(point=effect.point, outcome=effect.outcome, metric=effect.metric)
 
 
 class Group(BaseModel):

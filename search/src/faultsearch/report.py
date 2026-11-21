@@ -7,8 +7,8 @@ from pydantic import BaseModel
 from faultsearch.allocation import Allocation, Strategy
 from faultsearch.catalog import FROZEN, Catalog, Exclusion, Layer
 from faultsearch.chains import LAYER_PATH_SEPARATOR, Chain, Stitching
-from faultsearch.edges import Counterpart, Edge, EdgeSet, EffectKey, EffectMap
-from faultsearch.counterfactual import ControlRecord, Leak, RunSettings, TreatmentRecord, treatment_record
+from faultsearch.counterfactual import ControlRecord, EffectKey, Leak, RunSettings, TreatmentRecord, treatment_record
+from faultsearch.edges import Edge, EdgeSet, EffectMap
 from faultsearch.store import (CATALOG, CONTROLS, EFFECTS_INPUT, INPUTS, LEAKS, MAPPING_FEEDBACK, REPETITIONS,
                                RUN_SETTINGS, TREATMENTS, VALIDATIONS, Store, allocation_file, chains_file, edges_file)
 from faultsearch.validation import VALIDATION_PREFIX, MappingFeedback, Selection, Validations
@@ -214,8 +214,7 @@ def validation_summaries(validations: Validations, random_edges: EdgeSet | None,
 def conditional_examples(edges: EdgeSet) -> tuple[Edge, ...]:
     """Conditional edges that can continue a chain or end one, at most two per learned condition: those ending at
     the user first, then counts before means."""
-    useful = sorted((edge for edge in edges.edges if edge.not_held
-                     and (edge.terminal or edge.counterpart == Counterpart.INJECTABLE)),
+    useful = sorted((edge for edge in edges.edges if edge.not_held and (edge.terminal or edge.counterparts)),
                     key=lambda edge: (not edge.terminal, edge.effect.metric != Metric.COUNT, -len(edge.held), edge.key))
     by_condition: dict[str, list[Edge]] = defaultdict(list)
     for edge in useful:

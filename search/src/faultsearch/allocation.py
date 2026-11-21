@@ -12,7 +12,7 @@ from scipy.spatial.distance import squareform
 from shop.workload import Scenarios
 
 from faultsearch.catalog import FROZEN, Catalog, Fault
-from faultsearch.counterfactual import NamedWorkload, Runner, TreatmentRecord
+from faultsearch.counterfactual import EffectKey, NamedWorkload, Runner, TreatmentRecord
 
 
 class Strategy(StrEnum):
@@ -25,6 +25,8 @@ class Phase(StrEnum):
     ROUND_ROBIN = "round-robin"
     WEIGHTED = "weighted"
     RANDOM = "random"
+    COUNTERPART = "counterpart"
+    """A fault no assignment tried that the effect map names for an effect, injected where the effect appeared."""
 
 
 class AllocationSettings(BaseModel):
@@ -74,7 +76,7 @@ class Allocation(BaseModel):
 
 
 def effect_keys(record: TreatmentRecord) -> set[str]:
-    return {f"{effect.point} {effect.outcome} {effect.metric}" for effect in record.effects}
+    return {EffectKey.of(effect).key for effect in record.effects}
 
 
 def weighted_vectors(effect_sets: list[set[str]]) -> np.ndarray:
@@ -217,17 +219,31 @@ def weighted(exploration: Exploration, members: dict[int, list[str]], budget: in
         spent += len(batch)
 
 
+def cover(exploration: Exploration) -> None:
+    """Every fault of the catalog no assignment tried, once, where its point runs most."""
+    assigned = {assignment.fault.key for assignment in exploration.assignments}
+    exploration.run([Assignment(fault=fault, scenario=scenarios[0], phase=Phase.COVERAGE)
+                     for fault in exploration.catalog.faults
+                     if fault.key not in assigned and (scenarios := exploration.untested(fault, set()))])
+
+
 def phased_allocation(exploration: Exploration) -> Allocation:
     """Phased budget allocation: every fault once where its point runs most, clustered into causally equivalent
     faults; then the clusters in turn; then the clusters by weight."""
-    exploration.run([Assignment(fault=fault, scenario=scenarios[0], phase=Phase.COVERAGE)
-                     for fault in exploration.catalog.faults
-                     if (scenarios := exploration.untested(fault, set()))])
+    cover(exploration)
     remaining = exploration.settings.budget - len(exploration.assignments)
     members = exploration.members()
     round_robin(exploration, members, round(remaining * exploration.settings.round_robin_share))
     weighted(exploration, members, exploration.settings.budget - len(exploration.assignments))
     return exploration.allocation(Strategy.PHASED)
+
+
+def extended_allocation(exploration: Exploration, strategy: Strategy, assignments: list[Assignment]) -> Allocation:
+    """Given assignments, those an earlier allocation recorded among them, then every fault of the catalog they leave
+    out once; the clusters are those of every fault's first run."""
+    exploration.run(assignments)
+    cover(exploration)
+    return exploration.allocation(strategy)
 
 
 def random_allocation(exploration: Exploration) -> Allocation:
