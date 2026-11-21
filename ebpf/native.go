@@ -29,6 +29,7 @@ const (
 	outcomeFalse   = "false"
 	buildIDSection = ".note.gnu.build-id"
 	buildIDDigits  = 12
+	detailValue    = "value"
 	// cloneSuffix is what GCC appends to the name of a copy of a function that it specializes, splits or moves out of line.
 	cloneSuffix = `(\.(constprop|isra|part|cold)(\.\d+)?)+$`
 )
@@ -94,11 +95,13 @@ type injectedWord struct {
 }
 
 // nativePoint is a configured function as the agent found it in its service's containers: an open file for each inode
-// that holds it, since a uprobe is set on an inode, and the probe sites, which are alike in every file of one build.
+// that holds it, since a uprobe is set on an inode, and the probe sites, which are alike in every file of one build. A
+// failed call with an integer result records the integer as its detail; a pointer's value is an address, unbounded.
 type nativePoint struct {
 	id          string
 	kind        string
 	service     uint32
+	valued      bool
 	errors      map[string][]pointsNativeWrite
 	files       []*os.File
 	executables []*link.Executable
@@ -199,7 +202,7 @@ func locateFunction(function functionOptions, services []service, hostRoot int, 
 		id: faultpoint.PointID(function.Service, function.Kind,
 			fmt.Sprintf("%s@%s:%s", filepath.Base(function.File), build[:buildIDDigits], function.Symbol)),
 		kind: function.Kind, service: services[owner].index, errors: injected, files: files, executables: executables,
-		entries: entries, returns: returns,
+		entries: entries, returns: returns, valued: function.Kind == kindCall && function.Result.Type != "pointer",
 	}, sites, nil
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"syscall"
 
 	"faultpoint"
@@ -28,6 +29,9 @@ func (a *agent) collect() error {
 			Outcome: point.outcome(key.Flagged), Count: int(delta)}
 		if key.Rule > 0 {
 			observation.Rule = a.rules.injections[key.Rule-1].rule
+		}
+		if point.valued && key.Flagged != 0 {
+			observation.Detail = map[string]string{detailValue: strconv.FormatInt(key.Value, 10)}
 		}
 		a.sinks[a.services[point.service].name].Add(observation)
 	})
