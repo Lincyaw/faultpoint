@@ -23,11 +23,13 @@ type ContextProvider interface {
 }
 
 // Plugin is a point or adapter plugin as it registers from its package's init: the actions it implements at each
-// kind it serves, and a pointer to its options holding their defaults, nil when it has none.
+// kind it serves, a pointer to its options holding their defaults, nil when it has none, and Refuse, nil when it
+// obeys every rule of those actions, which says why it cannot obey a rule at one of its kinds.
 type Plugin struct {
 	Name    string
 	Actions map[string][]string
 	Options any
+	Refuse  func(rule *Rule) error
 }
 
 // ruleState is an installed rule set with the per-process counts of its triggers.
@@ -44,6 +46,7 @@ type core struct {
 	enabled    bool
 	registered []string
 	actions    map[string][]string
+	refusals   map[string][]func(rule *Rule) error
 	source     RuleSource
 	sink       ObservationSink
 	context    ContextProvider
@@ -51,7 +54,7 @@ type core struct {
 	started    atomic.Bool
 	state      atomic.Pointer[ruleState]
 	restricted map[string][]string
-	// installing serializes installs with Restrict, so that every rule set in force obeys every restriction.
+	// installing serializes installs with Restrict and Recheck, so that every rule set in force is within the limits.
 	installing sync.Mutex
 	mu         sync.Mutex
 	exit       sync.Mutex
@@ -64,6 +67,7 @@ func init() {
 	current.settings = readSettings()
 	current.enabled = current.settings.rules != "" || current.settings.report != ""
 	current.actions = map[string][]string{}
+	current.refusals = map[string][]func(rule *Rule) error{}
 	current.restricted = map[string][]string{}
 	current.state.Store(&ruleState{})
 }
@@ -83,6 +87,9 @@ func Register(plugin Plugin) bool {
 			actions = slices.DeleteFunc(slices.Clone(served), func(action string) bool { return !slices.Contains(actions, action) })
 		}
 		current.actions[kind] = actions
+		if plugin.Refuse != nil {
+			current.refusals[kind] = append(current.refusals[kind], plugin.Refuse)
+		}
 	}
 	return true
 }
@@ -95,15 +102,34 @@ func Restrict(point string, actions ...string) {
 	defer current.installing.Unlock()
 	current.restricted[point] = actions
 	for _, rule := range current.state.Load().byPoint[point] {
-		current.enforceRestriction(rule)
+		current.enforceLimits(rule)
 	}
 }
 
-// enforceRestriction aborts when a rule names an action its point's restriction leaves out.
-func (c *core) enforceRestriction(rule *Rule) {
+// Recheck enforces the limits again on the rules in force, for a plugin that refuses more once it knows more, as the
+// SQL adapter does once it wraps a driver whose errors it cannot build.
+func Recheck() {
+	current.installing.Lock()
+	defer current.installing.Unlock()
+	for _, rules := range current.state.Load().byPoint {
+		for _, rule := range rules {
+			current.enforceLimits(rule)
+		}
+	}
+}
+
+// enforceLimits aborts when a rule asks more of its point than the process can do: an action the point's
+// restriction leaves out, or a rule a plugin serving its kind refuses.
+func (c *core) enforceLimits(rule *Rule) {
 	actions, restricted := c.restricted[rule.Point]
 	if restricted && !slices.Contains(actions, rule.Action.Kind) {
 		Abort("rule %s: %s implements only %s", rule.ID, rule.Point, strings.Join(actions, ", "))
+	}
+	_, kind, _, _ := SplitPoint(rule.Point)
+	for _, refuse := range c.refusals[kind] {
+		if err := refuse(rule); err != nil {
+			Abort("rule %s: %v", rule.ID, err)
+		}
 	}
 }
 
@@ -147,7 +173,7 @@ func start() {
 }
 
 // install replaces the rule set; a rule of this service at a kind a plugin serves must use an action that plugin
-// implements and its point's restriction allows, and rules of other services or kinds are left to the processes
+// implements, within the limits enforceLimits checks, and rules of other services or kinds are left to the processes
 // that serve them.
 func (c *core) install(data []byte) {
 	ruleset, err := ParseRuleSet(data)
@@ -168,7 +194,7 @@ func (c *core) install(data []byte) {
 		if !slices.Contains(actions, rule.Action.Kind) {
 			Abort("rule %s: no plugin of this process implements %s at a %s point", rule.ID, rule.Action.Kind, kind)
 		}
-		c.enforceRestriction(rule)
+		c.enforceLimits(rule)
 		next.byPoint[rule.Point] = append(next.byPoint[rule.Point], rule)
 		seed := fnv.New64a()
 		seed.Write([]byte(rule.ID))

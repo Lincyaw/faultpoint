@@ -105,7 +105,7 @@ func Exec(db execer, ctx context.Context, sql string, arguments ...any) (pgconn.
 	var err error
 	switch s.action {
 	case "fail":
-		err = action.Failure(s.rule)
+		err = action.Failure(s.rule, sqlpoint.PostgresError)
 	case "drop":
 		tag = pgconn.NewCommandTag(s.command + " 1")
 	default:
@@ -115,7 +115,7 @@ func Exec(db execer, ctx context.Context, sql string, arguments ...any) (pgconn.
 		tag, err = run()
 	}
 	if err == nil && s.action == "fail_after" {
-		tag, err = pgconn.CommandTag{}, action.Failure(s.rule)
+		tag, err = pgconn.CommandTag{}, action.Failure(s.rule, sqlpoint.PostgresError)
 	}
 	if err == nil && s.action == "empty" {
 		tag = pgconn.NewCommandTag(s.command + " 0")
@@ -136,7 +136,7 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 	s := decide(ctx, sql)
 	s.refuse("Query", "drop")
 	if s.action == "fail" {
-		err := action.Failure(s.rule)
+		err := action.Failure(s.rule, sqlpoint.PostgresError)
 		s.observe(0, err)
 		return failedRows{err: err}, err
 	}
@@ -149,7 +149,7 @@ func Query(db querier, ctx context.Context, sql string, arguments ...any) (pgx.R
 		rows, err = db.Query(s.inner, sql, arguments...)
 	}
 	if err == nil && s.action == "fail_after" {
-		err = action.Failure(s.rule)
+		err = action.Failure(s.rule, sqlpoint.PostgresError)
 		rows = failedRows{err: err}
 	}
 	if err != nil {
@@ -225,7 +225,7 @@ func (r *observedRow) Scan(dest ...any) error {
 	s := r.statement
 	var err error
 	if s.action == "fail" {
-		err = action.Failure(s.rule)
+		err = action.Failure(s.rule, sqlpoint.PostgresError)
 	} else {
 		err = r.row.Scan(dest...)
 	}
@@ -233,7 +233,7 @@ func (r *observedRow) Scan(dest ...any) error {
 		err = r.query().Scan(dest...)
 	}
 	if err == nil && s.action == "fail_after" {
-		err = action.Failure(s.rule)
+		err = action.Failure(s.rule, sqlpoint.PostgresError)
 	}
 	if err == nil && s.action == "empty" {
 		err = pgx.ErrNoRows
@@ -268,7 +268,7 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 	var err error
 	var results pgx.BatchResults
 	if s.action == "fail" {
-		err = action.Failure(s.rule)
+		err = action.Failure(s.rule, sqlpoint.PostgresError)
 	} else {
 		results = db.SendBatch(s.inner, batch)
 	}
@@ -279,7 +279,7 @@ func SendBatch(db batchSender, ctx context.Context, batch *pgx.Batch) pgx.BatchR
 		results = db.SendBatch(s.inner, batch)
 	}
 	if err == nil && s.action == "fail_after" {
-		err = action.Failure(s.rule)
+		err = action.Failure(s.rule, sqlpoint.PostgresError)
 	}
 	if err != nil {
 		s.observe(0, err)
@@ -331,7 +331,7 @@ func begin(ctx context.Context, run func(context.Context) (pgx.Tx, error)) (pgx.
 	var tx pgx.Tx
 	var err error
 	if s.action == "fail" {
-		err = action.Failure(s.rule)
+		err = action.Failure(s.rule, sqlpoint.PostgresError)
 	} else {
 		tx, err = run(s.inner)
 	}

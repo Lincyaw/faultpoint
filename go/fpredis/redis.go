@@ -153,7 +153,7 @@ func (c call) block(cmd redis.Cmder) {
 func (c call) settle(cmd redis.Cmder, err error) error {
 	switch {
 	case c.action == "fail" || (err == nil && c.action == "fail_after"):
-		err = action.Failure(c.rule)
+		err = action.Failure(c.rule, replyError)
 	case err == nil && c.action == "empty":
 		err = emptied(cmd, c.command.Empty)
 	}
@@ -175,6 +175,15 @@ func (c call) settle(cmd redis.Cmder, err error) error {
 	}
 	faultpoint.Observe(c.ctx, c.point, outcome, float64(total), c.rule, detail)
 	return err
+}
+
+// replyType is the type go-redis gives an error reply of Redis, proto.RedisError, which is internal to go-redis;
+// redis.Nil is its one exported value.
+var replyType = reflect.TypeOf(redis.Nil)
+
+// replyError is the error go-redis gives for an error reply that starts with code, as a fail rule injects it.
+func replyError(code string) error {
+	return reflect.ValueOf(code + " " + action.ErrInjected.Error()).Convert(replyType).Interface().(error)
 }
 
 // errorDetail is the detail of a failed command: the error's name and, for an error reply of Redis, its prefix,

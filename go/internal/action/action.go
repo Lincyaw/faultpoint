@@ -37,23 +37,29 @@ func Hold(rule *faultpoint.Rule) {
 	}
 }
 
-// ErrInjected is the error of a store or broker whose fail rule names no peer error.
+// ErrInjected is the error of a store or broker whose fail rule names no peer error and no code.
 var ErrInjected = errors.New("faultpoint: injected failure")
 
 // The injected error is registered, so that an observation names it as it names the sentinels of the service.
 func init() { faultpoint.RegisterError("faultpoint/internal/action.ErrInjected", ErrInjected) }
 
-// Failure is the error a fail or fail_after rule of a store or broker gives the caller: the peer error the rule
-// names, or ErrInjected.
-func Failure(rule *faultpoint.Rule) error {
+// Failure is the error a fail or fail_after rule of a store or broker gives the caller: the client library's own
+// error with the code the rule names, which coded builds, the peer error it names, or ErrInjected.
+func Failure(rule *faultpoint.Rule, coded func(code string) error) error {
 	var params struct {
 		Error string `json:"error"`
+		Code  string `json:"code"`
 	}
 	rule.DecodeParams(&params)
-	if params.Error == "" {
-		return ErrInjected
+	switch {
+	case params.Code != "" && params.Error != "":
+		faultpoint.Abort("rule %s: a failure names a peer error or a code, not both", rule.ID)
+	case params.Code != "":
+		return coded(params.Code)
+	case params.Error != "":
+		return PeerError(rule, params.Error)
 	}
-	return PeerError(rule, params.Error)
+	return ErrInjected
 }
 
 // PeerError is the error a caller sees when its peer timed out or refused the connection; any other name ends the
