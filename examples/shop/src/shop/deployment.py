@@ -27,7 +27,8 @@ ROOT: Final = SHOP.parent.parent
 RUNS: Final = ROOT / "runs" / "shop"
 BUILD: Final = RUNS / "build"
 MANIFESTS: Final = BUILD / "manifests"
-HOOKS: Final = BUILD / "hooks"
+HOOKS_DIRECTORY: Final = "hooks"
+"""Where in a system's build the kernel agent's hook catalog of the upstream images lies."""
 BUILT_FROM: Final = BUILD / "sdk-commit"
 FLUSH_SECONDS: Final = 0.5
 REQUESTS_PER_TENANT: Final = 21
@@ -167,7 +168,7 @@ def build(sdk: Path) -> str:
     run(["npm", "run", "--silent", "build"], sdk / "typescript")
     run(["mvn", "-q", "-B", "package", "-DskipTests"], sdk / "java")
     run(["go", "build", "-o", "fpebpf", "."], sdk / "ebpf", {"CGO_ENABLED": "0"})
-    scan_hooks(sdk, HOOKS)
+    scan_hooks(sdk, BUILD / HOOKS_DIRECTORY)
     run(["npm", "ci", "--silent"], SHOP / "gateway")
     run(["npx", "tsc", "-p", "tsconfig.json"], SHOP / "gateway")
     run(["uv", "sync", "-q"], SHOP / "orders")
@@ -218,7 +219,7 @@ def orders_config() -> dict[str, JsonValue]:
                         "redis": {"key_identifier": REDIS_KEY_IDENTIFIER}}}
 
 
-def services(directory: Path, sdk: Path, workload: Workload, upstream: Upstream) -> list[Service]:
+def services(directory: Path, sdk: Path, build: Path, workload: Workload, upstream: Upstream) -> list[Service]:
     urls = {f"{name.upper()}_URL": f"http://127.0.0.1:{port}" for name, port in PORTS.items()}
     routes = {"identifier_segment": IDENTIFIER_SEGMENT}
     return [
@@ -239,10 +240,10 @@ def services(directory: Path, sdk: Path, workload: Workload, upstream: Upstream)
                 attachment={"PYTHONPATH": os.pathsep.join([str(sdk / "python" / "src" / "faultpoint" / "bootstrap"),
                                                            str(SHOP / "orders")]),
                             "FAULTPOINT_SOURCE_ROOT": str(SHOP / "orders")}),
-        Service(name="inventory", port=PORTS["inventory"], command=[str(BUILD / "inventory-bin")], directory=directory,
+        Service(name="inventory", port=PORTS["inventory"], command=[str(build / "inventory-bin")], directory=directory,
                 config={"options": {"http": routes}}, environment={"INVENTORY_DATABASE": upstream.database}),
         Service(name="pricing", port=PORTS["pricing"],
-                command=[str(BUILD / "pricing" / "target" / "release" / "pricing")], directory=directory,
+                command=[str(build / "pricing" / "target" / "release" / "pricing")], directory=directory,
                 config={"options": {"tower": routes}}),
         Service(name="ledger", port=PORTS["ledger"], command=["java", "-cp", LEDGER_CLASS_PATH, "shop.Ledger"],
                 directory=directory, config={"options": {"servlet": routes}},
@@ -353,9 +354,9 @@ def record_responses(directory: Path, tenants: list[str], responses: list[Respon
     (directory / STATUSES_FILE).write_text(counts.model_dump_json())
 
 
-def serve_and_load(directory: Path, sdk: Path) -> None:
-    """Start the services on a repetition directory, send its workload's checkouts, stop them and keep the responses;
-    this runs inside the repetition's own network namespace, which reaches the upstream containers through
+def serve_and_load(directory: Path, sdk: Path, build: Path) -> None:
+    """Start a build's services on a repetition directory, send its workload's checkouts, stop them and keep the
+    responses; this runs inside the repetition's own network namespace, which reaches the upstream containers through
     slirp4netns."""
     wait_for_host_route()
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
@@ -363,7 +364,7 @@ def serve_and_load(directory: Path, sdk: Path) -> None:
     upstream = Upstream.model_validate_json((directory / UPSTREAM_FILE).read_text())
     instrumentation = Instrumentation.model_validate_json((directory / INSTRUMENTATION_FILE).read_text())
     seed_ledger(directory, workload)
-    shop = services(directory, sdk, workload, upstream)
+    shop = services(directory, sdk, build, workload, upstream)
     processes: list[subprocess.Popen[bytes]] = []
     try:
         for service in shop:
@@ -389,10 +390,10 @@ def wait_for_namespace(pid: int) -> None:
         time.sleep(0.01)
 
 
-def namespaced_run(directory: Path, sdk: Path, module: str) -> None:
-    """Run a system's deployment module, which serves and loads the repetition's directory, in a fresh user and network
-    namespace that slirp4netns connects to the host."""
-    child = subprocess.Popen([*NETWORK_NAMESPACE, sys.executable, "-m", module, str(directory), str(sdk)])
+def namespaced_run(directory: Path, sdk: Path, module: str, build: Path) -> None:
+    """Run a system's deployment module, which serves the build's services and loads them on the repetition's
+    directory, in a fresh user and network namespace that slirp4netns connects to the host."""
+    child = subprocess.Popen([*NETWORK_NAMESPACE, sys.executable, "-m", module, str(directory), str(sdk), str(build)])
     wait_for_namespace(child.pid)
     with (directory / "slirp4netns.log").open("wb") as log:
         slirp = subprocess.Popen(["slirp4netns", "--configure", "--mtu=65520", str(child.pid), "tap0"], stdout=log,
@@ -417,11 +418,11 @@ def refusal(directory: Path) -> str | None:
 
 def isolated_repetition(directory: Path, workload: BaseModel, rules: dict[str, Any], sdk: Path,
                         instrumentation: Instrumentation, sql: str, redis_commands: list[str], module: str,
-                        hooks: Path) -> Statuses:
-    """One run of a system's services under a rule set, with a fresh database and cache seeded as given and, with
-    faultpoint, the kernel agent watching the upstream containers, attaching what it selects of the build's hook
-    catalog; the system's deployment module serves and loads it in a namespace of its own, and its observations stay
-    in its directory."""
+                        build: Path) -> Statuses:
+    """One run of a build of a system's services under a rule set, with a fresh database and cache seeded as given
+    and, with faultpoint, the kernel agent watching the upstream containers, attaching what it selects of the build's
+    hook catalog; the system's deployment module serves and loads it in a namespace of its own, and its observations
+    stay in its directory."""
     shutil.rmtree(directory, ignore_errors=True)
     directory.mkdir(parents=True)
     (directory / WORKLOAD_FILE).write_text(workload.model_dump_json())
@@ -433,8 +434,8 @@ def isolated_repetition(directory: Path, workload: BaseModel, rules: dict[str, A
         upstream = start_upstream(prefix, sql, redis_commands)
         (directory / UPSTREAM_FILE).write_text(upstream.model_dump_json())
         agent = start_agent(directory, directory / RULES_FILE, upstream, sdk, prefix, FLUSH_SECONDS,
-                            instrumentation.agent, hooks) if instrumentation.attached else None
-        namespaced_run(directory, sdk, module)
+                            instrumentation.agent, build / HOOKS_DIRECTORY) if instrumentation.attached else None
+        namespaced_run(directory, sdk, module, build)
         if agent is not None:
             stop_agent(agent, directory)
     finally:
@@ -454,7 +455,7 @@ def repetition(directory: Path, workload: dict[str, JsonValue], rules: dict[str,
     """One run of the whole shop under a rule set, with inventory's stock in PostgreSQL and an empty price cache."""
     shop = Workload.model_validate(workload)
     return isolated_repetition(directory, shop, rules, sdk, instrumentation, stock_sql(shop), [], "shop.deployment",
-                               HOOKS)
+                               BUILD)
 
 
 class System(BaseModel):
@@ -478,4 +479,4 @@ SYSTEM: Final = System(name="shop", scenarios=SCENARIOS, manifests=MANIFESTS, en
 
 
 if __name__ == "__main__":
-    serve_and_load(Path(sys.argv[1]), Path(sys.argv[2]))
+    serve_and_load(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))

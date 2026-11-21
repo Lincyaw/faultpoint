@@ -8,7 +8,7 @@ from pydantic import BaseModel, TypeAdapter
 from shop.deployment import SYSTEM as SHOP
 from shop.deployment import System
 from shop.upstream import PACKET_POINTS, UNSCOPED_TARGETS, UPSTREAM_SERVICES
-from stitch_mechanism.deployment import SYSTEM as STITCH_MECHANISM
+from stitch_mechanism.deployment import SYSTEMS as STITCH_MECHANISM_BUILDS
 
 from faultsearch.allocation import (Allocation, AllocationSettings, Exploration, Strategy, extended_allocation,
                                     phased_allocation, random_allocation)
@@ -31,7 +31,7 @@ Experiment = Annotated[str, typer.Argument(help="The experiment's name, its dire
 Chosen = Annotated[Strategy, typer.Option(help="The allocation strategy.")]
 SdkRoot = Annotated[Path, typer.Option(help="A clean checkout of the SDK commit the system runs with.")]
 Rebuild = Annotated[bool, typer.Option(help="Build the SDK and the system first.")]
-SYSTEMS: Final = {system.name: system for system in (SHOP, STITCH_MECHANISM)}
+SYSTEMS: Final = {system.name: system for system in (SHOP, *STITCH_MECHANISM_BUILDS)}
 Explored = Annotated[str, typer.Option(help=f"The system to explore, one of {', '.join(SYSTEMS)}.")]
 
 

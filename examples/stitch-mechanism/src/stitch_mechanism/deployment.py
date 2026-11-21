@@ -5,12 +5,13 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from string import ascii_lowercase
 from typing import Any, Final
 
 from pydantic import BaseModel, Field, JsonValue, PositiveInt
-from shop.deployment import (FLUSH_SECONDS, IDENTIFIER_SEGMENT, INSTRUMENTATION_FILE, LOAD_DEADLINE_S,
+from shop.deployment import (FLUSH_SECONDS, HOOKS_DIRECTORY, IDENTIFIER_SEGMENT, INSTRUMENTATION_FILE, LOAD_DEADLINE_S,
                              REDIS_KEY_IDENTIFIER, WORKLOAD_FILE, Instrumentation, Response, Service, Statuses, System,
                              answered, built_commit, isolated_repetition, record_responses, run, sdk_commit,
                              service_environment, start, tenant_request, wait_for_host_route, wait_for_port,
@@ -21,10 +22,6 @@ from shop.workload import FROZEN
 MECHANISM: Final = Path(__file__).resolve().parents[2]
 SCENARIOS: Final = MECHANISM / "scenarios.json"
 RUNS: Final = MECHANISM.parent.parent / "runs" / "stitch-mechanism"
-BUILD: Final = RUNS / "build"
-MANIFESTS: Final = BUILD / "manifests"
-HOOKS: Final = BUILD / "hooks"
-BUILT_FROM: Final = BUILD / "sdk-commit"
 PORTS: Final = {"quote": 27280, "catalog": 27281}
 QUOTE_PLUGINS: Final = ["points", "import-hook", "httpx", "asgi"]
 QUOTE_CATALOG_TIMEOUT_S: Final = 2.0
@@ -63,43 +60,64 @@ class Workload(BaseModel):
         return [f"{tenant}-{number}" for number in self.sku_numbers]
 
 
+class Build(BaseModel):
+    """A build of the constructed system in a directory of its own, catalog's rewrite registering the exported error
+    variables of the packages it names, with its manifests and its hook catalog."""
+
+    model_config = FROZEN
+
+    name: str
+    directory: Path
+    error_packages: tuple[str, ...]
+
+    @property
+    def manifests(self) -> Path:
+        return self.directory / "manifests"
+
+    @property
+    def built_from(self) -> Path:
+        return self.directory / "sdk-commit"
+
+
 def quote_config() -> dict[str, JsonValue]:
     return {"plugins": QUOTE_PLUGINS, "options": {"asgi": {"identifier_segment": IDENTIFIER_SEGMENT},
                                                   "httpx": {"identifier_segment": IDENTIFIER_SEGMENT}}}
 
 
-def build(sdk: Path) -> str:
+def build(sdk: Path, variant: Build) -> str:
     """Build the kernel agent, quote's environment with the Python SDK and catalog from an instrumented copy, and
     return the SDK's commit."""
     commit = sdk_commit(sdk)
-    BUILD.mkdir(parents=True, exist_ok=True)
+    directory = variant.directory
+    directory.mkdir(parents=True, exist_ok=True)
     run(["go", "build", "-o", "fpebpf", "."], sdk / "ebpf", {"CGO_ENABLED": "0"})
-    scan_hooks(sdk, HOOKS)
+    scan_hooks(sdk, directory / HOOKS_DIRECTORY)
     run(["uv", "sync", "-q"], MECHANISM / "quote")
     # Python plugins are found through the faultpoint.plugins entry points, which only an installed package exposes.
     run(["uv", "pip", "install", "-q", "--python", str(MECHANISM / "quote" / ".venv"), "-e", str(sdk / "python")],
         MECHANISM / "quote")
-    go_copy = BUILD / "catalog"
+    go_copy = directory / "catalog"
     shutil.rmtree(go_copy, ignore_errors=True)
-    run(["go", "build", "-o", str(BUILD / "fprewrite"), "."], sdk / "go" / "rewrite")
-    run([str(BUILD / "fprewrite"), "instrument", "-service", "catalog", "-source", str(MECHANISM / "catalog"),
+    placement = {"scope": [], "error_packages": list(variant.error_packages)}
+    run(["go", "build", "-o", str(directory / "fprewrite"), "."], sdk / "go" / "rewrite")
+    run([str(directory / "fprewrite"), "instrument", "-service", "catalog", "-source", str(MECHANISM / "catalog"),
          "-target", str(go_copy), "-sdk", str(sdk / "go"), "-config",
-         str(write_config(BUILD / "catalog.build.json", {"placement": {"scope": []}}))], MECHANISM)
-    run(["go", "build", "-o", str(BUILD / "catalog-bin"), "."], go_copy)
-    MANIFESTS.mkdir(parents=True, exist_ok=True)
+         str(write_config(directory / "catalog.build.json", {"placement": placement}))], MECHANISM)
+    run(["go", "build", "-o", str(directory / "catalog-bin"), "."], go_copy)
+    variant.manifests.mkdir(parents=True, exist_ok=True)
     run(["uv", "run", "--extra", "tools", "faultpoint", "scan", str(MECHANISM / "quote"), "--service", "quote",
-         "--config", str(write_config(BUILD / "quote.scan.json", quote_config())),
-         "--output", str(MANIFESTS / "quote.json")], sdk / "python")
-    shutil.copy(go_copy / "faultpoint-manifest.json", MANIFESTS / "catalog.json")
-    BUILT_FROM.write_text(commit)
+         "--config", str(write_config(directory / "quote.scan.json", quote_config())),
+         "--output", str(variant.manifests / "quote.json")], sdk / "python")
+    shutil.copy(go_copy / "faultpoint-manifest.json", variant.manifests / "catalog.json")
+    variant.built_from.write_text(commit)
     return commit
 
 
-def verified_build(sdk: Path) -> str:
-    return built_commit(sdk, BUILT_FROM)
+def verified_build(sdk: Path, variant: Build) -> str:
+    return built_commit(sdk, variant.built_from)
 
 
-def services(sdk: Path, upstream: Upstream) -> list[Service]:
+def services(sdk: Path, build: Path, upstream: Upstream) -> list[Service]:
     routes = {"identifier_segment": IDENTIFIER_SEGMENT}
     return [
         Service(name="quote", port=PORTS["quote"],
@@ -113,7 +131,7 @@ def services(sdk: Path, upstream: Upstream) -> list[Service]:
                 attachment={"PYTHONPATH": os.pathsep.join([str(sdk / "python" / "src" / "faultpoint" / "bootstrap"),
                                                            str(MECHANISM / "quote")]),
                             "FAULTPOINT_SOURCE_ROOT": str(MECHANISM / "quote")}),
-        Service(name="catalog", port=PORTS["catalog"], command=[str(BUILD / "catalog-bin")], directory=BUILD,
+        Service(name="catalog", port=PORTS["catalog"], command=[str(build / "catalog-bin")], directory=build,
                 config={"options": {"http": routes, "redis": {"key_identifier": REDIS_KEY_IDENTIFIER}}},
                 environment={"CATALOG_DATABASE": f"{upstream.database} pool_max_conns={CATALOG_POOL_SIZE}",
                              "REDIS_URL": upstream.redis_url, "CATALOG_DB_BUDGET_MS": str(CATALOG_DB_BUDGET_MS)}),
@@ -160,15 +178,15 @@ def load(workload: Workload) -> list[Response]:
         return [response for response in pool.map(quoted, quotes) if response is not None]
 
 
-def serve_and_load(directory: Path, sdk: Path) -> None:
-    """Start quote and catalog on a repetition directory, send its workload's quotes, stop them and keep the
-    responses, inside the repetition's own network namespace."""
+def serve_and_load(directory: Path, sdk: Path, build: Path) -> None:
+    """Start quote and a build's catalog on a repetition directory, send its workload's quotes, stop them and keep
+    the responses, inside the repetition's own network namespace."""
     wait_for_host_route()
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     workload = Workload.model_validate_json((directory / WORKLOAD_FILE).read_text())
     upstream = Upstream.model_validate_json((directory / UPSTREAM_FILE).read_text())
     instrumentation = Instrumentation.model_validate_json((directory / INSTRUMENTATION_FILE).read_text())
-    mechanism = services(sdk, upstream)
+    mechanism = services(sdk, build, upstream)
     processes: list[subprocess.Popen[bytes]] = []
     try:
         for service in mechanism:
@@ -186,17 +204,30 @@ def serve_and_load(directory: Path, sdk: Path) -> None:
 
 
 def repetition(directory: Path, workload: dict[str, JsonValue], rules: dict[str, Any], sdk: Path,
-               instrumentation: Instrumentation) -> Statuses:
-    """One run of quote and catalog under a rule set, with the prices and discount rules in PostgreSQL and the cached
-    SKUs' prices in Redis."""
+               instrumentation: Instrumentation, variant: Build) -> Statuses:
+    """One run of quote and a build's catalog under a rule set, with the prices and discount rules in PostgreSQL and
+    the cached SKUs' prices in Redis."""
     mechanism = Workload.model_validate(workload)
     return isolated_repetition(directory, mechanism, rules, sdk, instrumentation, price_sql(mechanism),
-                               cache_commands(mechanism), "stitch_mechanism.deployment", HOOKS)
+                               cache_commands(mechanism), "stitch_mechanism.deployment", variant.directory)
 
 
-SYSTEM: Final = System(name="stitch-mechanism", scenarios=SCENARIOS, manifests=MANIFESTS, entry_service="quote",
-                       ports=PORTS, build=build, verified_build=verified_build, repetition=repetition)
+def system(variant: Build) -> System:
+    """The constructed system as the search explores one of its builds."""
+    return System(name=variant.name, scenarios=SCENARIOS, manifests=variant.manifests, entry_service="quote",
+                  ports=PORTS, build=partial(build, variant=variant),
+                  verified_build=partial(verified_build, variant=variant),
+                  repetition=partial(repetition, variant=variant))
+
+
+PLAIN: Final = Build(name="stitch-mechanism", directory=RUNS / "build", error_packages=())
+"""Catalog registers no error variable of another package, so a deadline's error is named by its type."""
+CONTEXT_SENTINELS: Final = Build(name="stitch-mechanism-context-sentinels", directory=RUNS / "build-context-sentinels",
+                                 error_packages=("context",))
+"""Catalog registers the error variables of the context package, so a deadline's error is named
+context.DeadlineExceeded."""
+SYSTEMS: Final = (system(PLAIN), system(CONTEXT_SENTINELS))
 
 
 if __name__ == "__main__":
-    serve_and_load(Path(sys.argv[1]), Path(sys.argv[2]))
+    serve_and_load(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
