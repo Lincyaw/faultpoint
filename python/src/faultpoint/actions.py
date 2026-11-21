@@ -73,8 +73,8 @@ class BoundaryFail(Failure):
     kind: Literal[ActionKind.FAIL]
 
 
-class FailAfter(Failure):
-    """A failure the caller sees after the boundary's effect took place."""
+class FailAfter(Failure, OnCompletion):
+    """A failure the caller sees after the exchange completed with a 2xx or 3xx response."""
 
     kind: Literal[ActionKind.FAIL_AFTER]
 

@@ -19,6 +19,8 @@ HTTPX_MODULE: Final = "httpx"
 HTTPX2_MODULE: Final = "httpx2"
 UVICORN_MODULE: Final = "uvicorn"
 DEFAULT_FAILURE_STATUS: Final = 503
+COMPLETED_STATUSES: Final = range(200, 400)
+"""The statuses of an exchange that completed, which a fail_after rule replaces."""
 RESPONSE_START: Final = "http.response.start"
 HTTP_DISCONNECT: Final = "http.disconnect"
 IDENTIFIER_SEGMENT: Final = re.compile(
@@ -61,10 +63,6 @@ def status_outcome(status: int) -> str:
 
 def elapsed_ms(started: float) -> float:
     return (time.monotonic() - started) * 1000
-
-
-async def discard(message: Message) -> None:
-    """A send that drops the response of an application whose effects took place."""
 
 
 async def send_failure(send: Send, status: int | None) -> None:
@@ -121,6 +119,23 @@ class ServerExchange:
         return {**status, DetailKey.ABANDONED: flag(self.abandoned)}
 
 
+class CompletionGate:
+    """The send of an application run with no rule decided before it: the start of a 2xx or 3xx response decides a
+    fail_after rule, and a rule that fires holds back that response, start and body, for its failure."""
+
+    def __init__(self, runtime: Runtime, point: str, send: Send) -> None:
+        self.runtime = runtime
+        self.point = point
+        self.inner_send = send
+        self.decision: Decision | None = None
+
+    async def send(self, message: Message) -> None:
+        if message["type"] == RESPONSE_START and message["status"] in COMPLETED_STATUSES:
+            self.decision = self.runtime.decide_completed(self.point)
+        if self.decision is None:
+            await self.inner_send(message)
+
+
 class ServerPoint:
     """The rpc_server point of every request an ASGI application serves, under the caller's request context."""
 
@@ -144,7 +159,10 @@ class ServerPoint:
         exchange = ServerExchange(receive, send)
         started = time.monotonic()
         try:
-            await self.respond(scope, exchange.receive, exchange.send, decision)
+            if decision is None:
+                decision = await self.respond_undecided(scope, exchange, point)
+            else:
+                await self.respond(scope, exchange.receive, exchange.send, decision)
         except BaseException as error:
             self.runtime.observe(point, RpcOutcome.ERROR, elapsed_ms(started), decision,
                                  {**exchange.detail(), DetailKey.ERROR: error_type(error)})
@@ -152,7 +170,7 @@ class ServerPoint:
         self.runtime.observe(point, RpcOutcome.ERROR if exchange.status is None else status_outcome(exchange.status),
                              elapsed_ms(started), decision, exchange.detail())
 
-    async def respond(self, scope: Scope, receive: Receive, send: Send, decision: Decision | None) -> None:
+    async def respond(self, scope: Scope, receive: Receive, send: Send, decision: Decision) -> None:
         match decision:
             case Decision(action=Delay(ms=ms)):
                 await asyncio.sleep(ms / 1000)
@@ -161,11 +179,16 @@ class ServerPoint:
                 self.runtime.crash(code)
             case Decision(action=BoundaryFail(status=status)):
                 await send_failure(send, status)
+
+    async def respond_undecided(self, scope: Scope, exchange: ServerExchange, point: str) -> Decision | None:
+        """Run the application for a request no rule was decided for before it ran; a fail_after rule its 2xx or
+        3xx response decides replaces that response with the rule's failure."""
+        gate = CompletionGate(self.runtime, point, exchange.send)
+        await self.app(scope, exchange.receive, gate.send)
+        match gate.decision:
             case Decision(action=FailAfter(status=status)):
-                await self.app(scope, receive, discard)
-                await send_failure(send, status)
-            case None:
-                await self.app(scope, receive, send)
+                await send_failure(exchange.send, status)
+        return gate.decision
 
 
 def serve_points(runtime: Runtime, options: HttpOptions, load: Callable[[], None], config: Any,
@@ -234,6 +257,13 @@ class ClientPoint:
         self.runtime.observe(point, self.error_outcome(error), elapsed_ms(started), decision,
                              {DetailKey.ERROR: error_type(error), **self.sent(decision, error)})
 
+    def completed(self, point: str, decision: Decision | None, response: Any) -> Decision | None:
+        """The decision of an exchange that got a response: the one made before it was sent, or else, for a 2xx
+        or 3xx, a fail_after rule's."""
+        if decision is None and response.status_code in COMPLETED_STATUSES:
+            return self.runtime.decide_completed(point)
+        return decision
+
     def handle(self, send: Callable[..., Any], transport: Any, args: tuple[Any, ...],
                kwargs: dict[str, Any]) -> Any:
         (request,) = args
@@ -241,6 +271,11 @@ class ClientPoint:
         started = time.monotonic()
         try:
             response = self.exchange(send, request, decision)
+            decision = self.completed(point, decision, response)
+            match decision:
+                case Decision(action=FailAfter() as failure):
+                    response.read()
+                    response = self.failed(failure, request)
         except Exception as error:
             self.observe_error(point, started, decision, error)
             raise
@@ -260,9 +295,6 @@ class ClientPoint:
                 request.read()
                 send(request).read()
                 return send(request)
-            case Decision(action=FailAfter() as failure):
-                send(request).read()
-                return self.failed(failure, request)
         return send(request)
 
     async def handle_async(self, send: Callable[..., Awaitable[Any]], transport: Any, args: tuple[Any, ...],
@@ -272,6 +304,11 @@ class ClientPoint:
         started = time.monotonic()
         try:
             response = await self.exchange_async(send, request, decision)
+            decision = self.completed(point, decision, response)
+            match decision:
+                case Decision(action=FailAfter() as failure):
+                    await response.aread()
+                    response = self.failed(failure, request)
         except Exception as error:
             self.observe_error(point, started, decision, error)
             raise
@@ -292,9 +329,6 @@ class ClientPoint:
                 await request.aread()
                 await (await send(request)).aread()
                 return await send(request)
-            case Decision(action=FailAfter() as failure):
-                await (await send(request)).aread()
-                return self.failed(failure, request)
         return await send(request)
 
 
