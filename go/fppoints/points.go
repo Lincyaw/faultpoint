@@ -14,7 +14,7 @@ import (
 
 var enabled = faultpoint.Register(faultpoint.Plugin{Name: "points", Actions: map[string][]string{
 	"branch":  {"fail", "delay", "crash"},
-	"call":    {"fail", "delay", "crash"},
+	"call":    {"fail", "fail_after", "delay", "crash"},
 	"check":   {"negate", "delay", "crash"},
 	"loop":    {"delay", "crash"},
 	"value":   {"set", "shift", "delay", "crash"},
@@ -44,8 +44,75 @@ func Branch(ctx context.Context, point string, taken bool) bool {
 	return taken
 }
 
-// Failed observes the error a call returned, with its name as the detail, and, under a fail rule, replaces it with
-// the registered error the rule names or an injected one; it reports whether the error is not nil.
+// injected is the error a fail or fail_after rule of a call point returns: the registered error it names, or an
+// injected one.
+func injected(rule *faultpoint.Rule, point string) error {
+	var params struct {
+		Error string `json:"error"`
+	}
+	rule.DecodeParams(&params)
+	if params.Error == "" {
+		return &injectedError{point: point}
+	}
+	registered, found := faultpoint.RegisteredError(params.Error)
+	if !found {
+		faultpoint.Abort("rule %s names unregistered error %q", rule.ID, params.Error)
+	}
+	return registered
+}
+
+// observeCall records the error a call point's caller gets, with its name as the detail.
+func observeCall(ctx context.Context, point string, rule *faultpoint.Rule, err error) {
+	if err == nil {
+		faultpoint.Observe(ctx, point, "ok", 0, rule, nil)
+		return
+	}
+	faultpoint.Observe(ctx, point, "error", 0, rule, map[string]string{"error": faultpoint.ErrorName(err)})
+}
+
+// Call is the call point of a call site whose error the caller checks: the rewriter calls Call(ctx, id, f)(args)
+// where the source calls f(args), so that the arguments are evaluated as before. Under a fail rule f is not called:
+// the results are zero values and the error the rule names. Under fail_after f is called and the caller gets the
+// rule's error instead of f's. f is returned as it is when the plugin is not enabled.
+func Call[F any](ctx context.Context, point string, fn F) F {
+	if !enabled {
+		return fn
+	}
+	callee := reflect.ValueOf(fn)
+	called := reflect.MakeFunc(callee.Type(), func(arguments []reflect.Value) []reflect.Value {
+		rule := faultpoint.Decide(ctx, point)
+		kind := ""
+		if rule != nil {
+			action.Hold(rule)
+			kind = rule.Action.Kind
+		}
+		var results []reflect.Value
+		switch {
+		case kind == "fail":
+			for index := range callee.Type().NumOut() {
+				results = append(results, reflect.Zero(callee.Type().Out(index)))
+			}
+		case callee.Type().IsVariadic():
+			results = callee.CallSlice(arguments)
+		default:
+			results = callee.Call(arguments)
+		}
+		last := len(results) - 1
+		if kind == "fail" || kind == "fail_after" {
+			replaced := reflect.New(callee.Type().Out(last)).Elem()
+			replaced.Set(reflect.ValueOf(injected(rule, point)))
+			results[last] = replaced
+		}
+		err, _ := results[last].Interface().(error)
+		observeCall(ctx, point, rule, err)
+		return results
+	})
+	return called.Interface().(F)
+}
+
+// Failed is the call point of an error check whose call the rewriter cannot hand to Call: it observes the error the
+// call returned and, under a fail_after rule, replaces it, which is all it can do once the call has run; a fail
+// rule, which skips the call, cannot be obeyed there. It reports whether the error is not nil.
 func Failed(ctx context.Context, point string, err *error) bool {
 	if !enabled {
 		return *err != nil
@@ -55,25 +122,13 @@ func Failed(ctx context.Context, point string, err *error) bool {
 		action.Hold(rule)
 	}
 	if rule != nil && rule.Action.Kind == "fail" {
-		var params struct {
-			Error string `json:"error"`
-		}
-		rule.DecodeParams(&params)
-		*err = &injectedError{point: point}
-		if params.Error != "" {
-			registered, found := faultpoint.RegisteredError(params.Error)
-			if !found {
-				faultpoint.Abort("rule %s names unregistered error %q", rule.ID, params.Error)
-			}
-			*err = registered
-		}
+		faultpoint.Abort("rule %s: the call of %s has run before its error is checked, so it fails only with fail_after", rule.ID, point)
 	}
-	if *err == nil {
-		faultpoint.Observe(ctx, point, "ok", 0, rule, nil)
-		return false
+	if rule != nil && rule.Action.Kind == "fail_after" {
+		*err = injected(rule, point)
 	}
-	faultpoint.Observe(ctx, point, "error", 0, rule, map[string]string{"error": faultpoint.ErrorName(*err)})
-	return true
+	observeCall(ctx, point, rule, *err)
+	return *err != nil
 }
 
 // Check is the result of a detector, negated by a negate rule.

@@ -204,6 +204,24 @@ func (w *wirer) wireMethod(call *ast.CallExpr) {
 	call.Args = append([]ast.Expr{receiver}, call.Args...)
 }
 
+// wired is whether the boundary wiring rewrites a call: a call whose arguments or result it wraps, or a method call
+// it hands to an adapter; a call point must not hide such a call from the wiring.
+func wired(info *types.Info, call *ast.CallExpr) bool {
+	if callee, ok := typeutil.Callee(info, call).(*types.Func); ok {
+		_, argument := argumentWrappers[callee.FullName()]
+		_, result := resultWrappers[callee.FullName()]
+		if argument || result {
+			return true
+		}
+	}
+	selector, isSelector := call.Fun.(*ast.SelectorExpr)
+	if !isSelector || info.Selections[selector] == nil || info.Selections[selector].Kind() != types.MethodVal {
+		return false
+	}
+	target, found := methodWrappers[selector.Sel.Name]
+	return found && signatureText(info.Selections[selector].Type().(*types.Signature)) == target.signature
+}
+
 // signatureText is a signature without parameter names, its types qualified by package path.
 func signatureText(signature *types.Signature) string {
 	unnamed := func(tuple *types.Tuple) *types.Tuple {

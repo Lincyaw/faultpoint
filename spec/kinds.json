@@ -46,7 +46,7 @@
   },
   "kinds": {
     "branch": {"actions": ["fail", "delay", "crash"], "outcomes": ["taken", "not_taken"]},
-    "call": {"actions": ["fail", "delay", "crash"], "outcomes": ["ok", "error"], "details": ["error", "value"]},
+    "call": {"actions": ["fail", "fail_after", "delay", "crash"], "outcomes": ["ok", "error"], "details": ["error", "value"]},
     "check": {"actions": ["negate", "delay", "crash"], "outcomes": ["true", "false"]},
     "loop": {"actions": ["delay", "crash"], "outcomes": ["iteration"]},
     "value": {"actions": ["set", "shift", "delay", "crash"], "outcomes": ["observed"]},

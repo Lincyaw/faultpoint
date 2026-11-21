@@ -342,7 +342,7 @@ func (p *placer) post(cursor *astutil.Cursor) bool {
 			node.Results[0] = p.call("Check", p.current().check, node.Results[0])
 		}
 	case *ast.IfStmt:
-		p.placeCondition(node)
+		p.placeCondition(cursor, node)
 	case *ast.ForStmt:
 		p.placeLoop(node, node.Body)
 	case *ast.RangeStmt:
@@ -355,17 +355,77 @@ func (p *placer) post(cursor *astutil.Cursor) bool {
 	return true
 }
 
-// placeCondition makes `err != nil` a call point, which replaces err, and any other condition guarding an error
-// return a branch point.
-func (p *placer) placeCondition(node *ast.IfStmt) {
+// placeCondition makes `err != nil` a call point and any other condition guarding an error return a branch point.
+// The call point goes to the call that produced err when it can be skipped there, so that fail does not run it, and
+// otherwise to the check, which can only replace err once the call has run.
+func (p *placer) placeCondition(cursor *astutil.Cursor, node *ast.IfStmt) {
 	variable := p.errorVariable(node.Cond)
 	switch {
 	case variable != nil && p.placement.Call:
 		point := p.place("call", node, p.anchors[node])
-		node.Cond = p.call("Failed", point, &ast.UnaryExpr{Op: token.AND, X: ast.NewIdent(variable.Name)})
+		if call := p.producingCall(cursor, node, variable); call != nil {
+			call.Fun = p.call("Call", point, call.Fun)
+		} else {
+			node.Cond = p.call("Failed", point, &ast.UnaryExpr{Op: token.AND, X: ast.NewIdent(variable.Name)})
+		}
 	case variable == nil && p.placement.Branch && p.guardsError(node.Body):
 		node.Cond = p.call("Branch", p.place("branch", node, p.anchors[node]), node.Cond)
 	}
+}
+
+// producingCall is the call whose error an `err != nil` checks, in the if's init or in the statement just before
+// it, when the call can be handed to fppoints.Call: the assignment's only value is a call of a function or method
+// value named without side effects, which is no conversion, builtin or inferred generic instance, whose last result
+// is the error, and which the boundary wiring leaves alone. It is nil otherwise.
+func (p *placer) producingCall(cursor *astutil.Cursor, node *ast.IfStmt, variable *ast.Ident) *ast.CallExpr {
+	statement := node.Init
+	if statement == nil && cursor.Index() > 0 {
+		switch parent := cursor.Parent().(type) {
+		case *ast.BlockStmt:
+			statement = parent.List[cursor.Index()-1]
+		case *ast.CaseClause:
+			statement = parent.Body[cursor.Index()-1]
+		case *ast.CommClause:
+			statement = parent.Body[cursor.Index()-1]
+		}
+	}
+	assignment, isAssignment := statement.(*ast.AssignStmt)
+	if !isAssignment || len(assignment.Rhs) != 1 {
+		return nil
+	}
+	call, isCall := assignment.Rhs[0].(*ast.CallExpr)
+	last, isIdent := assignment.Lhs[len(assignment.Lhs)-1].(*ast.Ident)
+	if !isCall || !isIdent || p.info.ObjectOf(last) != p.info.ObjectOf(variable) {
+		return nil
+	}
+	signature, isSignature := p.info.TypeOf(call.Fun).(*types.Signature)
+	if !isSignature || p.info.Types[call.Fun].IsType() || p.info.Types[call.Fun].IsBuiltin() || !plainValue(call.Fun) {
+		return nil
+	}
+	results := signature.Results()
+	if results.Len() != len(assignment.Lhs) || !types.Identical(results.At(results.Len()-1).Type(), errorType) {
+		return nil
+	}
+	named := call.Fun
+	if selector, isSelector := named.(*ast.SelectorExpr); isSelector {
+		named = selector.Sel
+	}
+	if _, generic := p.info.Instances[named.(*ast.Ident)]; generic || wired(p.info, call) {
+		return nil
+	}
+	return call
+}
+
+// plainValue is whether an expression names a value without evaluating anything that could have an effect: an
+// identifier or a selector of one, as in f, pkg.F or s.store.Reserve.
+func plainValue(expression ast.Expr) bool {
+	switch value := expression.(type) {
+	case *ast.Ident:
+		return value.Name != "_"
+	case *ast.SelectorExpr:
+		return plainValue(value.X)
+	}
+	return false
 }
 
 func (p *placer) placeLoop(node ast.Node, body *ast.BlockStmt) {
