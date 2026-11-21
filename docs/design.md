@@ -169,6 +169,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 - 没有接入的系统，由本仓库的 HTTP 边界适配器负责提取和注入这两个请求头。
 - Python 的上下文基于 contextvars，能随协程和线程池传递。Node 使用 OpenTelemetry 基于 AsyncLocalStorage 的上下文管理器；进程尚未登记上下文管理器时，由 SDK 登记。Java 使用 OpenTelemetry API 的 `Context`。Rust 使用 `opentelemetry::Context`，服务端适配器用 `with_context` 把上下文挂到请求的 future 上。
 - Go 必须显式传递 `context.Context`。改写器使用所在函数的 `context.Context` 参数或 `*http.Request` 参数的 `Context()`；找不到时传入 `nil`，这时故障点只匹配 `scope` 为空的规则，观测的范围为空。
+- **范围只限制注入，不限制效应**：一个范围内的注入，可以经由进程内共享的资源影响其他范围的请求，例如连接池、缓存、锁，以及被关闭的长连接。实例：Starlette 对未处理的异常先答一个保持连接的 500，再交给 uvicorn，uvicorn 随即关闭连接；客户端在收到关闭之前，已经把下一个请求写上了这条连接，于是另一个租户的请求失败。比较时，这类效应会出现在其他范围中，它们是真实的跨请求传播，不是噪声。
 
 ## 6. 接入方式
 
