@@ -88,6 +88,7 @@ faultpoint 在被测系统的代码中放置故障点。同一个故障点既能
 | `consume` | 消息消费 | `fail` `delay` `fail_after` `duplicate` `empty`（取不到消息） | `rows` `empty` `error`，消息条数记入 total |
 | `syscall` | 进程的系统调用（eBPF） | `fail`：返回指定的 errno | `ok`，或 errno 名 |
 | `packet` | 容器网络接口上的包（eBPF） | `delay` `drop` | `delayed` `dropped` |
+| `event` | USDT 探针和 tracepoint（eBPF，只观测） | 无 | `fired` |
 
 除 `syscall` 和 `packet` 外，所有类别都还可以执行 `delay` 和 `crash`。`syscall` 不能延迟，因为 eBPF 程序不能在内核探针里睡眠；它可以执行 `crash`：eBPF 程序在系统调用入口向进程发送 SIGKILL，系统调用照常执行，进程在返回用户态时终止，退出状态总是 137，规则中的 `code` 不起作用。`packet` 只作用于网络包，不针对某个进程，因此没有 `crash`。值错误中，只有布尔取反（`negate`）由插桩自动放置；一般的业务计算错误空间大、误报多，因此 `value` 只放在人工标注的、在业务约束上有意义的计算上（金额、配额、时间窗口、版本号），并且只在合法值域内扰动。
 
@@ -304,7 +305,11 @@ eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能
 - **目录是数据**：每条记录对应一个（目标，机制），给出 id、类别、层、注入和观测的机制、目标（文件、build-id、符号、入口和返回指令的地址、克隆）、签名（来自 DWARF 或 BTF）、允许的动作和取值、开销等级、陷入范围（内核点是整台主机，uprobe 是 inode）和安全说明。`spec/kinds.json` 仍是动作的上界，每条记录只列出其机制允许的子集，规则加载时代理按记录检查。
 - **取值带来源**：错误注入名单的类型（ERRNO 为负 errno，NULL 为 0）；LSM 的返回范围；对照运行中观测到的自然结果，这是首选（见第 6.5 节 Redis 断言的教训）；静态分析得到的常量，置信度较低。`bpf_override_return` 和 fmod_ret 都不检查取值（返回 1、-5000、0x7fffffff 的 fmod_ret 程序都能加载），由代理按类型限定。`security_*` 的自然结果总是 0，所以它的取值来自 LSM 的惯例（EACCES、EPERM），或来自调用方的操作本身可能产生的 errno，例如连接的 ECONNREFUSED。
 - **类别**：复用 `call`（整型、errno、指针返回）、`check`（布尔返回）、`branch`（用 ip 写强制条件跳转）、`syscall`、`packet`。非系统调用的内核名单函数和 `security_*` 记为内核层的 `call`。另加一个只观测的类别 `event`（outcome 为 `fired`，没有动作），用于 USDT 和 tracepoint，把上游组件内部的事件作为效果观测，例如 postgres 的 57 个 USDT 名字中有 `transaction__abort` `deadlock__found` `lock__wait__start`。
-- **生成**：eBPF 代理新增只读的 `scan`。它读服务进程映射的可执行文件（ELF 符号、DWARF、`.gopclntab`、`.note.stapsdt`，以及反汇编得到的返回指令和条件跳转）和宿主内核的清单（kallsyms、ftrace 函数表、错误注入名单、BTF），可选地按 build-id 匹配调试符号。选择哪些记录由配置 `ebpf.hooks` 给出，形式与 `placement.scope`（第 6.4 节）相同。
+- **生成**：eBPF 代理新增只读的 `scan`。它读服务进程映射的可执行文件（ELF 符号、DWARF、`.gopclntab`、`.note.stapsdt`，以及反汇编得到的返回指令和条件跳转）和宿主内核的清单（kallsyms、ftrace 函数表、错误注入名单、BTF），可选地按 build-id 在容器内匹配调试文件，包括它的 dwz 补充文件。选择哪些记录由配置 `ebpf.hooks` 给出，形式与 `placement.scope`（第 6.4 节）相同。
+- **身份**：在第 6.5 节的形式上，保证每个定义只有一个 id。
+  - **符号版本**：隐藏的符号版本跟在 `@` 后面，例如 `libc.so.6@<build-id>:realpath@GLIBC_2.2.5`；缺省版本仍用裸名。
+  - **同名局部符号**：几个定义同名时，全局的那个保留名字，局部的各加 `#<链接地址>`，例如 redis-server 里 hiredis 的 `dictFind#207360`。
+  - **内核和事件**：内核函数是 `vmlinux@<build-id>:<函数>`，模块函数是 `<模块>@<模块 build-id>:<函数>`；USDT 是 `<文件>@<build-id>:<provider>:<名字>`；tracepoint 是 `vmlinux@<build-id>:<组>:<名字>`。
 - **先观测，并控制开销**：
   - 系统调用用一个按 cgroup 过滤的 raw_syscalls 退出程序统计（调用号，errno）。
   - 其余内核候选用 fexit 只计数。内核点作用于整台主机：`security_file_open` 上挂一对 fmod_ret 与 fexit，主机上每次打开文件约多付 0.1–0.2 µs。因此观测程序只在对照窗口中挂载，注入程序只在有规则需要时挂载。fexit 在函数体被跳过时也运行，并看到注入的值，所以观测要排除被注入的调用，这些调用只记在规则名下。
@@ -322,7 +327,6 @@ eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能
 **待验证**：
 - `should_fail_bio` 的工作常在 kworker 中执行，要按 bio 的 blkcg 而不是当前进程过滤。
 - 按 pid 过滤的 uprobe 能否跟随 fork。
-- Go 的 `debug/dwarf` 能否读 dwz 补充文件。
 
 ## 7. 配置与运行时
 
@@ -380,7 +384,7 @@ eBPF 能挂载的位置都可以只读地枚举出来，但能挂载不等于能
 | 消息边界 | Redis Streams（经 redis-py） | Redis Streams（经 go-redis） | Redis Streams（经 ioredis） | Redis Streams（经 Lettuce） | Redis Streams（经 redis-rs） | — |
 | 依赖库中的故障点（第 6.4 节） | 已实现，只改写纯 Python 模块；`faultpoint candidates` 列出执行过的候选 | 已实现，模块副本加 `replace` | 已实现 | 已实现 | 已实现，crate 副本加 `[patch]` | — |
 | 原生函数中的故障点（第 6.5 节） | — | — | — | — | — | 已实现：`call`（`fail` `crash`）、`check`（`negate` `crash`），仅 x86-64，内核 6.18 及以上 |
-| eBPF 可挂载点目录（第 6.6 节） | — | — | — | — | — | 规划中 |
+| eBPF 可挂载点目录（第 6.6 节） | — | — | — | — | — | 已实现只读的 `scan` 和 `event` 类别；由记录生成原生函数点、观测全部系统调用尚未实现 |
 | 接入 | 导入钩子 | 构建副本，自动装配边界 | `--import` 加载钩子 | `-javaagent` | 构建副本 | 特权进程 |
 | 未覆盖 | 非 uvicorn 运行的 ASGI 应用 | 依赖内部创建的服务端和客户端；pgx 的 `CopyFrom` `Commit` `Rollback` | 直接使用 undici | WebClient、Feign、Apache HttpClient、OkHttp | reqwest、`query!` 宏、类型化的 Redis 命令方法 | 自然丢包、32 位兼容系统调用、IPv6（未验证） |
 | 只重放置候选故障点（第 6.4 节第 3 步） | 未实现 | 未实现 | 未实现 | 未实现 | 未实现 | — |
