@@ -23,6 +23,8 @@ class KindSpec(BaseModel):
     scope: bool = True
     error_pattern: re.Pattern[str] | None = None
     error_required: bool = False
+    details: tuple[str, ...] = ()
+    """The keys an observation of this kind may carry in its detail."""
 
 
 class KindTable(BaseModel):

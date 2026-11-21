@@ -46,7 +46,7 @@
   },
   "kinds": {
     "branch": {"actions": ["fail", "delay", "crash"], "outcomes": ["taken", "not_taken"]},
-    "call": {"actions": ["fail", "delay", "crash"], "outcomes": ["ok", "error"]},
+    "call": {"actions": ["fail", "delay", "crash"], "outcomes": ["ok", "error"], "details": ["error", "value"]},
     "check": {"actions": ["negate", "delay", "crash"], "outcomes": ["true", "false"]},
     "loop": {"actions": ["delay", "crash"], "outcomes": ["iteration"]},
     "value": {"actions": ["set", "shift", "delay", "crash"], "outcomes": ["observed"]},
@@ -56,33 +56,39 @@
       "actions": ["fail", "fail_after", "duplicate", "delay", "crash"],
       "outcomes": ["2xx", "3xx", "4xx", "5xx", "timeout", "refused", "error"],
       "status": true,
-      "errors": ["timeout", "refused"]
+      "errors": ["timeout", "refused"],
+      "details": ["status", "error", "sent"]
     },
     "rpc_server": {
       "actions": ["fail", "fail_after", "delay", "crash"],
       "outcomes": ["2xx", "3xx", "4xx", "5xx", "error"],
       "status": true,
-      "errors": []
+      "errors": [],
+      "details": ["status", "error", "abandoned"]
     },
     "store_read": {
       "actions": ["fail", "empty", "delay", "crash"],
       "outcomes": ["rows", "empty", "error"],
-      "errors": ["timeout", "refused"]
+      "errors": ["timeout", "refused"],
+      "details": ["error", "code"]
     },
     "store_write": {
       "actions": ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
       "outcomes": ["ok", "error"],
-      "errors": ["timeout", "refused"]
+      "errors": ["timeout", "refused"],
+      "details": ["error", "code"]
     },
     "publish": {
       "actions": ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
       "outcomes": ["ok", "error"],
-      "errors": ["timeout", "refused"]
+      "errors": ["timeout", "refused"],
+      "details": ["error", "code"]
     },
     "consume": {
       "actions": ["fail", "fail_after", "duplicate", "empty", "delay", "crash"],
       "outcomes": ["rows", "empty", "error"],
-      "errors": ["timeout", "refused"]
+      "errors": ["timeout", "refused"],
+      "details": ["error", "code"]
     },
     "syscall": {
       "actions": ["fail", "crash"],
