@@ -64,8 +64,9 @@ def error_detail(error: Exception) -> dict[str, str]:
 
 @functools.lru_cache(maxsize=STATEMENT_CACHE_SIZE)
 def statement_point(sql: str, dialect: str | None) -> tuple[StoreKind, str]:
-    """The kind and locator of a statement or script: the tables it touches and the hash of its shape without
-    literals; it reads only when every statement is a query that writes nowhere in its tree."""
+    """The kind and locator of a statement or script: the tables it touches, not the names of its CTEs, and the
+    hash of its shape without literals; it reads only when every statement is a query that writes nowhere in its
+    tree."""
     token = CLASSIFYING.set(True)
     try:
         # The lenient level classifies a statement sqlglot only partly understands, which the database accepts.
@@ -74,7 +75,8 @@ def statement_point(sql: str, dialect: str | None) -> tuple[StoreKind, str]:
         kind = StoreKind.READ if statements and all(
             isinstance(statement, exp.Query) and statement.find(*WRITING_NODES) is None
             for statement in statements) else StoreKind.WRITE
-        tables = sorted({table.name for statement in statements for table in statement.find_all(exp.Table)})
+        tables = sorted({table.name for statement in statements for table in statement.find_all(exp.Table)
+                         if table.name not in {cte.alias for cte in statement.find_all(exp.CTE)}})
         shape = ";".join(statement.transform(
             lambda node: exp.Placeholder() if isinstance(node, exp.Literal) else node).sql(dialect=dialect)
             for statement in statements)
