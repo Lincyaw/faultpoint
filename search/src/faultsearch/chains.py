@@ -14,6 +14,13 @@ LAYER_PATH_SEPARATOR: Final = " > "
 CROSS_LAYER_KEPT: Final = 300
 
 
+def similarity_order(several_scenarios: bool, similarity: float) -> float:
+    """The last ranking criterion, higher first. A chain whose hops need several scenarios ranks dissimilar clusters
+    first: clusters whose effects differ from one scenario to another are the sign of conditional causality that
+    allocation favours too; other chains rank alike clusters first."""
+    return 1 - similarity if several_scenarios else similarity
+
+
 class Visibility(StrEnum):
     """What the scenarios tested tell of a chain: one of them showed it end to end, none did, or one that did not
     show it injected the first fault in only some repetitions."""
@@ -96,7 +103,8 @@ class Chain(BaseModel):
         return len(set(self.layers)) > 1
 
     def rank(self) -> tuple[bool, int, bool, bool, float]:
-        return self.several_scenarios, len(self.services), self.terminal, self.novel, self.similarity
+        return (self.several_scenarios, len(self.services), self.terminal, self.novel,
+                similarity_order(self.several_scenarios, self.similarity))
 
 
 class Trail(BaseModel):
@@ -121,11 +129,14 @@ class Trail(BaseModel):
         return fmean(allocation.cluster_of[edge.cause.key].similarity for edge in self.edges)
 
     def rank(self, allocation: Allocation) -> tuple[bool, int, bool, float]:
-        return self.several_scenarios(), len(self.services()), self.edges[-1].terminal, self.similarity(allocation)
+        several = self.several_scenarios()
+        order = similarity_order(several, self.similarity(allocation))
+        return several, len(self.services()), self.edges[-1].terminal, order
 
     def promise(self, allocation: Allocation) -> tuple[bool, int, float]:
         """The rank without ending at the user, which extending a chain still open can only reach later."""
-        return self.several_scenarios(), len(self.services()), self.similarity(allocation)
+        several = self.several_scenarios()
+        return several, len(self.services()), similarity_order(several, self.similarity(allocation))
 
 
 class Stitching(BaseModel):
@@ -202,7 +213,8 @@ def beam_search(edges: list[Edge], allocation: Allocation, width: int, max_hops:
 def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[TreatmentRecord],
                   min_count_increase: float) -> list[Chain]:
     """Chains ranked by needing several scenarios, services crossed, ending in a failure the user sees, novelty of
-    their cluster sequence and cluster similarity; novelty is judged against the chains ranked above."""
+    their cluster sequence and the order of their cluster similarity; novelty is judged against the chains ranked
+    above."""
     shown: dict[str, list[tuple[str, set[str]]]] = defaultdict(list)
     unfinished: dict[str, set[str]] = defaultdict(set)
     for record in records:
