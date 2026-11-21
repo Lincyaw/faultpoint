@@ -38,8 +38,8 @@ public final class SpringHttp {
         }
     }
 
-    /** Begin a request and fill the headers it must carry; a fail rule with an error throws here. */
-    public static Object enter(String method, URI uri, Map<String, String> headers) throws IOException {
+    /** Begin a request and fill the headers it must carry. */
+    public static Object enter(String method, URI uri, Map<String, String> headers) {
         int[] depth = DEPTH.get();
         depth[0] += 1;
         Core core = Core.current();
@@ -57,12 +57,6 @@ public final class SpringHttp {
         }
         if (call.action().equals("duplicate")) {
             core.abort("rule " + rule.id() + ": duplicate at " + point + " cannot resend a Spring request, whose body is written once");
-        }
-        if (call.action().equals("fail") && rule.integer("status") == null) {
-            IOException error = boundaryError(rule);
-            core.observe(point, outcome(error), 0, rule, Map.of("error", error.getClass().getName(), "sent", "false"));
-            depth[0] -= 1;
-            throw error;
         }
         CURRENT.set(call);
         return call;
@@ -82,6 +76,8 @@ public final class SpringHttp {
                 result = method.invoke(body, arguments);
             } catch (InvocationTargetException failure) {
                 throw failure.getCause();
+            } catch (IllegalAccessException inaccessible) {
+                throw Core.internalError(inaccessible);
             }
             if (method.getName().equals("writeTo")) {
                 call.written().set(true);
@@ -121,19 +117,26 @@ public final class SpringHttp {
                         case "hashCode" -> System.identityHashCode(proxy);
                         case "equals" -> proxy == arguments[0];
                         case "toString" -> "faultpoint synthetic response " + status;
-                        default -> throw new UnsupportedOperationException("faultpoint synthetic response: " + method.getName());
+                        default -> throw Core.internalError(new UnsupportedOperationException("faultpoint synthetic response: " + method.getName()));
                     });
         } catch (ReflectiveOperationException unavailable) {
             throw new IllegalStateException("faultpoint: cannot build a Spring response", unavailable);
         }
     }
 
-    /** The response a fail rule with a status answers with before the request is sent, or null. */
+    /** What a fail rule answers with in place of sending the request: a response of its status, or without one the
+     * error the exit advice throws; null sends the request. */
     public static Object answered(Object call, Class<?> responseType) {
         if (!(call instanceof Call running) || !running.action().equals("fail")) {
             return null;
         }
-        int status = running.rule().integer("status");
+        Integer status = running.rule().integer("status");
+        if (status == null) {
+            IOException error = boundaryError(running.rule());
+            Core.current().observe(running.point(), outcome(error), 0, running.rule(),
+                    Map.of("error", error.getClass().getName(), "sent", "false"));
+            return error;
+        }
         Core.current().observe(running.point(), (status / 100) + "xx", 0, running.rule(),
                 Map.of("status", String.valueOf(status), "sent", "false"));
         return synthetic(responseType, status);

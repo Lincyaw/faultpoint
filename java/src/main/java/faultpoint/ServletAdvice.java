@@ -18,7 +18,7 @@ final class ServletAdvice {
 
     private ServletAdvice() {}
 
-    @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class)
+    @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
     static boolean enter(@Advice.Argument(0) ServletRequest request, @Advice.Argument(1) ServletResponse response,
                          @Advice.Local("entry") ServletBoundary.Entry entry) {
         if (!(request instanceof HttpServletRequest http) || !(response instanceof HttpServletResponse answer)) {
@@ -40,7 +40,7 @@ final class ServletAdvice {
     /** The request ran; when nothing it did made its status known, the status it leaves is where fail_after is
      * decided, as long as it did not fail and its answer is not yet written. A request that went asynchronous is
      * observed when it completes. */
-    @Advice.OnMethodExit(onThrowable = Throwable.class)
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     static void exit(@Advice.Argument(0) ServletRequest request, @Advice.Argument(1) ServletResponse response,
                      @Advice.Local("entry") ServletBoundary.Entry entry, @Advice.Thrown Throwable thrown)
             throws ReflectiveOperationException {
@@ -65,7 +65,7 @@ final class ServletAdvice {
     static final class Status {
         private Status() {}
 
-        @Advice.OnMethodEnter
+        @Advice.OnMethodEnter(suppress = Throwable.class)
         static void enter(@Advice.This Object response, @Advice.Argument(value = 0, readOnly = false) int status)
                 throws ReflectiveOperationException {
             status = ServletBoundary.answering(response, status);
@@ -76,7 +76,7 @@ final class ServletAdvice {
     static final class Error {
         private Error() {}
 
-        @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class)
+        @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
         static boolean enter(@Advice.This Object response, @Advice.Argument(0) int status) throws ReflectiveOperationException {
             return ServletBoundary.answering(response, status) != status;
         }
@@ -86,7 +86,7 @@ final class ServletAdvice {
     static final class Redirect {
         private Redirect() {}
 
-        @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class)
+        @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
         static boolean enter(@Advice.This HttpServletResponse response) throws ReflectiveOperationException {
             int answered = ServletBoundary.answering(response, HttpServletResponse.SC_FOUND);
             if (answered != HttpServletResponse.SC_FOUND) {
@@ -101,7 +101,7 @@ final class ServletAdvice {
     static final class Body {
         private Body() {}
 
-        @Advice.OnMethodEnter
+        @Advice.OnMethodEnter(suppress = Throwable.class)
         static void enter(@Advice.This HttpServletResponse response) throws ReflectiveOperationException {
             int status = response.getStatus();
             int answered = ServletBoundary.answering(response, status);
@@ -116,7 +116,7 @@ final class ServletAdvice {
     static final class Writer {
         private Writer() {}
 
-        @Advice.OnMethodEnter
+        @Advice.OnMethodEnter(suppress = Throwable.class)
         static void enter(@Advice.This HttpServletResponse response) throws ReflectiveOperationException {
             int status = response.getStatus();
             int answered = ServletBoundary.answering(response, status);
@@ -125,7 +125,7 @@ final class ServletAdvice {
             }
         }
 
-        @Advice.OnMethodExit
+        @Advice.OnMethodExit(suppress = Throwable.class)
         static void exit(@Advice.Return(readOnly = false) PrintWriter writer) {
             if (ServletBoundary.replaced()) {
                 writer = new PrintWriter(java.io.Writer.nullWriter());
@@ -138,7 +138,7 @@ final class ServletAdvice {
     static final class Dropped {
         private Dropped() {}
 
-        @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class)
+        @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
         static boolean enter() {
             return ServletBoundary.replaced();
         }

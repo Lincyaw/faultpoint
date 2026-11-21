@@ -119,11 +119,11 @@ public final class Placement implements ClassFileTransformer {
         if (target == null) {
             return null;
         }
+        // The JVM ignores an exception of a transformer and loads the class as it was, without its points.
         try {
             return rewrite(classfile, loader, target);
-        } catch (RuntimeException failure) {
-            System.err.println("faultpoint: cannot rewrite " + internalName + ": " + failure);
-            return null;
+        } catch (RuntimeException | Error failure) {
+            throw Core.internalError(new IllegalStateException("cannot rewrite " + internalName, failure));
         }
     }
 

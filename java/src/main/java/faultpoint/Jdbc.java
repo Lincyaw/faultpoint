@@ -114,8 +114,8 @@ public final class Jdbc {
         });
     }
 
-    /** One outermost execution under its rule. */
-    public record Execution(String point, String kind, Rule rule, long started) {
+    /** One outermost execution under its rule; injected is the error a fail rule answers with, or null. */
+    public record Execution(String point, String kind, Rule rule, long started, SQLException injected) {
         String action() {
             return rule == null ? "" : rule.kind();
         }
@@ -134,7 +134,8 @@ public final class Jdbc {
         }
     }
 
-    /** Enter a statement execution; a fail rule throws here, before the driver runs. */
+    /** Enter a statement execution; a fail rule's error is made here, so that the driver does not run and the exit
+     * advice throws it. */
     public static Object enter(Object statement, Object[] arguments) throws SQLException {
         int[] depth = DEPTH.get();
         depth[0] += 1;
@@ -150,14 +151,12 @@ public final class Jdbc {
         if (rule != null) {
             Points.hold(core, rule);
         }
-        Execution execution = new Execution(point, kind.kind(), rule, System.nanoTime());
-        if (execution.action().equals("fail")) {
-            depth[0] -= 1;
-            SQLException injected = injectedError(statement, rule, "faultpoint: injected store failure");
+        SQLException injected = rule != null && rule.kind().equals("fail")
+                ? injectedError(statement, rule, "faultpoint: injected store failure") : null;
+        if (injected != null) {
             core.observe(point, "error", 0, rule, failureDetail(injected));
-            throw injected;
         }
-        return execution;
+        return new Execution(point, kind.kind(), rule, System.nanoTime(), injected);
     }
 
     /** The error a fail or fail_after rule raises. With a code it is the driver's own error for a server error of that
@@ -216,9 +215,11 @@ public final class Jdbc {
         return sql;
     }
 
-    /** The value a dropped write returns without reaching the database: one row affected. */
-    public static Object dropped(Object execution) {
-        return execution instanceof Execution running && running.action().equals("drop") ? Boolean.TRUE : null;
+    /** Whether the driver is skipped: for a dropped write, which returns one row affected without reaching the database,
+     * and for a fail rule's error; null runs it. */
+    public static Object skipped(Object execution) {
+        return execution instanceof Execution running && (running.action().equals("drop") || running.injected() != null)
+                ? Boolean.TRUE : null;
     }
 
     private static Object droppedResult(Class<?> type) {
@@ -234,14 +235,17 @@ public final class Jdbc {
         return type == long[].class ? new long[] {1} : new int[] {1};
     }
 
-    public static Outcome exit(Object execution, Object statement, Method method, Object[] arguments, Object dropped,
+    public static Outcome exit(Object execution, Object statement, Method method, Object[] arguments, Object skipped,
                                Object returned, Throwable thrown) throws SQLException {
         DEPTH.get()[0] -= 1;
         if (!(execution instanceof Execution running)) {
             return new Outcome(returned, thrown);
         }
+        if (running.injected() != null) {
+            return new Outcome(returned, running.injected());
+        }
         Core core = Core.current();
-        if (dropped != null) {
+        if (skipped != null) {
             core.observe(running.point(), "ok", 1, running.rule(), Map.of());
             return new Outcome(droppedResult(method.getReturnType()), null);
         }
@@ -252,7 +256,7 @@ public final class Jdbc {
             } catch (InvocationTargetException failure) {
                 thrown = failure.getCause();
             } catch (IllegalAccessException inaccessible) {
-                throw new IllegalStateException(inaccessible);
+                throw Core.internalError(inaccessible);
             } finally {
                 DEPTH.get()[0] -= 1;
             }
@@ -295,27 +299,32 @@ public final class Jdbc {
             int seen;
             boolean recorded;
 
+            /** The driver's result set answers, and its errors reach the application; counting the rows is the agent's
+             * own work, whose error stops the process. */
             @Override
             public Object invoke(Object proxy, Method method, Object[] arguments) throws Throwable {
-                if (method.getName().equals("next") && execution.action().equals("empty")) {
-                    record();
-                    return false;
-                }
                 Object result;
                 try {
-                    result = method.invoke(rows, arguments);
+                    result = method.getName().equals("next") && execution.action().equals("empty") ? Boolean.FALSE
+                            : method.invoke(rows, arguments);
                 } catch (InvocationTargetException failure) {
                     throw failure.getCause();
+                } catch (IllegalAccessException inaccessible) {
+                    throw Core.internalError(inaccessible);
                 }
-                if (method.getName().equals("next")) {
-                    if ((Boolean) result) {
-                        seen += 1;
-                    } else {
+                try {
+                    if (method.getName().equals("next")) {
+                        if ((Boolean) result) {
+                            seen += 1;
+                        } else {
+                            record();
+                        }
+                    }
+                    if (method.getName().equals("close")) {
                         record();
                     }
-                }
-                if (method.getName().equals("close")) {
-                    record();
+                } catch (RuntimeException | Error unexpected) {
+                    throw Core.internalError(unexpected);
                 }
                 return result;
             }

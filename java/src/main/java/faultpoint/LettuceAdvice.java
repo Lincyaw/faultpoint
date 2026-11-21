@@ -12,7 +12,7 @@ final class LettuceAdvice {
 
     private LettuceAdvice() {}
 
-    @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class)
+    @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
     static Object enter(@Advice.Argument(0) RedisCommand<?, ?, ?> command, @Advice.Local("call") Object call) {
         call = Lettuce.enter(new String(command.getType().getBytes(), StandardCharsets.US_ASCII),
                 command.getArgs() == null ? null : command.getArgs().getFirstEncodedKey(), RedisCommandExecutionException.class);
@@ -30,7 +30,7 @@ final class LettuceAdvice {
         return null;
     }
 
-    @Advice.OnMethodExit
+    @Advice.OnMethodExit(suppress = Throwable.class)
     static void exit(@Advice.Argument(0) RedisCommand<?, ?, ?> command, @Advice.Local("call") Object call,
                      @Advice.Enter Object answered,
                      @Advice.Return(readOnly = false, typing = Assigner.Typing.DYNAMIC) Object returned) {

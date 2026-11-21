@@ -17,7 +17,8 @@ import java.util.function.Predicate;
  * semantics lives in the plugins, which declare the kinds they serve and the actions they implement. */
 public final class Core {
 
-    static final int INVALID_RULES_EXIT = 70;
+    /** The exit status of a process faultpoint stops, for rules it cannot obey or an error of its own. */
+    static final int ABORT_EXIT = 70;
 
     /** One execution of a point, as the core hands it to the observation sink; the detail tells executions of one
      * outcome apart by bounded values under the keys spec/kinds.json gives the kind. */
@@ -227,9 +228,23 @@ public final class Core {
         Runtime.getRuntime().halt(code);
     }
 
-    /** End the process when rules cannot be obeyed, so that no experiment runs under rules it did not ask for. */
+    /** End the process when rules cannot be obeyed, so that no experiment runs under rules it did not ask for; what was
+     * observed is written first, and the process stops even when writing it fails. */
     public void abort(String reason) {
-        System.err.println("faultpoint: " + reason + "; stopping the process");
-        crash(INVALID_RULES_EXIT);
+        try {
+            flush();
+        } finally {
+            System.err.println("faultpoint: " + reason + "; stopping the process");
+            Runtime.getRuntime().halt(ABORT_EXIT);
+        }
+    }
+
+    /** End the process for an error of faultpoint's own code, which ran inside the application or while a class
+     * loaded, so that the error neither changes what the application does nor leaves its points silently inert. The
+     * process stops before this returns; the error it returns only lets a caller end its control flow with throw. */
+    public static Error internalError(Throwable error) {
+        error.printStackTrace();
+        current().abort("internal error: " + error);
+        return new AssertionError("faultpoint stopped the process", error);
     }
 }

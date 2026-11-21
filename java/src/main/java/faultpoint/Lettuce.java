@@ -99,23 +99,26 @@ public final class Lettuce {
                 ? null : "code " + code + " at " + rule.point() + " is not the prefix of a Redis error reply, an upper-case word";
     }
 
-    /** Observe a sent command's reply when it completes. */
+    /** Observe a sent command's reply when it completes, on a thread of Lettuce, whose future would keep an error of
+     * the observing to itself. */
     public static void observe(Object call, Object command) {
         if (!(call instanceof Call running) || answered(running) || !(command instanceof CompletionStage<?> reply)) {
             return;
         }
         reply.whenComplete((value, error) -> {
-            String outcome;
-            if (error != null) {
-                outcome = "error";
-            } else if (running.command().empty() == null) {
-                outcome = "ok";
-            } else {
-                outcome = RedisCommands.empty(running.command(), value) ? "empty" : "rows";
-            }
             try (Scope ignored = running.context().makeCurrent()) {
+                String outcome;
+                if (error != null) {
+                    outcome = "error";
+                } else if (running.command().empty() == null) {
+                    outcome = "ok";
+                } else {
+                    outcome = RedisCommands.empty(running.command(), value) ? "empty" : "rows";
+                }
                 Core.current().observe(running.point(), outcome, (System.nanoTime() - running.started()) / 1e6, running.rule(),
                         error == null ? Map.of() : running.failureDetail(error));
+            } catch (RuntimeException | Error unexpected) {
+                throw Core.internalError(unexpected);
             }
         });
     }

@@ -5,7 +5,9 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
-/** The point functions placed code calls; the value comes first so that bytecode passes it on the stack. */
+/** The point functions placed code calls; the value comes first so that bytecode passes it on the stack. Each runs
+ * only the agent's own code, and throws only the checked exception a fail rule injects; any other error of it stops
+ * the process through Core.internalError instead of reaching the application. */
 public final class Points {
 
     private Points() {}
@@ -27,65 +29,81 @@ public final class Points {
 
     /** Whether a guarded error path runs: its natural condition, or forced by a fail rule. */
     public static boolean branch(boolean taken, String point) {
-        Core core = Core.current();
-        if (!core.enabled()) {
+        try {
+            Core core = Core.current();
+            if (!core.enabled()) {
+                return taken;
+            }
+            Rule rule = core.decide(point);
+            if (rule != null) {
+                hold(core, rule);
+                taken = taken || rule.kind().equals("fail");
+            }
+            core.observe(point, taken ? "taken" : "not_taken", 0, rule, Map.of());
             return taken;
+        } catch (RuntimeException | Error unexpected) {
+            throw Core.internalError(unexpected);
         }
-        Rule rule = core.decide(point);
-        if (rule != null) {
-            hold(core, rule);
-            taken = taken || rule.kind().equals("fail");
-        }
-        core.observe(point, taken ? "taken" : "not_taken", 0, rule, Map.of());
-        return taken;
     }
 
     /** The result of a detector, negated by a negate rule. */
     public static boolean check(boolean result, String point) {
-        Core core = Core.current();
-        if (!core.enabled()) {
+        try {
+            Core core = Core.current();
+            if (!core.enabled()) {
+                return result;
+            }
+            Rule rule = core.decide(point);
+            if (rule != null) {
+                hold(core, rule);
+                result = result != rule.kind().equals("negate");
+            }
+            core.observe(point, result ? "true" : "false", 0, rule, Map.of());
             return result;
+        } catch (RuntimeException | Error unexpected) {
+            throw Core.internalError(unexpected);
         }
-        Rule rule = core.decide(point);
-        if (rule != null) {
-            hold(core, rule);
-            result = result != rule.kind().equals("negate");
-        }
-        core.observe(point, result ? "true" : "false", 0, rule, Map.of());
-        return result;
     }
 
     /** One iteration of a loop, delayed by a delay rule to model contention. */
     public static void loop(String point) {
-        Core core = Core.current();
-        if (!core.enabled()) {
-            return;
+        try {
+            Core core = Core.current();
+            if (!core.enabled()) {
+                return;
+            }
+            Rule rule = core.decide(point);
+            if (rule != null) {
+                hold(core, rule);
+            }
+            core.observe(point, "iteration", 0, rule, Map.of());
+        } catch (RuntimeException | Error unexpected) {
+            throw Core.internalError(unexpected);
         }
-        Rule rule = core.decide(point);
-        if (rule != null) {
-            hold(core, rule);
-        }
-        core.observe(point, "iteration", 0, rule, Map.of());
     }
 
     /** A business value, replaced by a set rule or offset by a shift rule. */
     public static double value(double observed, String point) {
-        Core core = Core.current();
-        if (!core.enabled()) {
-            return observed;
+        try {
+            Core core = Core.current();
+            if (!core.enabled()) {
+                return observed;
+            }
+            Rule rule = core.decide(point);
+            double result = observed;
+            if (rule != null) {
+                hold(core, rule);
+                result = switch (rule.kind()) {
+                    case "set" -> rule.number("value");
+                    case "shift" -> observed + rule.number("amount");
+                    default -> observed;
+                };
+            }
+            core.observe(point, "observed", result, rule, Map.of());
+            return result;
+        } catch (RuntimeException | Error unexpected) {
+            throw Core.internalError(unexpected);
         }
-        Rule rule = core.decide(point);
-        double result = observed;
-        if (rule != null) {
-            hold(core, rule);
-            result = switch (rule.kind()) {
-                case "set" -> rule.number("value");
-                case "shift" -> observed + rule.number("amount");
-                default -> observed;
-            };
-        }
-        core.observe(point, "observed", result, rule, Map.of());
-        return result;
     }
 
     private static Rule shift(String point) {
@@ -100,35 +118,47 @@ public final class Points {
 
     /** A clock reading in epoch milliseconds, moved by a shift rule's seconds. */
     public static long clock(long reading, String point) {
-        if (!Core.current().enabled()) {
-            return reading;
+        try {
+            if (!Core.current().enabled()) {
+                return reading;
+            }
+            Rule rule = shift(point);
+            return rule == null ? reading : reading + (long) (rule.number("amount") * 1000);
+        } catch (RuntimeException | Error unexpected) {
+            throw Core.internalError(unexpected);
         }
-        Rule rule = shift(point);
-        return rule == null ? reading : reading + (long) (rule.number("amount") * 1000);
     }
 
     /** A clock reading, moved by a shift rule's seconds. */
     public static Instant clock(Instant reading, String point) {
-        if (!Core.current().enabled()) {
-            return reading;
+        try {
+            if (!Core.current().enabled()) {
+                return reading;
+            }
+            Rule rule = shift(point);
+            return rule == null ? reading : reading.plusMillis((long) (rule.number("amount") * 1000));
+        } catch (RuntimeException | Error unexpected) {
+            throw Core.internalError(unexpected);
         }
-        Rule rule = shift(point);
-        return rule == null ? reading : reading.plusMillis((long) (rule.number("amount") * 1000));
     }
 
     /** Whether a resource was acquired: its natural outcome, or rejected by a fail rule. */
     public static boolean acquire(boolean acquired, String point) {
-        Core core = Core.current();
-        if (!core.enabled()) {
+        try {
+            Core core = Core.current();
+            if (!core.enabled()) {
+                return acquired;
+            }
+            Rule rule = core.decide(point);
+            if (rule != null) {
+                hold(core, rule);
+                acquired = acquired && !rule.kind().equals("fail");
+            }
+            core.observe(point, acquired ? "acquired" : "rejected", 0, rule, Map.of());
             return acquired;
+        } catch (RuntimeException | Error unexpected) {
+            throw Core.internalError(unexpected);
         }
-        Rule rule = core.decide(point);
-        if (rule != null) {
-            hold(core, rule);
-            acquired = acquired && !rule.kind().equals("fail");
-        }
-        core.observe(point, acquired ? "acquired" : "rejected", 0, rule, Map.of());
-        return acquired;
     }
 
     /** A call in progress: the rule decided before it, or null, and the checked exception its callee declares. */
@@ -141,20 +171,26 @@ public final class Points {
     /** Before a call whose callee declares a checked exception: a fail rule throws that exception here, so the
      * callee does not run. */
     public static void call(String point, Class<?> declared) throws Exception {
-        Core core = Core.current();
-        if (!core.enabled()) {
-            return;
-        }
-        Rule rule = core.decide(point, Core.ACTS_BEFORE);
-        if (rule != null) {
-            hold(core, rule);
-        }
-        if (rule != null && rule.kind().equals("fail")) {
-            Exception injected = declaredException(declared, point);
+        Exception injected;
+        try {
+            Core core = Core.current();
+            if (!core.enabled()) {
+                return;
+            }
+            Rule rule = core.decide(point, Core.ACTS_BEFORE);
+            if (rule != null) {
+                hold(core, rule);
+            }
+            if (rule == null || !rule.kind().equals("fail")) {
+                CALLS.get().push(new Pending(rule, declared));
+                return;
+            }
+            injected = declaredException(declared, point);
             core.observe(point, "error", 0, rule, Map.of("error", injected.getClass().getName()));
-            throw injected;
+        } catch (RuntimeException | Error | ReflectiveOperationException unexpected) {
+            throw Core.internalError(unexpected);
         }
-        CALLS.get().push(new Pending(rule, declared));
+        throw injected;
     }
 
     private static Exception declaredException(Class<?> declared, String point) throws ReflectiveOperationException {
@@ -170,26 +206,36 @@ public final class Points {
     /** After a call returned: a fail_after rule decided now, which only a call that returned counts against its
      * trigger, throws the exception the callee declares in place of its result. */
     public static void returned(String point) throws Exception {
-        Core core = Core.current();
-        if (!core.enabled()) {
-            return;
-        }
-        Pending pending = CALLS.get().pop();
-        Rule replacing = core.decide(point, Core.ACTS_AFTER);
-        if (replacing != null) {
-            Exception injected = declaredException(pending.declared(), point);
+        Exception injected;
+        try {
+            Core core = Core.current();
+            if (!core.enabled()) {
+                return;
+            }
+            Pending pending = CALLS.get().pop();
+            Rule replacing = core.decide(point, Core.ACTS_AFTER);
+            if (replacing == null) {
+                core.observe(point, "ok", 0, pending.rule(), Map.of());
+                return;
+            }
+            injected = declaredException(pending.declared(), point);
             core.observe(point, "error", 0, replacing, Map.of("error", injected.getClass().getName()));
-            throw injected;
+        } catch (RuntimeException | Error | ReflectiveOperationException unexpected) {
+            throw Core.internalError(unexpected);
         }
-        core.observe(point, "ok", 0, pending.rule(), Map.of());
+        throw injected;
     }
 
     /** After a call threw: its own failure is observed under the rule decided before the call and not replaced, so
      * a fail_after rule neither claims nor counts it. */
     public static void raised(Throwable error, String point) {
-        Core core = Core.current();
-        if (core.enabled()) {
-            core.observe(point, "error", 0, CALLS.get().pop().rule(), Map.of("error", error.getClass().getName()));
+        try {
+            Core core = Core.current();
+            if (core.enabled()) {
+                core.observe(point, "error", 0, CALLS.get().pop().rule(), Map.of("error", error.getClass().getName()));
+            }
+        } catch (RuntimeException | Error unexpected) {
+            throw Core.internalError(unexpected);
         }
     }
 

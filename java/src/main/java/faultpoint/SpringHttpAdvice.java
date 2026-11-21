@@ -14,8 +14,8 @@ final class SpringHttpAdvice {
 
     private SpringHttpAdvice() {}
 
-    @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class)
-    static Object enter(@Advice.This ClientHttpRequest request, @Advice.Local("call") Object call) throws IOException {
+    @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
+    static Object enter(@Advice.This ClientHttpRequest request, @Advice.Local("call") Object call) {
         Map<String, String> headers = new HashMap<>();
         call = SpringHttp.enter(request.getMethod().name(), request.getURI(), headers);
         for (Map.Entry<String, String> header : headers.entrySet()) {
@@ -24,15 +24,26 @@ final class SpringHttpAdvice {
         return SpringHttp.answered(call, ClientHttpResponse.class);
     }
 
-    @Advice.OnMethodExit(onThrowable = Throwable.class)
+    /** A status the response cannot tell is the request's failure, which the application meets when it reads it. */
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     static void exit(@Advice.Local("call") Object call, @Advice.Enter Object answered,
                      @Advice.Return(readOnly = false, typing = Assigner.Typing.DYNAMIC) Object response,
-                     @Advice.Thrown(readOnly = false) Throwable thrown) throws IOException {
-        if (answered != null) {
+                     @Advice.Thrown(readOnly = false) Throwable thrown) {
+        if (answered instanceof Throwable failure) {
+            thrown = failure;
+        } else if (answered != null) {
             response = answered;
         }
-        int status = thrown == null && response != null ? ((ClientHttpResponse) response).getStatusCode().value() : 0;
-        Object replacement = SpringHttp.exit(call, ClientHttpResponse.class, answered, status, thrown);
+        Throwable failed = thrown;
+        int status = 0;
+        if (failed == null && response != null) {
+            try {
+                status = ((ClientHttpResponse) response).getStatusCode().value();
+            } catch (IOException unreadable) {
+                failed = unreadable;
+            }
+        }
+        Object replacement = SpringHttp.exit(call, ClientHttpResponse.class, answered, status, failed);
         if (replacement != null) {
             ((ClientHttpResponse) response).close();
         }
@@ -49,7 +60,7 @@ final class SpringHttpAdvice {
     static final class Streaming {
         private Streaming() {}
 
-        @Advice.OnMethodEnter
+        @Advice.OnMethodEnter(suppress = Throwable.class)
         static void enter(@Advice.Argument(value = 1, readOnly = false) StreamingHttpOutputMessage.Body body) {
             body = (StreamingHttpOutputMessage.Body) SpringHttp.watched(body, StreamingHttpOutputMessage.Body.class);
         }

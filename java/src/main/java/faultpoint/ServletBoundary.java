@@ -173,7 +173,7 @@ public final class ServletBoundary {
     }
 
     /** A jakarta AsyncListener, made through the servlet's class loader, that observes an asynchronous request when
-     * it completes, in the request's context. */
+     * it completes, in the request's context; the container calls it, and an error of it stops the process. */
     public static Object listener(Entry entry, Class<?> listenerType, Object request, Object response) throws ReflectiveOperationException {
         ClassLoader servlet = listenerType.getClassLoader();
         Method getAttribute = Class.forName("jakarta.servlet.ServletRequest", false, servlet).getMethod("getAttribute", String.class);
@@ -181,30 +181,34 @@ public final class ServletBoundary {
         boolean[] timedOut = {false};
         Throwable[] failure = {null};
         return Proxy.newProxyInstance(servlet, new Class<?>[] {listenerType}, (proxy, method, arguments) -> {
-            switch (method.getName()) {
-                case "onTimeout" -> timedOut[0] = true;
-                case "onError" -> failure[0] = (Throwable) arguments[0].getClass().getMethod("getThrowable").invoke(arguments[0]);
-                case "onStartAsync" -> {
-                    Method getAsyncContext = arguments[0].getClass().getMethod("getAsyncContext");
-                    getAsyncContext.getReturnType().getMethod("addListener", listenerType)
-                            .invoke(getAsyncContext.invoke(arguments[0]), proxy);
-                }
-                case "onComplete" -> {
-                    try (Scope ignored = entry.context().makeCurrent()) {
-                        observe(entry, (Integer) getStatus.invoke(response), failure[0], timedOut[0]
-                                || clientAborted(failure[0]) || clientAborted(getAttribute.invoke(request, RESOLVED_EXCEPTION)), entry.rule());
+            try {
+                switch (method.getName()) {
+                    case "onTimeout" -> timedOut[0] = true;
+                    case "onError" -> failure[0] = (Throwable) arguments[0].getClass().getMethod("getThrowable").invoke(arguments[0]);
+                    case "onStartAsync" -> {
+                        Method getAsyncContext = arguments[0].getClass().getMethod("getAsyncContext");
+                        getAsyncContext.getReturnType().getMethod("addListener", listenerType)
+                                .invoke(getAsyncContext.invoke(arguments[0]), proxy);
                     }
+                    case "onComplete" -> {
+                        try (Scope ignored = entry.context().makeCurrent()) {
+                            observe(entry, (Integer) getStatus.invoke(response), failure[0], timedOut[0]
+                                    || clientAborted(failure[0]) || clientAborted(getAttribute.invoke(request, RESOLVED_EXCEPTION)), entry.rule());
+                        }
+                    }
+                    case "hashCode" -> {
+                        return System.identityHashCode(proxy);
+                    }
+                    case "equals" -> {
+                        return proxy == arguments[0];
+                    }
+                    case "toString" -> {
+                        return "faultpoint async listener";
+                    }
+                    default -> throw new UnsupportedOperationException("faultpoint async listener: " + method.getName());
                 }
-                case "hashCode" -> {
-                    return System.identityHashCode(proxy);
-                }
-                case "equals" -> {
-                    return proxy == arguments[0];
-                }
-                case "toString" -> {
-                    return "faultpoint async listener";
-                }
-                default -> throw new UnsupportedOperationException("faultpoint async listener: " + method.getName());
+            } catch (Throwable unexpected) {
+                throw Core.internalError(unexpected);
             }
             return null;
         });

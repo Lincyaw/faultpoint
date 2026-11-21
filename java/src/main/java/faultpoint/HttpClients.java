@@ -183,19 +183,23 @@ public final class HttpClients {
         return response;
     }
 
+    /** The client's own calls, whose exceptions are the application's, between the agent's work. */
     public static <T> HttpResponse<T> send(HttpClient client, HttpRequest request, HttpResponse.BodyHandler<T> handler)
             throws IOException, InterruptedException {
         Core core = Core.current();
         if (!core.enabled()) {
             return client.send(request, handler);
         }
-        Call call = begin(request);
+        Call call = own(() -> {
+            Call begun = begin(request);
+            if (begun.rule() != null) {
+                Points.hold(core, begun.rule());
+            }
+            return begun;
+        });
         String kind = call.rule() == null ? "" : call.rule().kind();
-        if (call.rule() != null) {
-            Points.hold(core, call.rule());
-        }
         if (kind.equals("fail")) {
-            return failure(call, call.rule());
+            return own(() -> failure(call, call.rule()));
         }
         HttpResponse<T> response;
         try {
@@ -204,27 +208,35 @@ public final class HttpClients {
                 response = client.send(call.request(), handler);
             }
         } catch (IOException failure) {
-            core.observe(call.point(), outcome(failure), call.elapsed(), call.rule(), failureDetail(failure, call.sent()));
+            own(() -> {
+                core.observe(call.point(), outcome(failure), call.elapsed(), call.rule(), failureDetail(failure, call.sent()));
+                return null;
+            });
             throw failure;
         }
-        return answered(call, response);
+        HttpResponse<T> received = response;
+        return own(() -> answered(call, received));
     }
 
+    /** The client's own calls, whose failures are the application's, between the agent's work, which runs on the
+     * client's threads once the request is sent. */
     public static <T> CompletableFuture<HttpResponse<T>> sendAsync(HttpClient client, HttpRequest request,
                                                                    HttpResponse.BodyHandler<T> handler) {
         Core core = Core.current();
         if (!core.enabled()) {
             return client.sendAsync(request, handler);
         }
-        Call call = begin(request);
+        Call call = unchecked(() -> begin(request));
         Rule rule = call.rule();
         String kind = rule == null ? "" : rule.kind();
-        if (kind.equals("crash")) {
-            Points.hold(core, rule);
-        }
-        CompletableFuture<Void> ready = kind.equals("delay")
-                ? CompletableFuture.runAsync(() -> {}, CompletableFuture.delayedExecutor((long) rule.number("ms"), TimeUnit.MILLISECONDS))
-                : CompletableFuture.completedFuture(null);
+        CompletableFuture<Void> ready = unchecked(() -> {
+            if (kind.equals("crash")) {
+                Points.hold(core, rule);
+            }
+            return kind.equals("delay")
+                    ? CompletableFuture.runAsync(() -> {}, CompletableFuture.delayedExecutor((long) rule.number("ms"), TimeUnit.MILLISECONDS))
+                    : CompletableFuture.completedFuture(null);
+        });
         return ready.thenCompose(ignored -> {
             if (kind.equals("fail")) {
                 return CompletableFuture.supplyAsync(() -> null).thenApply(nothing -> {
@@ -240,8 +252,11 @@ public final class HttpClients {
             return sent.handle((response, failure) -> {
                 try (Scope scope = call.context().makeCurrent()) {
                     if (failure != null) {
-                        Throwable cause = failure.getCause() == null ? failure : failure.getCause();
-                        core.observe(call.point(), outcome(cause), call.elapsed(), rule, failureDetail(cause, call.sent()));
+                        unchecked(() -> {
+                            Throwable cause = failure.getCause() == null ? failure : failure.getCause();
+                            core.observe(call.point(), outcome(cause), call.elapsed(), rule, failureDetail(cause, call.sent()));
+                            return null;
+                        });
                         throw new java.util.concurrent.CompletionException(failure);
                     }
                     return unchecked(() -> answered(call, response));
@@ -250,13 +265,24 @@ public final class HttpClients {
         });
     }
 
+    /** The agent's own work for a request, whose IOException is the failure a rule injects. */
     private interface Failing<T> {
         T get() throws IOException;
     }
 
-    private static <T> T unchecked(Failing<T> body) {
+    /** Run the agent's own work: any error of it other than an injected failure stops the process. */
+    private static <T> T own(Failing<T> work) throws IOException {
         try {
-            return body.get();
+            return work.get();
+        } catch (RuntimeException | Error unexpected) {
+            throw Core.internalError(unexpected);
+        }
+    }
+
+    /** Run the agent's own work in a future of the client, which fails with an injected failure. */
+    private static <T> T unchecked(Failing<T> work) {
+        try {
+            return own(work);
         } catch (IOException failure) {
             throw new java.util.concurrent.CompletionException(failure);
         }

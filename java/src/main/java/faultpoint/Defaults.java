@@ -27,9 +27,12 @@ final class Defaults {
 
     private Defaults() {}
 
+    /** A thread of the agent's own, whose error stops the process rather than ending the thread alone, which would
+     * leave observations unwritten or rules unread. */
     static Thread daemon(String name, Runnable body) {
         Thread thread = new Thread(body, name);
         thread.setDaemon(true);
+        thread.setUncaughtExceptionHandler((ended, error) -> Core.internalError(error));
         thread.start();
         return thread;
     }

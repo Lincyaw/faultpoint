@@ -9,19 +9,19 @@ final class JdbcAdvice {
 
     private JdbcAdvice() {}
 
-    @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class)
+    @Advice.OnMethodEnter(skipOn = Advice.OnNonDefaultValue.class, suppress = Throwable.class)
     static Object enter(@Advice.This Object statement, @Advice.AllArguments Object[] arguments,
                         @Advice.Local("execution") Object execution) throws java.sql.SQLException {
         execution = Jdbc.enter(statement, arguments);
-        return Jdbc.dropped(execution);
+        return Jdbc.skipped(execution);
     }
 
-    @Advice.OnMethodExit(onThrowable = Throwable.class)
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     static void exit(@Advice.This Object statement, @Advice.Origin Method method, @Advice.AllArguments Object[] arguments,
-                     @Advice.Local("execution") Object execution, @Advice.Enter Object dropped,
+                     @Advice.Local("execution") Object execution, @Advice.Enter Object skipped,
                      @Advice.Return(readOnly = false, typing = Assigner.Typing.DYNAMIC) Object returned,
                      @Advice.Thrown(readOnly = false) Throwable thrown) throws java.sql.SQLException {
-        Jdbc.Outcome outcome = Jdbc.exit(execution, statement, method, arguments, dropped, returned, thrown);
+        Jdbc.Outcome outcome = Jdbc.exit(execution, statement, method, arguments, skipped, returned, thrown);
         returned = outcome.returned();
         thrown = outcome.thrown();
     }
@@ -30,7 +30,7 @@ final class JdbcAdvice {
     static final class Prepare {
         private Prepare() {}
 
-        @Advice.OnMethodExit
+        @Advice.OnMethodExit(suppress = Throwable.class)
         static void exit(@Advice.Argument(0) Object sql, @Advice.Return Object statement) {
             Jdbc.prepared(statement, sql);
         }
