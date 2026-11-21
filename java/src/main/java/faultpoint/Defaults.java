@@ -109,18 +109,30 @@ final class Defaults {
                     flush();
                 }
             });
-            Runtime.getRuntime().addShutdownHook(new Thread(this::flush));
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                stopping = true;
+                flush();
+            }));
         }
 
+        /** Whether the JVM is shutting down, while other shutdown hooks, such as a server's graceful stop, may still
+         * finish requests; each observation is then written as it is made. */
+        private volatile boolean stopping;
+
         @Override
-        public synchronized void add(Observation observation) {
-            Tally entry = tally.computeIfAbsent(new Key(observation.experiment(), observation.point(),
-                    observation.outcome(), observation.scope(), observation.rule(), new TreeMap<>(observation.detail())),
-                    ignored -> new Tally());
-            entry.count += 1;
-            entry.total += observation.quantity();
-            if (observation.traceId() != null && entry.exemplars.size() < exemplars && sampled(observation.traceId())) {
-                entry.exemplars.add(observation.traceId());
+        public void add(Observation observation) {
+            synchronized (this) {
+                Tally entry = tally.computeIfAbsent(new Key(observation.experiment(), observation.point(),
+                        observation.outcome(), observation.scope(), observation.rule(), new TreeMap<>(observation.detail())),
+                        ignored -> new Tally());
+                entry.count += 1;
+                entry.total += observation.quantity();
+                if (observation.traceId() != null && entry.exemplars.size() < exemplars && sampled(observation.traceId())) {
+                    entry.exemplars.add(observation.traceId());
+                }
+            }
+            if (stopping) {
+                flush();
             }
         }
 
