@@ -13,11 +13,14 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.ByteBuffer;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Flow;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -154,18 +157,70 @@ public final class HttpClients {
                 : new HttpTimeoutException("faultpoint: request timed out");
     }
 
+    /** How long a delay, or a fail with ms, keeps the client waiting as a slow peer would; null without either. */
+    private static Duration waiting(Rule rule) {
+        return rule != null && (rule.kind().equals("delay") || (rule.kind().equals("fail") && rule.integer("ms") != null))
+                ? Duration.ofMillis((long) rule.number("ms")) : null;
+    }
+
+    /** Observe a request the caller gave up on while a slow peer kept it waiting, which was never sent; an asynchronous
+     * wait ends on a thread of its own, so the request's context is made current. */
+    private static void abandoned(Call call, Throwable failure) {
+        try (Scope ignored = call.context().makeCurrent()) {
+            Core.current().observe(call.point(), outcome(failure), call.elapsed(), call.elapsed(), call.rule(),
+                    Map.of("error", failure.getClass().getName(), "sent", "false"));
+        }
+    }
+
+    /** The request sent after a wait, with what is left of its timeout, which counts the whole exchange. */
+    private static Call afterWait(Call call, Duration wait) {
+        Optional<Duration> timeout = call.request().timeout();
+        return timeout.isEmpty() ? call : new Call(call.point(), call.rule(),
+                HttpRequest.newBuilder(call.request(), (name, value) -> true).timeout(timeout.get().minus(wait)).build(),
+                call.started(), call.written(), call.context());
+    }
+
+    /** Whether the request's timeout ends a wait before it passes, as the client gives up on a slow peer. */
+    private static boolean timesOut(Call call, Duration wait) {
+        return call.request().timeout().filter(timeout -> timeout.compareTo(wait) <= 0).isPresent();
+    }
+
+    /** Wait as a slow peer keeps a send waiting: the request's timeout ends it with HttpTimeoutException and nothing
+     * sent, as the client gives up, and an interrupt ends it as it ends a send; otherwise the request goes on. */
+    private static Call waitAsPeer(Call call, Duration wait) throws IOException, InterruptedException {
+        boolean timingOut = timesOut(call, wait);
+        try {
+            Thread.sleep((timingOut ? call.request().timeout().get() : wait).toMillis());
+        } catch (InterruptedException interrupted) {
+            own(() -> {
+                abandoned(call, interrupted);
+                return null;
+            });
+            throw interrupted;
+        }
+        if (timingOut) {
+            HttpTimeoutException timedOut = new HttpTimeoutException("request timed out");
+            own(() -> {
+                abandoned(call, timedOut);
+                return null;
+            });
+            throw timedOut;
+        }
+        return own(() -> afterWait(call, wait));
+    }
+
     /** The failure a fail or fail_after rule answers with: a synthetic status, or the error to throw; only a
      * fail_after has sent the request. */
     private static <T> HttpResponse<T> failure(Call call, Rule rule) throws IOException {
         Integer status = rule.integer("status");
         String sent = String.valueOf(rule.kind().equals("fail_after"));
         if (status != null) {
-            Core.current().observe(call.point(), (status / 100) + "xx", call.elapsed(), call.elapsed(),rule,
+            Core.current().observe(call.point(), (status / 100) + "xx", call.elapsed(), call.elapsed(), rule,
                     Map.of("status", status.toString(), "sent", sent));
             return new SyntheticResponse<>(status, call.request());
         }
         IOException error = boundaryError(rule);
-        Core.current().observe(call.point(), outcome(error), call.elapsed(), call.elapsed(),rule,
+        Core.current().observe(call.point(), outcome(error), call.elapsed(), call.elapsed(), rule,
                 Map.of("error", error.getClass().getName(), "sent", sent));
         throw error;
     }
@@ -178,7 +233,7 @@ public final class HttpClients {
         if (replacing != null) {
             return failure(call, replacing);
         }
-        core.observe(call.point(), (response.statusCode() / 100) + "xx", call.elapsed(), call.elapsed(),call.rule(),
+        core.observe(call.point(), (response.statusCode() / 100) + "xx", call.elapsed(), call.elapsed(), call.rule(),
                 Map.of("status", String.valueOf(response.statusCode())));
         return response;
     }
@@ -190,14 +245,15 @@ public final class HttpClients {
         if (!core.enabled()) {
             return client.send(request, handler);
         }
-        Call call = own(() -> {
-            Call begun = begin(request);
-            if (begun.rule() != null) {
+        Call begun = own(() -> begin(request));
+        String kind = begun.rule() == null ? "" : begun.rule().kind();
+        Duration wait = own(() -> {
+            if (kind.equals("crash")) {
                 Points.hold(core, begun.rule());
             }
-            return begun;
+            return waiting(begun.rule());
         });
-        String kind = call.rule() == null ? "" : call.rule().kind();
+        Call call = wait == null ? begun : waitAsPeer(begun, wait);
         if (kind.equals("fail")) {
             return own(() -> failure(call, call.rule()));
         }
@@ -209,7 +265,7 @@ public final class HttpClients {
             }
         } catch (IOException failure) {
             own(() -> {
-                core.observe(call.point(), outcome(failure), call.elapsed(), call.elapsed(),call.rule(), failureDetail(failure, call.sent()));
+                core.observe(call.point(), outcome(failure), call.elapsed(), call.elapsed(), call.rule(), failureDetail(failure, call.sent()));
                 return null;
             });
             throw failure;
@@ -226,19 +282,44 @@ public final class HttpClients {
         if (!core.enabled()) {
             return client.sendAsync(request, handler);
         }
-        Call call = unchecked(() -> begin(request));
-        Rule rule = call.rule();
+        Call begun = unchecked(() -> begin(request));
+        Rule rule = begun.rule();
         String kind = rule == null ? "" : rule.kind();
-        CompletableFuture<Void> ready = unchecked(() -> {
+        Duration wait = unchecked(() -> {
             if (kind.equals("crash")) {
                 Points.hold(core, rule);
             }
-            // A fail rule with ms waits as a delay does, before it fails.
-            return kind.equals("delay") || (kind.equals("fail") && rule.integer("ms") != null)
-                    ? CompletableFuture.runAsync(() -> {}, CompletableFuture.delayedExecutor((long) rule.number("ms"), TimeUnit.MILLISECONDS))
-                    : CompletableFuture.completedFuture(null);
+            return waiting(rule);
         });
-        return ready.thenCompose(ignored -> {
+        boolean timingOut = wait != null && timesOut(begun, wait);
+        // The future the caller holds: cancelled during a wait, the caller has given up and nothing is sent; cancelled
+        // after, the cancel reaches the request the client sends.
+        CompletableFuture<HttpResponse<T>> answer = new CompletableFuture<>();
+        AtomicBoolean proceeded = new AtomicBoolean();
+        answer.whenComplete((response, failure) -> {
+            if (answer.isCancelled() && proceeded.compareAndSet(false, true)) {
+                unchecked(() -> {
+                    abandoned(begun, new CancellationException());
+                    return null;
+                });
+            }
+        });
+        CompletableFuture<Void> ready = wait == null ? CompletableFuture.completedFuture(null)
+                : CompletableFuture.runAsync(() -> {}, CompletableFuture.delayedExecutor(
+                        (timingOut ? begun.request().timeout().get() : wait).toMillis(), TimeUnit.MILLISECONDS));
+        ready.thenCompose(ignored -> {
+            if (!proceeded.compareAndSet(false, true)) {
+                return CompletableFuture.<HttpResponse<T>>completedFuture(null);
+            }
+            if (timingOut) {
+                HttpTimeoutException timedOut = new HttpTimeoutException("request timed out");
+                unchecked(() -> {
+                    abandoned(begun, timedOut);
+                    return null;
+                });
+                return CompletableFuture.<HttpResponse<T>>failedFuture(timedOut);
+            }
+            Call call = wait == null ? begun : unchecked(() -> afterWait(begun, wait));
             if (kind.equals("fail")) {
                 return CompletableFuture.supplyAsync(() -> null).thenApply(nothing -> {
                     try (Scope scope = call.context().makeCurrent()) {
@@ -246,24 +327,35 @@ public final class HttpClients {
                     }
                 });
             }
-            CompletableFuture<HttpResponse<T>> sent = client.sendAsync(call.request(), handler);
-            if (kind.equals("duplicate")) {
-                sent = sent.thenCompose(first -> client.sendAsync(call.request(), handler));
-            }
+            CompletableFuture<HttpResponse<T>> first = client.sendAsync(call.request(), handler);
+            CompletableFuture<HttpResponse<T>> sent = kind.equals("duplicate")
+                    ? first.thenCompose(response -> client.sendAsync(call.request(), handler)) : first;
+            answer.whenComplete((response, failure) -> {
+                if (answer.isCancelled()) {
+                    sent.cancel(true);
+                }
+            });
             return sent.handle((response, failure) -> {
                 try (Scope scope = call.context().makeCurrent()) {
                     if (failure != null) {
                         unchecked(() -> {
                             Throwable cause = failure.getCause() == null ? failure : failure.getCause();
-                            core.observe(call.point(), outcome(cause), call.elapsed(), call.elapsed(),rule, failureDetail(cause, call.sent()));
+                            core.observe(call.point(), outcome(cause), call.elapsed(), call.elapsed(), rule, failureDetail(cause, call.sent()));
                             return null;
                         });
-                        throw new java.util.concurrent.CompletionException(failure);
+                        throw new CompletionException(failure);
                     }
                     return unchecked(() -> answered(call, response));
                 }
             });
+        }).whenComplete((response, failure) -> {
+            if (failure == null) {
+                answer.complete(response);
+            } else {
+                answer.completeExceptionally(failure instanceof CompletionException && failure.getCause() != null ? failure.getCause() : failure);
+            }
         });
+        return answer;
     }
 
     /** The agent's own work for a request, whose IOException is the failure a rule injects. */
@@ -285,7 +377,7 @@ public final class HttpClients {
         try {
             return own(work);
         } catch (IOException failure) {
-            throw new java.util.concurrent.CompletionException(failure);
+            throw new CompletionException(failure);
         }
     }
 
