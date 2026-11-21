@@ -85,6 +85,7 @@ type ServerCall struct {
 // already took the request, as when a wrapped http.Server serves an instrumented framework, so that a request is
 // one execution of one point.
 func Take(request *http.Request) *ServerCall {
+	defer faultpoint.Guard()
 	if request.Context().Value(takenKey{}) != nil {
 		return nil
 	}
@@ -101,6 +102,7 @@ func Take(request *http.Request) *ServerCall {
 // Answer is the status to send once the handler's is known: the handler's, or a fail_after rule's, which is decided
 // only for a 2xx or 3xx status of a request no rule acted on before.
 func (c *ServerCall) Answer(status int) int {
+	defer faultpoint.Guard()
 	if c.Rule != nil || !succeeded(status) {
 		return status
 	}
@@ -125,6 +127,7 @@ func (c *ServerCall) Action() string {
 
 // FailureStatus is the status a fail or fail_after rule answers with.
 func (c *ServerCall) FailureStatus() int {
+	defer faultpoint.Guard()
 	params := struct {
 		Status int `json:"status"`
 	}{Status: defaultFailureStatus}
@@ -139,12 +142,14 @@ func (c *ServerCall) abandoned() string {
 
 // Finish observes the status the server answered.
 func (c *ServerCall) Finish(status int) {
+	defer faultpoint.Guard()
 	faultpoint.Observe(c.Request.Context(), c.point, statusOutcome(status), milliseconds(c.started), c.Rule,
 		map[string]string{"status": strconv.Itoa(status), "abandoned": c.abandoned()})
 }
 
 // Panicked observes a request whose handler panicked with a value, named by its type or its registered name.
 func (c *ServerCall) Panicked(recovered any) {
+	defer faultpoint.Guard()
 	name := fmt.Sprintf("%T", recovered)
 	if err, isError := recovered.(error); isError {
 		name = faultpoint.ErrorName(err)
@@ -323,6 +328,7 @@ func syntheticResponse(request *http.Request, status int) *http.Response {
 // failure is what a fail or fail_after rule gives the caller instead of the peer's response: a response with its
 // status, or the error of a peer that timed out, the default, or refused the connection.
 func failure(request *http.Request, rule *faultpoint.Rule) (*http.Response, error) {
+	defer faultpoint.Guard()
 	params := struct {
 		Status int    `json:"status"`
 		Error  string `json:"error"`

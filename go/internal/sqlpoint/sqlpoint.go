@@ -56,6 +56,7 @@ func NewClassifier(readCommands []string) *Classifier {
 // Classify is the point of a statement; its locator is the tables it touches and the hash of its shape with
 // literals and comments removed, so that one statement is one point whatever its arguments.
 func (c *Classifier) Classify(query string) Point {
+	defer faultpoint.Guard()
 	if known, found := c.points.Load(query); found {
 		return known.(Point)
 	}
@@ -109,6 +110,7 @@ func (c *Classifier) reads(query string) bool {
 // ErrorDetail is the detail of a failed statement: the error's name and, when the driver reports one, its code: the
 // SQLSTATE of a PostgreSQL driver, or the numeric code of a driver such as SQLite's.
 func ErrorDetail(err error) map[string]string {
+	defer faultpoint.Guard()
 	detail := map[string]string{"error": faultpoint.ErrorName(err)}
 	var state interface{ SQLState() string }
 	var numbered interface{ Code() int }

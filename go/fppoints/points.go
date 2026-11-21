@@ -31,6 +31,7 @@ func Branch(ctx context.Context, point string, taken bool) bool {
 	if !enabled {
 		return taken
 	}
+	defer faultpoint.Guard()
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
 		action.Hold(rule)
@@ -73,13 +74,16 @@ func observeCall(ctx context.Context, point string, rule *faultpoint.Rule, err e
 // Call is the call point of a call site whose error the caller checks: the rewriter calls Call(ctx, id, f)(args)
 // where the source calls f(args), so that the arguments are evaluated as before. Under a fail rule f is not called:
 // the results are zero values and the error the rule names. Under fail_after f is called and, when it returned no
-// error, the caller gets the rule's error instead. f is returned as it is when the plugin is not enabled.
+// error, the caller gets the rule's error instead. f is returned as it is when the plugin is not enabled, and a panic
+// of f reaches the caller as it was.
 func Call[F any](ctx context.Context, point string, fn F) F {
 	if !enabled {
 		return fn
 	}
+	defer faultpoint.Guard()
 	callee := reflect.ValueOf(fn)
 	called := reflect.MakeFunc(callee.Type(), func(arguments []reflect.Value) []reflect.Value {
+		defer faultpoint.Guard()
 		rule := faultpoint.Decide(ctx, point, action.Before...)
 		if rule != nil {
 			action.Hold(rule)
@@ -91,9 +95,9 @@ func Call[F any](ctx context.Context, point string, fn F) F {
 				results = append(results, reflect.Zero(callee.Type().Out(index)))
 			}
 		case callee.Type().IsVariadic():
-			results = callee.CallSlice(arguments)
+			faultpoint.Outside(func() { results = callee.CallSlice(arguments) })
 		default:
-			results = callee.Call(arguments)
+			faultpoint.Outside(func() { results = callee.Call(arguments) })
 		}
 		last := len(results) - 1
 		if rule == nil && results[last].IsNil() {
@@ -119,6 +123,7 @@ func Failed(ctx context.Context, point string, err *error) bool {
 	if !enabled {
 		return *err != nil
 	}
+	defer faultpoint.Guard()
 	var rule *faultpoint.Rule
 	if *err == nil {
 		rule = faultpoint.Decide(ctx, point)
@@ -143,6 +148,7 @@ func Check(ctx context.Context, point string, result bool) bool {
 	if !enabled {
 		return result
 	}
+	defer faultpoint.Guard()
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
 		action.Hold(rule)
@@ -161,6 +167,7 @@ func Loop(ctx context.Context, point string) {
 	if !enabled {
 		return
 	}
+	defer faultpoint.Guard()
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
 		action.Hold(rule)
@@ -173,6 +180,7 @@ func Value[T any](ctx context.Context, point string, observed T) T {
 	if !enabled {
 		return observed
 	}
+	defer faultpoint.Guard()
 	rule := faultpoint.Decide(ctx, point)
 	result := observed
 	if rule != nil {
@@ -232,6 +240,7 @@ func Clock(ctx context.Context, point string, reading time.Time) time.Time {
 	if !enabled {
 		return reading
 	}
+	defer faultpoint.Guard()
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
 		action.Hold(rule)
@@ -252,6 +261,7 @@ func Acquire(ctx context.Context, point string, acquired bool) bool {
 	if !enabled {
 		return acquired
 	}
+	defer faultpoint.Guard()
 	rule := faultpoint.Decide(ctx, point)
 	if rule != nil {
 		action.Hold(rule)

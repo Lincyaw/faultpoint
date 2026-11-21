@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -220,6 +221,7 @@ func (c *core) install(data []byte) {
 // execution's baggage and whose trigger fires, or nil. Given actions, only the rules of those actions are matched
 // and counted, so that a point deciding before and after its operation counts a rule only where it can act.
 func Decide(ctx context.Context, point string, actions ...string) *Rule {
+	defer Guard()
 	state := current.state.Load()
 	for _, rule := range state.byPoint[point] {
 		if len(actions) > 0 && !slices.Contains(actions, rule.Action.Kind) {
@@ -265,6 +267,7 @@ func Observe(ctx context.Context, point, outcome string, total float64, rule *Ru
 	if !current.started.Load() || current.sink == nil {
 		return
 	}
+	defer Guard()
 	observation := Observation{Experiment: current.state.Load().experiment, Point: point, Outcome: outcome,
 		Count: 1, Total: total, Detail: detail}
 	if rule != nil {
@@ -325,6 +328,7 @@ func EndOnSignals() {
 // endOnSignal waits for a signal EndOnSignals watches, runs End, and lets the signal end the process by its default
 // action.
 func endOnSignal(received chan os.Signal) {
+	defer Guard()
 	ending := <-received
 	End()
 	signal.Stop(received)
@@ -349,4 +353,33 @@ func Crash(code int) {
 func Abort(format string, arguments ...any) {
 	fmt.Fprintf(os.Stderr, "faultpoint: "+format+"; stopping the process\n", arguments...)
 	Crash(invalidRulesExit)
+}
+
+// outside carries a panic of code the SDK called through Outside, which Guard lets go on as it was.
+type outside struct{ value any }
+
+// Guard ends the process by Abort when the SDK's own code panics, so that a server or framework that recovers the
+// panics of its handlers does not swallow it and leave a point silently not acting. The functions of the SDK that
+// run in the application's control flow, and its goroutines, defer it; a panic of code they call through Outside,
+// such as the application's callee, goes on as it was.
+func Guard() {
+	recovered := recover()
+	if escaped, isOutside := recovered.(outside); isOutside {
+		panic(escaped.value)
+	}
+	if recovered != nil {
+		fmt.Fprintf(os.Stderr, "%s", debug.Stack())
+		Abort("internal error: %v", recovered)
+	}
+}
+
+// Outside calls code that is not the SDK's from a function that defers Guard, so that its panic reaches the
+// application as it was instead of ending the process.
+func Outside(call func()) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panic(outside{value: recovered})
+		}
+	}()
+	call()
 }

@@ -105,6 +105,7 @@ func DriverName(name string) string {
 
 // begin decides the rule of a statement's point that acts before it runs and performs its delay or crash.
 func begin(ctx context.Context, query string) (string, *faultpoint.Rule, string) {
+	defer faultpoint.Guard()
 	known := classifier.Classify(query)
 	point := faultpoint.PointID(faultpoint.Service(), known.Kind, known.Locator)
 	rule := faultpoint.Decide(ctx, point, action.Before...)
@@ -164,6 +165,7 @@ type query struct {
 // advance records what reading a row gave: a row, or the end of the rows, where a fail_after rule may give its error
 // instead, as a statement that returned its rows and then failed would, or an error of the statement's own.
 func (q *query) advance(ctx context.Context, err error, coded func(code string) error) error {
+	defer faultpoint.Guard()
 	switch {
 	case err == nil:
 		q.rows++
@@ -179,6 +181,7 @@ func (q *query) advance(ctx context.Context, err error, coded func(code string) 
 // failAfter decides, once a statement's rows ended or closed without an error and no rule acted on it before,
 // whether a fail_after rule replaces its result, and returns the error that rule gives, nil without one.
 func (q *query) failAfter(ctx context.Context, coded func(code string) error) error {
+	defer faultpoint.Guard()
 	if q.rule != nil {
 		return nil
 	}

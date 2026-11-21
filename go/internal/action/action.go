@@ -26,6 +26,7 @@ var Before = []string{"fail", "drop", "duplicate", "empty", "delay", "crash"}
 
 // Hold performs delay and crash: a delay blocks the calling goroutine, a crash ends the process with its code.
 func Hold(rule *faultpoint.Rule) {
+	defer faultpoint.Guard()
 	switch rule.Action.Kind {
 	case "delay":
 		var params struct {
@@ -51,6 +52,7 @@ func init() { faultpoint.RegisterError("faultpoint/internal/action.ErrInjected",
 // Failure is the error a fail or fail_after rule of a store or broker gives the caller: the client library's own
 // error with the code the rule names, which coded builds, the peer error it names, or ErrInjected.
 func Failure(rule *faultpoint.Rule, coded func(code string) error) error {
+	defer faultpoint.Guard()
 	var params struct {
 		Error string `json:"error"`
 		Code  string `json:"code"`

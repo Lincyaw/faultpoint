@@ -63,6 +63,7 @@ type statement struct {
 
 // decide classifies a statement, decides its rule that acts before it runs and performs the rule's delay or crash.
 func decide(ctx context.Context, query string) statement {
+	defer faultpoint.Guard()
 	known := classifier.Classify(query)
 	s := statement{ctx: ctx, inner: context.WithValue(ctx, ownerKey{}, true), kind: known.Kind, command: known.Command,
 		point: faultpoint.PointID(faultpoint.Service(), known.Kind, known.Locator)}
@@ -77,6 +78,7 @@ func decide(ctx context.Context, query string) statement {
 // failAfter decides, once the statement completed normally and no rule acted on it before, whether a fail_after
 // rule replaces its result, and returns the error that rule gives, nil without one.
 func (s *statement) failAfter() error {
+	defer faultpoint.Guard()
 	if s.rule != nil {
 		return nil
 	}
@@ -101,6 +103,7 @@ func (s statement) refuse(call string, actions ...string) {
 // observe records an outcome: error, with its name and SQLSTATE, rows or empty for a read, ok for a write, with the
 // rows read or affected.
 func (s statement) observe(rows int64, err error) {
+	defer faultpoint.Guard()
 	if err != nil {
 		faultpoint.Observe(s.ctx, s.point, "error", 0, s.rule, sqlpoint.ErrorDetail(err))
 		return

@@ -128,6 +128,7 @@ type FileRuleSource struct {
 func (source FileRuleSource) Start(install func(data []byte)) {
 	modified := source.read(install)
 	go func() {
+		defer Guard()
 		for range time.Tick(ruleFilePollInterval) {
 			info, err := os.Stat(source.Path)
 			if err != nil {

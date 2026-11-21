@@ -114,6 +114,7 @@ type call struct {
 // decide finds a command in the table, decides its rule that acts before it is sent and performs the rule's delay or
 // crash; a command outside the table is not a point.
 func decide(ctx context.Context, cmd redis.Cmder) (call, bool) {
+	defer faultpoint.Guard()
 	name := strings.ToUpper(cmd.Name())
 	known, found := commands[name]
 	if !found {
@@ -161,6 +162,7 @@ func (c call) block(cmd redis.Cmder) {
 // rule is decided only for a command that no rule acted on before and that completed normally: answered without an
 // error reply, or, for a read, with the empty reply redis.Nil stands for.
 func (c call) settle(cmd redis.Cmder, err error) error {
+	defer faultpoint.Guard()
 	reads := c.command.Kind == "store_read" || c.command.Kind == "consume"
 	if (err == nil || (reads && c.command.Empty == "nil" && errors.Is(err, redis.Nil))) && c.rule == nil {
 		c.rule = faultpoint.Decide(c.ctx, c.point, "fail_after")

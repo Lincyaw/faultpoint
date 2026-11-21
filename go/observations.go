@@ -105,6 +105,7 @@ func NewJSONLSink(path, service string, options JSONLOptions) (*JSONLSink, error
 	}
 	if !sink.writeThrough {
 		go func() {
+			defer Guard()
 			for range time.Tick(time.Duration(options.FlushSeconds * float64(time.Second))) {
 				sink.Flush()
 			}
