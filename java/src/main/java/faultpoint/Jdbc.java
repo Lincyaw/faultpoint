@@ -9,8 +9,10 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
@@ -20,7 +22,10 @@ import net.sf.jsqlparser.JSQLParserException;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.UnsupportedStatement;
+import net.sf.jsqlparser.statement.select.ParenthesedSelect;
+import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.select.Select;
+import net.sf.jsqlparser.statement.select.WithItem;
 import net.sf.jsqlparser.util.TablesNamesFinder;
 
 /** The store_read and store_write points of every JDBC statement a driver executes, whoever calls it:
@@ -42,9 +47,47 @@ public final class Jdbc {
 
     private Jdbc() {}
 
-    /** The kind and locator of a statement: a query is read and anything else written, the tables it
-     * touches and the hash of its normalised text. A statement the parser does not understand is
-     * written, since the parser recognises every query form a driver is sent. */
+    /** The tables a statement touches and whether it writes: TablesNamesFinder's walk, which also enters a WITH item
+     * that inserts, updates or deletes and takes the table a query selects INTO, both of which write. The name of a
+     * WITH item is not a table. */
+    static final class Touched extends TablesNamesFinder<Void> {
+        private final Set<String> named = new HashSet<>();
+        private boolean writes;
+
+        @Override
+        public <S> Void visit(WithItem<?> withItem, S context) {
+            named.add(withItem.getAliasName());
+            if (withItem.getParenthesedStatement() instanceof ParenthesedSelect) {
+                return super.visit(withItem, context);
+            }
+            writes = true;
+            return withItem.getParenthesedStatement().accept(this, context);
+        }
+
+        @Override
+        public <S> Void visit(PlainSelect select, S context) {
+            super.visit(select, context);
+            if (select.getIntoTables() != null) {
+                writes = true;
+                select.getIntoTables().forEach(table -> visit(table, context));
+            }
+            return null;
+        }
+
+        Set<String> tables(Statement statement) {
+            Set<String> tables = new TreeSet<>(getTables(statement));
+            tables.removeAll(named);
+            return tables;
+        }
+
+        boolean writes() {
+            return writes;
+        }
+    }
+
+    /** The kind and locator of a statement: a query that writes through neither a WITH item nor INTO is read and
+     * anything else written, the tables it touches and the hash of its normalised text. A statement the parser does
+     * not understand is written, since the parser recognises every query form a driver is sent. */
     static Kind statementPoint(String sql) {
         return STATEMENTS.computeIfAbsent(sql, text -> {
             List<Statement> statements = new ArrayList<>();
@@ -53,12 +96,16 @@ public final class Jdbc {
             } catch (JSQLParserException unparsable) {
                 statements.add(new UnsupportedStatement(text, List.of()));
             }
-            boolean reads = !statements.isEmpty() && statements.stream().allMatch(statement -> statement instanceof Select);
+            boolean reads = !statements.isEmpty();
             var tables = new TreeSet<String>();
             var shape = new StringBuilder();
             for (Statement statement : statements) {
-                if (!(statement instanceof UnsupportedStatement)) {
-                    tables.addAll(new TablesNamesFinder<Void>().getTables(statement));
+                if (statement instanceof UnsupportedStatement) {
+                    reads = false;
+                } else {
+                    Touched touched = new Touched();
+                    tables.addAll(touched.tables(statement));
+                    reads = reads && statement instanceof Select && !touched.writes();
                 }
                 shape.append(statement instanceof UnsupportedStatement ? text.strip() : statement.toString()).append(';');
             }
@@ -220,14 +267,14 @@ public final class Jdbc {
             core.observe(running.point(), "error", running.elapsed(), replacing, failureDetail(injected));
             return new Outcome(returned, injected);
         }
+        if (running.kind().equals("store_write")) {
+            core.observe(running.point(), "ok", affected(returned), running.rule(), Map.of());
+            return new Outcome(returned, null);
+        }
         if (returned instanceof ResultSet rows) {
             return new Outcome(observed(rows, running), null);
         }
-        if (running.kind().equals("store_read")) {
-            core.observe(running.point(), Boolean.TRUE.equals(returned) ? "rows" : "empty", 0, running.rule(), Map.of());
-        } else {
-            core.observe(running.point(), "ok", affected(returned), running.rule(), Map.of());
-        }
+        core.observe(running.point(), Boolean.TRUE.equals(returned) ? "rows" : "empty", 0, running.rule(), Map.of());
         return new Outcome(returned, null);
     }
 
