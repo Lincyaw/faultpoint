@@ -82,17 +82,33 @@ public final class Agent {
         return found;
     }
 
-    /** `scan --service NAME --packages a.b,c.d --classes DIR_OR_JAR [--classpath JARS] [--config FILE]`: the points
-     * the agent would place. */
+    /** The entries of a class path as the java launcher reads it, where an entry `DIR/*` stands for the jars in DIR. */
+    static List<Path> classPath(String classPath) throws IOException {
+        var entries = new java.util.ArrayList<Path>();
+        for (String entry : classPath.split(java.io.File.pathSeparator)) {
+            if (entry.equals("*") || entry.endsWith(java.io.File.separator + "*")) {
+                try (Stream<Path> jars = Files.list(Path.of(entry.substring(0, entry.length() - 1)))) {
+                    jars.filter(jar -> jar.toString().toLowerCase(java.util.Locale.ROOT).endsWith(".jar")).sorted().forEach(entries::add);
+                }
+            } else if (!entry.isEmpty()) {
+                entries.add(Path.of(entry));
+            }
+        }
+        return entries;
+    }
+
+    /** `scan --service NAME --packages a.b,c.d --classes DIR_OR_JAR --classpath CLASS_PATH [--config FILE]`: the points
+     * the agent would place in the classes of DIR_OR_JAR and of the class path in the placement scope. */
     public static void main(String[] arguments) throws IOException {
         var options = new LinkedHashMap<String, String>();
         for (int index = 1; index + 1 < arguments.length; index += 2) {
             options.put(arguments[index], arguments[index + 1]);
         }
         if (arguments.length == 0 || !arguments[0].equals("scan") || !options.keySet().containsAll(
-                List.of("--service", "--packages", "--classes"))) {
+                List.of("--service", "--packages", "--classes", "--classpath"))) {
             System.err.println("usage: java -jar faultpoint-agent.jar scan --service NAME --packages a.b,c.d --classes DIR_OR_JAR "
-                    + "[--classpath JARS] [--config FILE]");
+                    + "--classpath CLASS_PATH [--config FILE]\n  CLASS_PATH is the class path the service runs with, as java -cp "
+                    + "takes it; call points exist only where the callee's class file shows a checked exception");
             System.exit(2);
         }
         Settings.Config config = Settings.Config.read(options.get("--config"));
@@ -100,11 +116,10 @@ public final class Agent {
                 config.placement());
         placement.placePoints();
         Path location = Path.of(options.get("--classes"));
-        var locations = new java.util.ArrayList<Path>(List.of(location));
-        for (String entry : options.getOrDefault("--classpath", "").split(java.io.File.pathSeparator)) {
-            if (!entry.isEmpty()) {
-                locations.add(Path.of(entry));
-            }
+        // The class path usually holds the scanned classes too; each location is read once, or its points would repeat.
+        var locations = new java.util.LinkedHashSet<Path>();
+        for (Path each : java.util.stream.Stream.concat(Stream.of(location), classPath(options.get("--classpath")).stream()).toList()) {
+            locations.add(each.toAbsolutePath().normalize());
         }
         var path = new java.util.ArrayList<java.net.URL>();
         for (Path each : locations) {
