@@ -164,12 +164,17 @@ def control_executions(records: Iterable[ObservationRecord], repetitions: int, t
     return {point: count / (repetitions * tenants) for point, count in counts.items()}
 
 
-def service_manifests(manifests: Path) -> dict[str, Manifest]:
-    """The manifest of every service that has one, with its language and the errors its build registers; an upstream
-    component has none."""
-    return {manifest.service: manifest
-            for manifest in (Manifest.model_validate_json(path.read_text(encoding="utf-8"))
-                             for path in sorted(manifests.glob("*.json")))}
+def point_manifests(manifests: Path) -> dict[str, Manifest]:
+    """The manifest that lists each point, with its language and the errors its build registers: a service can have
+    several, such as its SDK's and that of its native hook points; a point no manifest lists has none."""
+    listed: dict[str, Manifest] = {}
+    for path in sorted(manifests.glob("*.json")):
+        manifest = Manifest.model_validate_json(path.read_text(encoding="utf-8"))
+        for entry in manifest.points:
+            if entry.id in listed:
+                raise ValueError(f"{entry.id} is listed in the manifests of {listed[entry.id].service} and of {path}")
+            listed[entry.id] = manifest
+    return listed
 
 
 def build_catalog(manifests: Path, executions: dict[str, dict[str, float]], configured: list[str],

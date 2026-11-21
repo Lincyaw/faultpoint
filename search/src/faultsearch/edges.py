@@ -70,7 +70,8 @@ class EffectRule(BaseModel):
     layers: tuple[Layer, ...] = tuple(Layer)
     """The layers of the effect's point the rule covers."""
     languages: tuple[str, ...] | None = None
-    """The languages, as manifests name them, of the services whose points the rule covers; every point when absent."""
+    """The languages of the points the rule covers, as the manifests listing them name them; every point when absent,
+    and no point that no manifest lists otherwise."""
     details: DetailValues = {}
     """The detail values the effect must show."""
     registration: Registration | None = None
@@ -83,9 +84,9 @@ class EffectRule(BaseModel):
     faults: tuple[Action, ...]
     reason: str
 
-    def covers_service(self, effect: EffectKey, manifest: Manifest | None) -> bool:
-        """Whether the rule covers an effect at a point of the service of this manifest, none for an upstream
-        component: by the service's language and by whether its build registers the effect's error."""
+    def covers_manifest(self, effect: EffectKey, manifest: Manifest | None) -> bool:
+        """Whether the rule covers an effect at a point this manifest lists, none for a point no manifest lists: by
+        the manifest's language and by whether its build registers the effect's error."""
         return ((self.languages is None or (manifest is not None and manifest.language in self.languages))
                 and (self.registration is None
                      or (manifest is not None and ERROR in effect.detail
@@ -94,11 +95,11 @@ class EffectRule(BaseModel):
 
     def covers(self, effect: EffectKey, verdicts: set[Verdict], layer: Layer, manifest: Manifest | None,
                peer_effects: list[EffectKey]) -> bool:
-        """Whether the rule covers an effect that held with these verdicts, at a point of the service of this
-        manifest, beside these effects of the called server point."""
+        """Whether the rule covers an effect that held with these verdicts, at a point this manifest lists, beside
+        these effects of the called server point."""
         return (self.kind == point_kind(effect.point) and effect.outcome in self.outcomes
                 and self.metric == effect.metric and bool(verdicts & set(self.verdicts)) and layer in self.layers
-                and self.covers_service(effect, manifest) and shows(effect.detail, self.details)
+                and self.covers_manifest(effect, manifest) and shows(effect.detail, self.details)
                 and set(self.parameters.values()) <= effect.detail.keys()
                 and (self.peer is None
                      or any(peer.outcome in self.peer.outcomes and shows(peer.detail, self.peer.details)
@@ -261,7 +262,7 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
             held_in = [sighting.scenario for sighting in held]
             not_held = [run.workload for run in runs if run.workload not in held_in]
             counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, layer,
-                                               manifests.get(point_service(effect.point)),
+                                               manifests.get(effect.point),
                                                peer_effects(effect, [shown[name] for name in held_in], services),
                                                effects, catalog, kinds)
             edges.append(Edge(cause=runs[0].fault, effect=effect, held=tuple(held), not_held=tuple(not_held),
