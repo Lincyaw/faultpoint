@@ -75,11 +75,16 @@ function results(result: unknown): QueryResult[] {
   return (Array.isArray(result) ? result : [result]) as QueryResult[];
 }
 
+/** Whether a locator has the shape statementPoint makes, which is the points this plugin serves. */
+function statementLocator(locator: string): boolean {
+  return STATEMENT_LOCATOR.test(locator);
+}
+
 /** Why a rule at a statement point cannot be obeyed: a code that is not a SQLSTATE, which PostgreSQL never reports. */
 function refusal(rule: Rule): string | null {
   const { kind, locator } = pointParts(rule.point);
   const code = stringParameter(rule, "code");
-  return code === undefined || (kind !== "store_read" && kind !== "store_write") || !STATEMENT_LOCATOR.test(locator)
+  return code === undefined || (kind !== "store_read" && kind !== "store_write") || !statementLocator(locator)
     || SQLSTATE.test(code) ? null : `code ${code} at ${rule.point} is not a SQLSTATE, five digits or upper-case letters`;
 }
 
@@ -166,7 +171,7 @@ export const pgPlugin: Plugin = {
     core.declare({
       store_read: ["fail", "empty", "delay", "crash"],
       store_write: ["fail", "fail_after", "drop", "duplicate", "delay", "crash"],
-    });
+    }, statementLocator);
     core.check(refusal);
     pg.Client.prototype.query = instrumentQuery(pg.Client.prototype.query, pg.DatabaseError);
   },

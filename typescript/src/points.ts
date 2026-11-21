@@ -1,5 +1,5 @@
 import { POINTS_SYMBOL } from "./config.js";
-import { CORE, type Plugin } from "./core.js";
+import { CORE, EVERY_LOCATOR, type Plugin } from "./core.js";
 import { type Rule, numberParameter } from "./rules.js";
 
 /** Perform delay and crash, blocking the thread as contention does. */
@@ -117,7 +117,7 @@ export const pointsPlugin: Plugin = {
       value: ["set", "shift", "delay", "crash"],
       clock: ["shift", "delay", "crash"],
       acquire: ["fail", "delay", "crash"],
-    });
+    }, EVERY_LOCATOR);
     (globalThis as Record<symbol, unknown>)[Symbol.for(POINTS_SYMBOL)] = { branch, check, loop, value, clock, acquire };
   },
 };

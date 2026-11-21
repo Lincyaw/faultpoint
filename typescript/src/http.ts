@@ -10,7 +10,7 @@ import { ROOT_CONTEXT, context, defaultTextMapGetter, defaultTextMapSetter } fro
 import { z } from "zod";
 
 import { PROPAGATOR } from "./context.js";
-import { CORE, type Plugin, errorName } from "./core.js";
+import { CORE, EVERY_LOCATOR, type Plugin, errorName } from "./core.js";
 import { type Rule, numberParameter, pointId, stringParameter } from "./rules.js";
 
 const DEFAULT_FAILURE_STATUS = 503;
@@ -297,7 +297,7 @@ export const httpPlugin: Plugin = {
     core.declare({
       rpc_server: ["fail", "fail_after", "delay", "crash"],
       rpc_client: ["fail", "fail_after", "duplicate", "delay", "crash"],
-    });
+    }, EVERY_LOCATOR);
     for (const server of [http.Server.prototype, https.Server.prototype]) {
       const emit = server.emit as (this: http.Server, event: string | symbol, ...arguments_: unknown[]) => boolean;
       server.emit = function (this: http.Server, event: string | symbol, ...arguments_: unknown[]): boolean {

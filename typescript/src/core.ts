@@ -52,9 +52,18 @@ function seededRandom(seed: string): () => number {
 
 /** Obtains rules, selects the rule of an execution and hands observations to the sink; every kind's
  * semantics lives in the plugins, which declare the kinds they serve and the actions they implement. */
+/** The locators of every point of a kind, for a plugin that serves them all. */
+export const EVERY_LOCATOR = (): boolean => true;
+
+/** The kinds one plugin serves with the actions it implements there, at the points whose locators it serves. */
+interface Declaration {
+  readonly kinds: Readonly<Record<string, readonly string[]>>;
+  readonly locators: (locator: string) => boolean;
+}
+
 export class Core {
   readonly enabled: boolean;
-  readonly declared = new Map<string, ReadonlySet<string>>();
+  readonly declarations: Declaration[] = [];
   /** Each answers why its plugin cannot obey a rule, or null; a plugin passes over the kinds it does not serve. */
   readonly checks: Array<(rule: Rule) => string | null> = [];
   experiment = "";
@@ -73,13 +82,11 @@ export class Core {
     }
   }
 
-  /** A kind served by several plugins accepts only the actions every one of them implements, so that a rule is
-   * rejected when its rule set loads rather than at the one point that cannot obey it. */
-  declare(kinds: Readonly<Record<string, readonly string[]>>): void {
-    for (const [kind, actions] of Object.entries(kinds)) {
-      const known = this.declared.get(kind);
-      this.declared.set(kind, new Set(known === undefined ? actions : actions.filter((action) => known.has(action))));
-    }
+  /** The kinds a plugin serves with the actions it implements there, at the points whose locators have the shape its
+   * adapter makes. A point served by several plugins accepts only the actions every one of them implements, so that a
+   * rule is rejected when its rule set loads rather than at the one point that cannot obey it. */
+  declare(kinds: Readonly<Record<string, readonly string[]>>, locators: (locator: string) => boolean): void {
+    this.declarations.push({ kinds, locators });
   }
 
   /** A check of every rule of this service when its rule set loads, for what an action's parameters ask that a plugin
@@ -104,18 +111,19 @@ export class Core {
     this.source?.start((ruleset) => this.apply(ruleset));
   }
 
-  /** Install a rule set; a rule of this service for a kind a plugin serves must use an action that
-   * plugin implements, and rules of other services or kinds are left to the processes that serve them. */
+  /** Install a rule set; a rule of this service at a point plugins serve must use an action each of those plugins
+   * implements, and rules of other services or of points no plugin here serves are left to their processes. */
   apply(ruleset: RuleSet): void {
     const rules = new Map<string, Rule[]>();
     for (const rule of ruleset.rules) {
-      const { service, kind } = pointParts(rule.point);
-      const actions = this.declared.get(kind);
-      if (service !== this.settings.service || actions === undefined) {
+      const { service, kind, locator } = pointParts(rule.point);
+      const serving = this.declarations.filter((declaration) => declaration.kinds[kind] !== undefined && declaration.locators(locator))
+        .map((declaration) => declaration.kinds[kind]);
+      if (service !== this.settings.service || serving.length === 0) {
         continue;
       }
-      if (!actions.has(rule.action.kind)) {
-        this.abort(`rule ${rule.id}: not every plugin of this process serving it implements ${rule.action.kind} at a ${kind} point`);
+      if (!serving.every((actions) => actions.includes(rule.action.kind))) {
+        this.abort(`rule ${rule.id}: not every plugin of this process serving its point implements ${rule.action.kind} at ${rule.point}`);
       }
       for (const check of this.checks) {
         const refusal = check(rule);

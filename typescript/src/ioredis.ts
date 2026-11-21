@@ -102,6 +102,11 @@ function failureDetail(error: unknown, ReplyError: ReplyError): Record<string, s
     : { error: errorName(error) };
 }
 
+/** Whether a locator has the shape the adapter makes: its first word is a command of the table. */
+function commandLocator(locator: string): boolean {
+  return TABLE.commands[locator.split(" ")[0]] !== undefined;
+}
+
 /** Why a rule at a Redis point cannot be obeyed: a code that is not an upper-case word, which is not the prefix of an
  * error reply. */
 function refusal(rule: Rule): string | null {
@@ -174,7 +179,7 @@ export const ioredisPlugin: Plugin = {
       store_write: ["fail", "drop", "delay", "crash"],
       publish: ["fail", "drop", "delay", "crash"],
       consume: ["fail", "empty", "delay", "crash"],
-    });
+    }, commandLocator);
     core.check(refusal);
     for (const client of [ioredis.Redis, ioredis.Cluster]) {
       if (client !== undefined) {
