@@ -1,46 +1,81 @@
 import argparse
 import json
+import subprocess
 from pathlib import Path
 from typing import Final
 
-from shop.deployment import MANIFESTS, RUNS, SCOPE_KEY, build, repetition, run, verified_build
-from shop.upstream import UPSTREAM_SERVICES
-from shop.workload import Scenarios
+from pydantic import BaseModel, JsonValue, TypeAdapter
+
+from shop.deployment import MANIFESTS, RUNS, SCOPE_KEY, build, refusal, repetition, run, verified_build
+from shop.upstream import PACKET_POINTS
+from shop.workload import FROZEN, Scenarios
 
 TREATED_TENANT: Final = "a"
 UNSCOPED: Final = ""
 
 
+class PointRule(BaseModel):
+    """A rule of a treatment: the action at the one point of a service and kind whose id is, or whose id or code
+    contains, a text; in a tenant's scope, or outside any scope when tenant is none."""
+
+    model_config = FROZEN
+
+    service: str
+    kind: str
+    contains: str
+    action: dict[str, JsonValue]
+    tenant: str | None = TREATED_TENANT
+    trigger: dict[str, JsonValue] = {}
+
+
+Treatments = TypeAdapter(dict[str, list[PointRule]])
+
+
 def known_points(control: str) -> dict[str, str]:
     """Every point id with the text it is recognised by: the manifests' code for placed points, and the id itself
-    for the boundary points the control run observed."""
+    for the boundary points the control run observed and for the packet points the deployment configures."""
     points = {record["point"]: record["point"] for path in (RUNS / control).glob("*.jsonl")
-              for record in map(json.loads, path.read_text().splitlines())}
+              for record in map(json.loads, path.read_text().splitlines())} | {point: point for point in PACKET_POINTS}
     for manifest in MANIFESTS.glob("*.json"):
         points.update({point["id"]: f"{point['id']} {point['code']}" for point in json.loads(manifest.read_text())["points"]})
     return points
 
 
 def find_point(control: str, service: str, kind: str, contains: str) -> str:
-    """The one point of a service and kind whose id or code contains a text."""
+    """The point of a service and kind whose id is a text, or else the one whose id or code contains it."""
     found = sorted(point for point, text in known_points(control).items()
                    if point.startswith(f"{service}:{kind}:") and contains in text)
+    if contains in found:
+        return contains
     if len(found) != 1:
         raise LookupError(f"{service}:{kind} with {contains!r} matches {found}")
     return found[0]
 
 
 TREATMENTS: Final = {
-    "inventory-read-empty": ("inventory", "store_read", "stock", {"kind": "empty"}),
-    "reserve-fail-after": ("orders", "rpc_client", "/reserve", {"kind": "fail_after", "error": "timeout"}),
-    "pricing-unavailable": ("pricing", "rpc_server", "/price", {"kind": "fail", "status": 503}),
-    "ledger-declines": ("ledger", "branch", "InsufficientFunds", {"kind": "fail"}),
-    "pricing-discount": ("pricing", "check", "discounted", {"kind": "negate"}),
-    "redis-lookup-miss": ("redis", "call", "lookupKey", {"kind": "fail", "error": "NULL"}),
-    "postgres-client-eof": ("postgres", "call", "pq_getbyte", {"kind": "fail", "error": "EOF"}),
+    "inventory-read-empty": [PointRule(service="inventory", kind="store_read", contains="stock",
+                                       action={"kind": "empty"})],
+    "reserve-fail-after": [PointRule(service="orders", kind="rpc_client", contains="/reserve",
+                                     action={"kind": "fail_after", "error": "timeout"})],
+    "pricing-unavailable": [PointRule(service="pricing", kind="rpc_server", contains="/price",
+                                      action={"kind": "fail", "status": 503})],
+    "ledger-declines": [PointRule(service="ledger", kind="branch", contains="InsufficientFunds",
+                                  action={"kind": "fail"})],
+    "pricing-discount": [PointRule(service="pricing", kind="check", contains="discounted", action={"kind": "negate"})],
+    "redis-lookup-miss": [PointRule(service="redis", kind="call", contains="lookupKey",
+                                    action={"kind": "fail", "error": "NULL"}, tenant=None)],
+    "postgres-client-eof": [PointRule(service="postgres", kind="call", contains="pq_getbyte",
+                                      action={"kind": "fail", "error": "EOF"}, tenant=None)],
 }
 """Faults at points of the shop's services, injected in tenant a, and at points the kernel agent places in an upstream
 component, which no rule can scope and so reach every tenant."""
+
+
+def rule_of(name: str, index: int, point_rule: PointRule, control: str) -> dict[str, JsonValue]:
+    point = find_point(control, point_rule.service, point_rule.kind, point_rule.contains)
+    return ({"id": f"{name}-{index}", "point": point, "action": point_rule.action}
+            | ({"scope": {SCOPE_KEY: point_rule.tenant}} if point_rule.tenant is not None else {})
+            | ({"trigger": point_rule.trigger} if point_rule.trigger else {}))
 
 
 def main() -> None:
@@ -53,8 +88,12 @@ def main() -> None:
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--scenario", default="limited-stock", help="The workload, a scenario of scenarios.json.")
+    parser.add_argument("--treatments-file", type=Path,
+                        help="Further treatments, by name, as JSON lists of rules of the PointRule form.")
     parser.add_argument("treatments", nargs="*", default=list(TREATMENTS))
     arguments = parser.parse_args()
+    treatments = TREATMENTS | (Treatments.validate_json(arguments.treatments_file.read_bytes())
+                               if arguments.treatments_file else {})
     sdk = arguments.sdk_root.resolve()
     commit = verified_build(sdk) if arguments.skip_build else build(sdk)
     print(f"SDK commit {commit} from {sdk}", flush=True)
@@ -63,17 +102,24 @@ def main() -> None:
     for label in controls:
         print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": []}, sdk), flush=True)
     for name in arguments.treatments:
-        service, kind, contains, action = TREATMENTS[name]
-        point = find_point(controls[0], service, kind, contains)
-        scoped = service not in UPSTREAM_SERVICES
+        rules = [rule_of(name, index, point_rule, controls[0]) for index, point_rule in enumerate(treatments[name])]
         labels = [f"{name}-{index}" for index in range(arguments.repetitions)]
+        refused = False
         for label in labels:
-            rule = {"id": name, "point": point, "action": action} | (
-                {"scope": {SCOPE_KEY: TREATED_TENANT}} if scoped else {})
-            print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": [rule]}, sdk), flush=True)
+            try:
+                print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": rules}, sdk),
+                      flush=True)
+            except subprocess.CalledProcessError:
+                refused = True
+                print(label, "refused:", refusal(RUNS / label), flush=True)
+        if refused:
+            continue
         reports = sorted(str(path) for label in controls + labels for path in (RUNS / label).glob("*.jsonl"))
-        for scope in [TREATED_TENANT] if scoped else [TREATED_TENANT, UNSCOPED]:
-            print(f"\n== {name}: {action} at {point}, compared in scope {scope!r}", flush=True)
+        tenants = {point_rule.tenant for point_rule in treatments[name]}
+        # A rule outside any scope reaches every tenant, so tenant a stands for them beside the unscoped records.
+        scopes = sorted({UNSCOPED, TREATED_TENANT} if None in tenants else tenants)
+        for scope in scopes:
+            print(f"\n== {name}: {json.dumps(rules)}, compared in scope {scope!r}", flush=True)
             run(["uv", "run", "--extra", "tools", "faultpoint", "diff", *reports,
                  *[f"--control={label}@{scope}" for label in controls],
                  *[f"--treatment={label}@{scope}" for label in labels]], sdk / "python")
