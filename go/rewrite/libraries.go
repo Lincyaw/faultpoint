@@ -71,20 +71,21 @@ func (l *libraryCopies) of(found *packages.Module) string {
 }
 
 // instrumentLibrary places the points of a dependency package as far as its scope entry allows, writes its rewritten
-// files and its error registry into the copy of its module, and adds its points and registered errors to the
-// manifest.
+// files and its registry into the copy of its module, and adds its points and registered errors to the manifest.
 func instrumentLibrary(service string, placement Placement, entry ScopeEntry, copies *libraryCopies, pkg *packages.Package, manifest *Manifest) {
 	limited := placement.limitedTo(entry.Kinds)
 	prefix := versionedPrefix(pkg.Module)
+	var placed []PointEntry
 	for _, file := range pkg.Syntax {
 		relative := relativePath(pkg.Module.Dir, pkg.Fset.Position(file.Pos()).Filename)
 		points := placePoints(service, prefix+relative, limited, pkg, file)
 		if len(points) > 0 {
 			writeFile(filepath.Join(copies.of(pkg.Module), relative), rewriteFile(pkg, file, []string{pointsPackage}))
-			manifest.Points = append(manifest.Points, points...)
+			placed = append(placed, points...)
 		}
 	}
-	if registry, names := errorRegistry(pkg); registry != nil && limited.Errors {
+	manifest.Points = append(manifest.Points, placed...)
+	if registry, names := packageRegistry(pkg, limited, placed); registry != nil {
 		directory := relativePath(pkg.Module.Dir, filepath.Dir(pkg.GoFiles[0]))
 		writeFile(filepath.Join(copies.of(pkg.Module), directory, registryFile), registry)
 		manifest.Errors = append(manifest.Errors, names...)
@@ -110,8 +111,7 @@ func scanLibraries(service, dir string, placement Placement, libraries map[strin
 			relative := relativePath(pkg.Module.Dir, pkg.Fset.Position(file.Pos()).Filename)
 			manifest.Points = append(manifest.Points, placePoints(service, versionedPrefix(pkg.Module)+relative, limited, pkg, file)...)
 		}
-		if _, names := errorRegistry(pkg); limited.Errors {
-			manifest.Errors = append(manifest.Errors, names...)
-		}
+		_, names := packageRegistry(pkg, limited, nil)
+		manifest.Errors = append(manifest.Errors, names...)
 	}
 }

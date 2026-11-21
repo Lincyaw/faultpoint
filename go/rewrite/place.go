@@ -43,6 +43,9 @@ func init() {
 {{- range .Errors}}
 	{{$.CoreName}}.RegisterError({{printf "%q" .Name}}, {{.Variable}})
 {{- end}}
+{{- range .Restricted}}
+	{{$.CoreName}}.Restrict({{printf "%q" .ID}}{{range .Actions}}, {{printf "%q" .}}{{end}})
+{{- end}}
 }
 `))
 
@@ -480,26 +483,28 @@ func packageErrors(dir string, paths []string) []registeredError {
 	return errors
 }
 
-// errorRegistry is the source of a file that registers a package's error variables by name in the core, which a
-// call fail rule returns and an observation names errors by, and the names it registers; nil when the package has
-// none.
-func errorRegistry(pkg *packages.Package) ([]byte, []string) {
+// packageRegistry is the source of a file that registers with the core, from a package's init, those of its points
+// that implement fewer actions than their kind and, when the placement registers errors, its error variables by
+// name, which a call fail rule returns and an observation names errors by; it returns the error names too, and nil
+// when there is nothing to register.
+func packageRegistry(pkg *packages.Package, placement Placement, points []PointEntry) ([]byte, []string) {
 	scope := pkg.Types.Scope()
 	var errors []registeredError
 	var names []string
 	for _, variable := range scope.Names() {
 		found, ok := scope.Lookup(variable).(*types.Var)
-		if ok && types.Identical(found.Type(), errorType) {
+		if ok && placement.Errors && types.Identical(found.Type(), errorType) {
 			errors = append(errors, registeredError{Name: pkg.PkgPath + "." + variable, Variable: variable})
 			names = append(names, pkg.PkgPath+"."+variable)
 		}
 	}
-	if len(errors) == 0 {
+	restricted := slices.DeleteFunc(slices.Clone(points), func(entry PointEntry) bool { return entry.Actions == nil })
+	if len(errors) == 0 && len(restricted) == 0 {
 		return nil, nil
 	}
 	var source bytes.Buffer
-	err := registryTemplate.Execute(&source, map[string]any{"Name": pkg.Name, "Errors": errors, "Core": corePackage,
-		"CoreName": path.Base(corePackage)})
+	err := registryTemplate.Execute(&source, map[string]any{"Name": pkg.Name, "Errors": errors,
+		"Restricted": restricted, "Core": corePackage, "CoreName": path.Base(corePackage)})
 	if err != nil {
 		log.Fatal(err)
 	}

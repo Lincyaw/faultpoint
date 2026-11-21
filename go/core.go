@@ -50,6 +50,9 @@ type core struct {
 	start      sync.Once
 	started    atomic.Bool
 	state      atomic.Pointer[ruleState]
+	restricted map[string][]string
+	// installing serializes installs with Restrict, so that every rule set in force obeys every restriction.
+	installing sync.Mutex
 	mu         sync.Mutex
 	exit       sync.Mutex
 	cleanups   []func()
@@ -61,6 +64,7 @@ func init() {
 	current.settings = readSettings()
 	current.enabled = current.settings.rules != "" || current.settings.report != ""
 	current.actions = map[string][]string{}
+	current.restricted = map[string][]string{}
 	current.state.Store(&ruleState{})
 }
 
@@ -81,6 +85,26 @@ func Register(plugin Plugin) bool {
 		current.actions[kind] = actions
 	}
 	return true
+}
+
+// Restrict narrows the actions a point implements below its kind's, as the rewriter registers them from the init of
+// the point's package, which may run before or after Start; a rule naming another action there is refused, among the
+// rules in force now or when a rule set is installed.
+func Restrict(point string, actions ...string) {
+	current.installing.Lock()
+	defer current.installing.Unlock()
+	current.restricted[point] = actions
+	for _, rule := range current.state.Load().byPoint[point] {
+		current.enforceRestriction(rule)
+	}
+}
+
+// enforceRestriction aborts when a rule names an action its point's restriction leaves out.
+func (c *core) enforceRestriction(rule *Rule) {
+	actions, restricted := c.restricted[rule.Point]
+	if restricted && !slices.Contains(actions, rule.Action.Kind) {
+		Abort("rule %s: %s implements only %s", rule.ID, rule.Point, strings.Join(actions, ", "))
+	}
 }
 
 // UseRuleSource replaces the file rule source; a plugin calls it from its init.
@@ -123,12 +147,15 @@ func start() {
 }
 
 // install replaces the rule set; a rule of this service at a kind a plugin serves must use an action that plugin
-// implements, and rules of other services or kinds are left to the processes that serve them.
+// implements and its point's restriction allows, and rules of other services or kinds are left to the processes
+// that serve them.
 func (c *core) install(data []byte) {
 	ruleset, err := ParseRuleSet(data)
 	if err != nil {
 		Abort("invalid rules: %v", err)
 	}
+	c.installing.Lock()
+	defer c.installing.Unlock()
 	next := &ruleState{experiment: ruleset.Experiment, byPoint: map[string][]*Rule{}, matches: map[string]int{},
 		injections: map[string]int{}, randoms: map[string]*rand.Rand{}}
 	for index := range ruleset.Rules {
@@ -141,6 +168,7 @@ func (c *core) install(data []byte) {
 		if !slices.Contains(actions, rule.Action.Kind) {
 			Abort("rule %s: no plugin of this process implements %s at a %s point", rule.ID, rule.Action.Kind, kind)
 		}
+		c.enforceRestriction(rule)
 		next.byPoint[rule.Point] = append(next.byPoint[rule.Point], rule)
 		seed := fnv.New64a()
 		seed.Write([]byte(rule.ID))

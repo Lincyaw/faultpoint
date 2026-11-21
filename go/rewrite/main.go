@@ -25,7 +25,7 @@ import (
 
 const (
 	manifestFile = "faultpoint-manifest.json"
-	registryFile = "faultpoint_errors.go"
+	registryFile = "faultpoint_registry.go"
 	initFile     = "faultpoint_init.go"
 	usage        = `usage:
   fprewrite instrument -service NAME -source DIR -target DIR -sdk DIR [-config FILE]
@@ -130,10 +130,11 @@ func rewriteFile(pkg *packages.Package, file *ast.File, imports []string) []byte
 	return content.Bytes()
 }
 
-// instrumentPackage writes the rewritten files of a package of a module into the module's copy, with its error
-// registry, adds its points and registered errors to the manifest, and returns the plugin packages it now imports.
+// instrumentPackage writes the rewritten files of a package of a module into the module's copy, with its registry,
+// adds its points and registered errors to the manifest, and returns the plugin packages it now imports.
 func instrumentPackage(service string, source module, copied string, config Config, pkg *packages.Package, manifest *Manifest) []string {
 	var used []string
+	var placed []PointEntry
 	for _, file := range pkg.Syntax {
 		relative := relativePath(source.dir, pkg.Fset.Position(file.Pos()).Filename)
 		var points []PointEntry
@@ -146,10 +147,11 @@ func instrumentPackage(service string, source module, copied string, config Conf
 		}
 		if len(imports) > 0 {
 			writeFile(filepath.Join(copied, relative), rewriteFile(pkg, file, imports))
-			manifest.Points, used = append(manifest.Points, points...), append(used, imports...)
+			placed, used = append(placed, points...), append(used, imports...)
 		}
 	}
-	if registry, names := errorRegistry(pkg); registry != nil && config.Placement.Errors {
+	manifest.Points = append(manifest.Points, placed...)
+	if registry, names := packageRegistry(pkg, config.Placement, placed); registry != nil {
 		writeFile(filepath.Join(copied, relativePath(source.dir, filepath.Dir(pkg.GoFiles[0])), registryFile), registry)
 		manifest.Errors = append(manifest.Errors, names...)
 	}
@@ -255,9 +257,8 @@ func scan(arguments []string) {
 				relative := known.prefix + relativePath(known.dir, pkg.Fset.Position(file.Pos()).Filename)
 				manifest.Points = append(manifest.Points, placePoints(*service, relative, config.Placement, pkg, file)...)
 			}
-			if _, names := errorRegistry(pkg); config.Placement.Errors {
-				manifest.Errors = append(manifest.Errors, names...)
-			}
+			_, names := packageRegistry(pkg, config.Placement, nil)
+			manifest.Errors = append(manifest.Errors, names...)
 		}
 	}
 	if libraries := scopedLibraries(graph, config.Placement); len(libraries) > 0 {
