@@ -49,11 +49,12 @@ class HttpBoundaries {
   async serve(handler: Handler, request: IncomingMessage, response: ServerResponse): Promise<void> {
     const requestContext = context.active();
     const point = pointId(CORE.settings.service, "rpc_server", `${request.method} ${this.pathTemplate(request.url ?? "/")}`);
-    const rule = CORE.decide(point);
+    const rule = CORE.decideAmong(point, ACTS_BEFORE);
+    let observed = rule;
     const started = performance.now();
     // A response that closes before it finished was abandoned: its connection closed first.
     response.on("close", () => context.with(requestContext, () => CORE.observe(point,
-      response.writableFinished ? statusOutcome(response.statusCode) : "error", performance.now() - started, rule,
+      response.writableFinished ? statusOutcome(response.statusCode) : "error", performance.now() - started, observed,
       response.writableFinished ? { status: String(response.statusCode), abandoned: "false" } : { abandoned: "true" })));
     if (rule !== null) {
       await wait(rule);
@@ -62,9 +63,9 @@ class HttpBoundaries {
       response.writeHead(failureStatus(rule)).end();
       return;
     }
-    if (rule?.action.kind === "fail_after") {
-      failAfterResponse(response, failureStatus(rule));
-    }
+    answerOnceWritten(response, () => context.with(requestContext, () => CORE.decideAmong(point, ACTS_AFTER)), (replacing) => {
+      observed = replacing;
+    });
     await handler(request, response);
   }
 
@@ -100,8 +101,8 @@ class HttpBoundaries {
           { error: errorName(error), sent: String(exchange.sent) });
         throw error;
       }
-      // Only a request that got a response is one a fail_after rule replaces and counts.
-      const replacing = CORE.decideAmong(point, ACTS_AFTER);
+      // Only a request answered with 2xx or 3xx is one a fail_after rule replaces and counts.
+      const replacing = succeeded(response.status) ? CORE.decideAmong(point, ACTS_AFTER) : null;
       if (replacing !== null) {
         await response.arrayBuffer();
         return failFetch(point, replacing, started);
@@ -177,16 +178,44 @@ function failureStatus(rule: Rule): number {
 }
 
 /** Replace a response's writers with ones that discard until the handler ends it, then send a failure. */
-function failAfterResponse(response: ServerResponse, status: number): void {
-  const { writeHead, write, end, setHeader } = response;
-  response.writeHead = (() => response) as typeof response.writeHead;
-  response.write = (() => true) as typeof response.write;
-  response.setHeader = (() => response) as typeof response.setHeader;
-  response.end = (() => {
-    Object.assign(response, { writeHead, write, end, setHeader });
-    response.writeHead(status).end();
-    return response;
-  }) as typeof response.end;
+/** Whether an answer is the success of an exchange, 2xx or 3xx, which is the only one fail_after replaces. */
+function succeeded(status: number): boolean {
+  return status >= 200 && status < 400;
+}
+
+/** Watch a response as its handler starts to write it. At the first writer call the status is known, and a fail_after
+ * rule decided then, which only a 2xx or 3xx answer counts, answers with the rule's failure instead, dropping the
+ * handler's headers and body; otherwise the writers are put back and the call goes on. */
+function answerOnceWritten(response: ServerResponse, decide: () => Rule | null, replaced: (rule: Rule) => void): void {
+  const { writeHead, write, end } = response;
+  const restore = (): void => {
+    Object.assign(response, { writeHead, write, end });
+  };
+  const replaces = (status: number): boolean => {
+    restore();
+    const replacement = succeeded(status) ? decide() : null;
+    if (replacement === null) {
+      return false;
+    }
+    replaced(replacement);
+    response.writeHead = (() => response) as typeof response.writeHead;
+    response.write = (() => true) as typeof response.write;
+    response.end = (() => {
+      restore();
+      for (const name of response.getHeaderNames()) {
+        response.removeHeader(name);
+      }
+      response.writeHead(failureStatus(replacement)).end();
+      return response;
+    }) as typeof response.end;
+    return true;
+  };
+  response.writeHead = ((status: number, ...rest: unknown[]) => (replaces(status) ? response
+    : writeHead.apply(response, [status, ...rest] as Parameters<typeof writeHead>))) as typeof response.writeHead;
+  response.write = ((...rest: unknown[]) => (replaces(response.statusCode) ? true
+    : write.apply(response, rest as Parameters<typeof write>))) as typeof response.write;
+  response.end = ((...rest: unknown[]) => (replaces(response.statusCode) ? response.end()
+    : end.apply(response, rest as Parameters<typeof end>))) as typeof response.end;
 }
 
 function boundaryError(rule: Rule): Error {
@@ -274,7 +303,7 @@ function answerInstead(clientRequest: ClientRequest, rule: Rule,
 }
 
 /** Let a request reach its peer and watch its response: a fail_after rule decided when the response comes, which only
- * an answered request counts, hides it behind a failure; otherwise the response is observed and passed on. */
+ * a 2xx or 3xx answer counts, hides it behind a failure; otherwise the response is observed and passed on. */
 function receiveResponse(clientRequest: ClientRequest, rule: Rule | null, exchange: { replaced: boolean },
                          replacing: () => Rule | null, observe: (outcome: string, detail: Record<string, string>, observed: Rule | null) => void): void {
   const emit = clientRequest.emit;
@@ -283,7 +312,7 @@ function receiveResponse(clientRequest: ClientRequest, rule: Rule | null, exchan
       return emit.call(this, event, ...arguments_);
     }
     const response = arguments_[0] as IncomingMessage;
-    const replacement = replacing();
+    const replacement = succeeded(response.statusCode ?? 0) ? replacing() : null;
     if (replacement === null) {
       observe(statusOutcome(response.statusCode ?? 0), { status: String(response.statusCode ?? 0) }, rule);
       return emit.call(this, event, ...arguments_);
