@@ -63,7 +63,7 @@
 
 ### 2.4 验证
 
-对排名最前的只靠拼接得到的链（缺省 10 条）和几条单场景可见的链（缺省 3 条），把条件合并到基线上得到负载 `validate.<参数=值>`，在其中只注入链首故障（单独运行，3 次对照、3 次处理），逐跳检查效果是否出现。链首故障和合并负载相同的链共用一次运行。`--cross-layer` 另外验证排名最前的、跨越多个层的只靠拼接的链。`--chain` 按键另外验证排序之外的链（也可以是以前验证过的链），记录中标为 `named`，与按排序选出的验证分开报告。
+对排名最前的只靠拼接得到的链（缺省 10 条）和几条单场景可见的链（缺省 3 条），把条件合并到基线上得到负载 `validate.<参数=值>`，在其中只注入链首故障（单独运行，3 次对照、3 次处理），逐跳检查效果是否出现。链首故障和合并负载相同的链共用一次运行。`--cross-layer` 另外验证排名最前的、跨越多个层、终止于用户可见失败的只靠拼接的链，其中第一个故障所在的层与最后的效果都相同的链最多取 `--per-pair` 条（缺省 3），使选出的链不集中在一个枢纽上；拼接为此分别保留排名最前的 300 条只靠拼接的和 300 条单场景可见的这类链。`--chain` 按键另外验证排序之外的链（也可以是以前验证过的链），记录中标为 `named`，与按排序选出的验证分开报告。
 
 验证反馈到效果映射：一跳的效果出现时，看下一跳的效果是否随之出现，记为对（效果，对应的故障，下一跳期待的后果）这一步的一次证实或否定，累积在 `mapping-feedback.json` 中。只被否定、从未被证实的步，拼接不再经过。单位是三元组而不是（效果，对应的故障）：同一个对应可以带来一个后果而带不来另一个，例如把 orders 的 `retryable` 取反带来了更多的重试和用户的 5xx，却带不来“每次重试都再预留一次”。
 
@@ -131,12 +131,11 @@ orders 的超时由环境变量 `RESERVE_TIMEOUT_S` 给出，作用于它的整�
 
 | 效果 | 对应的故障 |
 | --- | --- |
-| `branch` taken | `fail` |
+| `branch` taken | 无：`fail` 也在自然的原因到不了的执行中强制走入分支，例如成功的请求；拼接经过它背后的原因的边界效果 |
 | `call` error（Python、Java、TypeScript、Rust 的服务） | `fail`，抛出细节中的错误类型，例如 Python 可导入的类；细节中没有类型时无对应 |
-| `call` error（Go 的服务，错误是服务的构建登记的哨兵或包装了它） | `fail`，返回这个哨兵：Go 的调用方用 `errors.Is` 区分哨兵 |
-| `call` error（Go 的服务，其他错误，细节中是它的类型名） | 不带错误的 `fail`：Go 代码按惯例只区分已登记的哨兵，其余只判断不为 nil；这是由验证检验的假设 |
+| `call` error（Go 的服务） | 无：Go 调用点的 `fail` 在被调用者执行之后、`err != nil` 的判断处替换错误，使已经完成的工作失败，自然的错误不会这样；已登记的哨兵在同一处判断，也一样 |
 | `call` error（上游组件的原生函数） | `fail`，写入代理配置给出的、与自然失败相同的值 |
-| `check` 出现对照中没有的结果 | `negate` |
+| `check` 出现对照中没有的结果 | 无：`negate` 翻转每一次判断，也翻转自然的原因没有碰到的执行，例如 orders 对已成功的预留判断 `retryable`；拼接经过它背后的原因的边界效果 |
 | `loop` 迭代增加 | `delay`（解读为竞争） |
 | `rpc_client` timeout，请求没有完整发出（`sent=false`） | `fail` timeout |
 | `rpc_client` timeout，请求已发出，被调用的服务端在调用方离开后答复 2xx（`abandoned=true`） | `fail_after` timeout：对端完成了工作 |
@@ -150,7 +149,7 @@ orders 的超时由环境变量 `RESERVE_TIMEOUT_S` 给出，作用于它的整�
 | `syscall` EIO | `fail` EIO |
 | 依赖库中的 `branch` `call` `check` `loop` 的结果 | 无：拼接经过接收这个结果的业务调用点 |
 
-一个错误是否是已登记的哨兵，由服务的清单判断：构建登记的错误名列在清单的 `errors` 中（inventory 的是 `shop/inventory.ErrOutOfStock` 和 puddle 的 `ErrClosedPool`、`ErrNotAvailable`），它们是构建的性质，不写在效果映射里。存储的错误仍对应不带参数的 `fail`：存储的 `fail` 只接受 timeout 和 refused，不能给出指定的 SQLSTATE 或驱动错误。
+规则可以按服务的清单区分已登记的错误：构建登记的错误名列在清单的 `errors` 中（inventory 的是 `shop/inventory.ErrOutOfStock` 和 puddle 的 `ErrClosedPool`、`ErrNotAvailable`），它们是构建的性质，不写在效果映射里。现在的映射没有用到它：只有 Go 调用点上的错误需要区分哨兵，而它们都没有对应。存储的错误仍对应不带参数的 `fail`：存储的 `fail` 只接受 timeout 和 refused，不能给出指定的 SQLSTATE 或驱动错误。
 
 没有可注入对应物的效果：`branch` not_taken、`call` ok、`store_read` rows 的增加只说明执行次数变多；`check` 已有结果的增加同样可能只是执行变多；`rpc_*` 的 2xx/3xx 增加；`rpc_*` error 没有命名的动作；存储每次执行的行数增加是数据的变化，没有存储动作产生它。入口服务（gateway）`rpc_server` 的 4xx、5xx、error 是用户可见的终点。
 
@@ -296,17 +295,51 @@ orders 的超时由环境变量 `RESERVE_TIMEOUT_S` 给出，作用于它的整�
 - **否定都发生在业务层**。层的序列：依赖库起头 8 条，上游起头 1 条，依赖库 > 上游 > 业务 1 条；合并负载都是 limited-stock（`stock_per_sku=12`），因为期待的终点（409、缺货分支）只在这个场景成立。
   - 9 条在“`retryable` 为真 → 把 `retryable` 取反”之后断开：期待 409 或缺货分支，实际是用户 502、gateway 的客户端收到 503。取反让 orders 重试已经成功的预留，在 limited-stock 中耗尽库存；而链首使 inventory 在写入之前就失败。
   - 1 条在“inventory 的 `handleReserve` 调用出错（`ErrClosedPool`）→ 在这个调用点注入 `fail error=…ErrClosedPool`”之后断开：期待 orders 的缺货分支，实际只有重试。这个 Go 调用点放在 `err := s.reserve(...)` 之后的错误判断上，注入发生在预留完成之后：这个对应故障自己的处理在 limited-stock 中使库存写入从每次重复 21 次增到 26 次，并有 13 次 409；自然的 `ErrClosedPool` 发生在写入之前。
+- 每条被否定的链断开的那一跳，以及合并运行在那一跳的目标上实际出现的结果（每次重复的次数；链 3、6、8、9 的链首在 21 次结账中只使 1 次失败）：
+
+  | 链 | 链首（层） | 断开的跳 | 期待 | 实际 |
+  | --- | --- | --- | --- | --- |
+  | 1 | puddle 的 `acquire` 分支（依赖库） | 第 3 跳，取反 `retryable` | gateway 客户端 4xx `status=409` | 5xx `status=503`，21 |
+  | 2 | 同上 | 第 3 跳，取反 `retryable` | `/checkout` 4xx `status=409` | 5xx `status=502`，21 |
+  | 3 | pgxpool 的 `NewWithConfig.func1`（依赖库） | 第 3 跳，取反 `retryable` | gateway 客户端 4xx `status=409` | 5xx `status=503`，1 |
+  | 4 | PostgreSQL 的 `recvfrom` EIO（上游） | 第 3 跳，取反 `retryable` | gateway 客户端 4xx `status=409` | 5xx `status=503`，21 |
+  | 5 | pgxpool 的 `Acquire`（依赖库） | 第 3 跳，取反 `retryable` | gateway 客户端 4xx `status=409` | 5xx `status=503`，6 |
+  | 6 | pgxpool 的 `NewWithConfig.func1` | 第 3 跳，取反 `retryable` | `/checkout` 4xx `status=409` | 5xx `status=502`，1 |
+  | 7 | puddle 的 `acquire` 分支 | 第 3 跳，取反 `retryable` | inventory 的缺货分支走入 | 这个点上没有任何结果变化 |
+  | 8 | pgxpool 的 `NewWithConfig.func1` | 第 2 跳，取反 `retryable` | gateway 客户端 4xx `status=409` | 5xx `status=503`，1 |
+  | 9 | pgxpool 的 `NewWithConfig.func1`，经 `pq_getbyte` | 第 3 跳，取反 `retryable` | gateway 客户端 4xx `status=409` | 5xx `status=503`，1 |
+  | 10 | puddle 的 `acquire` 分支 | 第 2 跳，`handleReserve` 处注入 `ErrClosedPool` | orders 的缺货分支走入 | 未走入从 21 增到 63，即重试 |
+
+- **选取为什么这么窄**：排名前 300 的跨层、终止于用户的链中，只靠拼接的 268 条都在 limited-stock 中，都跨越 inventory、orders、gateway 三个服务，链首只有 15 个（inventory 的 pgx/puddle 故障点和 PostgreSQL 的系统调用），（第一个故障的层，最后的效果）只有 3 种；它们全部经过把 `retryable` 取反（232 条）、Go 调用点上的注入（8 条）或两者（28 条）。在全部 161332 条链中，这类链有 1295 条，1288 条经过这两类对应，其余 7 条中排名最前的在第 114257 位。排序先看是否需要多个场景，而在这个系统中需要多个场景、又跨层终止于用户的链，只能在 limited-stock 中由这两类对应得到 409 或缺货；跨层到达用户的失败只经过 inventory 与 PostgreSQL（Redis 的失败被 orders 的回退吸收），所以链首也集中在那里。按（层，终点）每对最多 3 条会选出 9 条，按第一个故障的层每层最多 3 条会选出 6 条，都仍然经过这两类对应：限制多样性改变不了结果，窄的是这些链本身。
 - **原因**：两处断开都是“调用方看到失败时，工作是否已经完成”。`check` 的结果没有细节，取反不分情形地翻转每一次判断；调用点上注入的时机由放置决定，细节记下错误的类型，不记下被调用的工作是否已经完成。第二轮的另外两种区别有了细节：错误类型（`fail` 抛出观测到的类），以及超时相对于服务端答复（`sent`、`abandoned`）；这一轮验证的 10 条链没有经过这两类对应。排名最前的只靠拼接的链需要多个场景，而 limited-stock 中的 409 只能由完成了工作的注入产生；忠实的对应产生的链（例如三条阳性对照）在单个场景中已经可见。
 - **反馈之后**：这次验证记下 24 次检查、12 步，其中 4 步只被否定。用它重新拼接后，排名前 300 的跨层、终止于用户的链中只靠拼接的 268 条里，255 条经过把 `retryable` 取反，25 条经过 `handleReserve` 调用点上的注入，两者都不经过的 2 条中有一跳期待的效果带 SDK 自己的注入错误类型（`faultpoint/internal/action.ErrInjected`），自然的失败不产生这个类型。这些链没有验证。
 - **Go 的假设**：两条阳性对照经过“在 `handleReserve` 调用点注入不带错误的 `fail` → orders 的 `retryable` 为真”或“→ orders 对 `/reserve` 的调用收到 500”，都被证实；后果取决于库存时它不成立，原因同上：注入在调用完成之后。
+
+### 6.3 检验：不经过已完成工作的对应
+
+证据范围：实验 `runs/search/shop-boundary-counterparts/`，与第 6.1 节同一构建（`a4bc35e`，shop 从它重建），沿用那里的全部记录，现在的效果映射（第 3.3 节）记为它的输入。
+
+- **假设**：第 6.2 节的否定都来自改变了自然原因没有碰到的执行的对应：`check` 的取反、`branch` 的 `fail`、Go 调用点在被调用者执行之后的 `fail`。把这三类效果改为没有对应，拼接就只能经过它们背后的原因的边界效果，例如阳性对照中“orders 对 `/reserve` 的调用收到 500 → 在这个客户端注入 `fail status=500`”。
+- **预言**：经过这三类对应的只靠拼接的链消失；剩下的链若被否定，原因不是工作是否已经完成。
+- **代价**：新映射只去掉对应，不需要新的对应故障，0 次注入。Go 调用点的错误都没有对应，按清单区分已登记哨兵的规则用不上，所以 `a4bc35e` 的清单没有 `errors` 不影响结果。
+- **结果**：3781 条边、134146 条链（只靠拼接的 96370 条）。跨层、只靠拼接、终止于用户的链从 1295 条降到 7 条，全部在基线中、终止于 `/checkout` 502，链首是 PostgreSQL 的包延迟（5 条）和 pgxpool、puddle 建立连接的两个故障点（各 1 条）。按（第一个故障的层，最后的效果）每对最多 3 条选出 5 条；阳性对照是 `recvfrom` EIO 起头、排名最前的 3 条单场景可见的跨层链，经由 inventory 的 `stock` 读取和 orders、gateway 的边界效果：
+
+  | 选取 | 条数 | 证实 | 否定 |
+  | --- | --- | --- | --- |
+  | 跨层、只靠拼接、终止于用户 | 5 | 0 | 5 |
+  | 阳性对照 | 3 | 3 | 0 |
+
+  - 包延迟起头的 3 条（上游 > 业务 > 业务 > 业务）在第 2 跳断开：期待 orders 对 `/reserve` 的调用收到 5xx `status=500`，实际是 timeout `error=httpx.ReadTimeout sent=true`，每次 15 次。inventory 的 500 在 orders 离开之后才答复（其中一条的第一跳就是 inventory 服务端的 5xx `abandoned=true status=500`），拼接却把它对应到立即答复的 `fail status=500`，或 inventory 存储上的 `fail`。
+  - pgxpool、puddle 起头的 2 条（依赖库 > 上游 > 业务 > 业务）在第 2 跳断开：期待 inventory 的 `stock` 读取以 `*pgconn.ConnectError` 失败，实际以 `*fppoints.injectedError` 失败，每次 3 次，这是链首自己注入的错误。`pq_getbyte` 读到的 EOF 是 inventory 关闭连接的结果，不是原因，拼接把方向反了过来。
+- **结论**：两个预言都成立。之前的 1288 条链都经过这三类对应，去掉之后，shop 中几乎不剩只靠拼接的跨层链，忠实的对应拼出的链在单个场景中已经可见。剩下的 5 条被否定，原因是时机（服务端在调用方离开后才答复）和方向（上游的自然结果是业务服务行为的结果）。细节记下了前者（`abandoned=true`），效果映射对服务端的状态还没有用它；后者是效果的因果方向，观测不记录。
 
 ## 7. 局限
 
 - 一次实验、一个随机种子；随机分配与分阶段分配的比较只针对第一轮的这一次抽样。
 - 计数的下限是固定的 20%：上游后台工作随运行时长的增加大多在 5% 以内，被它去掉；低于 20% 的真实增加（例如 33 次 Redis 命令多出 3 次）也被去掉。按运行时长归一化范围之外的计数，可以不靠这个下限。
-- 效果映射不知道调用方看到失败时工作是否已经完成：`check` 的结果没有细节，调用点上注入的时机由放置决定（第 6.2 节）。依赖库中的结果不对应故障，也是因为这一点。
+- 效果映射不知道调用方看到失败时工作是否已经完成，所以 `check`、`branch`、Go 调用点和依赖库中的结果都不对应故障，拼接只经过边界效果（第 6.3 节）。
+- 服务端在调用方离开之后才答复的状态（`abandoned=true`）仍对应立即答复的 `fail`；上游组件的自然结果可能是业务服务行为的结果，拼接不知道效果的方向（第 6.3 节）。
 - 注入的错误以 SDK 自己的类型出现在下游的细节中（`faultpoint/internal/action.ErrInjected`、`*fppoints.injectedError`），与自然错误的类型不同，经过这类效果的拼接在键上就与自然的传播不一致。
-- Go 的非哨兵错误对应不带错误的 `fail`，是按 Go 惯例的假设。
 - 验证反馈按（效果，对应的故障，后果）三元组排除被否定的步，同一个不忠实的对应可以经由下一个后果再次出现；反馈只能逐步收敛，不能推广到同一类对应。
 - 依赖库中的热路径故障点没有延迟动作；库中的 `fail` 可能使连接池进入真实系统不会进入的状态，结论限于它实际表现出的行为。
 - 一次重复最多发送 120 s 的结账，使整个服务停住的故障只观测到前 120 s。
