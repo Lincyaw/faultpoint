@@ -161,9 +161,10 @@ def group_treatments(groups: list[tuple[Group, list[SearchRun]]], controls: dict
 
 def edge_assignments(groups: list[tuple[Group, list[SearchRun]]],
                      records: dict[tuple[str, str], tuple[TreatmentRecord, Phase | None]]) -> list[Assignment]:
-    """The load variant runs as the allocation's assignments: every fault and workload in the order its first group
-    ran, with the phase its run recorded."""
-    pairs = dict.fromkeys((fault.key, group.workload.name) for group, _ in groups for fault in group.faults)
+    """The load variant runs as the allocation's assignments: every fault and workload with a record, in the order
+    its first group ran, with the phase its run recorded; a fault only a leaking group ran has no record yet."""
+    pairs = dict.fromkeys((fault.key, group.workload.name) for group, _ in groups for fault in group.faults
+                          if (fault.key, group.workload.name) in records)
     assignments = []
     for key, workload in pairs:
         record, phase = records[(key, workload)]

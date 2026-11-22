@@ -5,7 +5,7 @@ from faultpoint.observations import read_records
 from faultpoint.rules import RuleSet
 from faultsearch.allocation import Phase
 from faultsearch.counterfactual import DEFAULT_SEED, NamedWorkload, Statuses
-from faultsearch.facts import FACT, Fact, Facts, PathRequest, Purpose, SearchRun, tallies
+from faultsearch.facts import FACT, Fact, FactList, Facts, PathRequest, Purpose, SearchRun, tallies
 from pydantic import JsonValue, TypeAdapter
 
 from faultsearch_local.store import Store
@@ -29,32 +29,17 @@ def read_facts(path: Path) -> Facts:
     return Facts(facts=tuple(FACT.validate_json(line) for line in path.read_text(encoding="utf-8").splitlines()))
 
 
-class FactLog:
-    """An experiment's facts.jsonl, read once and then appended to, every fact numbered next and every search run's
-    identity written once."""
+class FactLog(FactList):
+    """An experiment's facts.jsonl, read once and then appended to, line by line."""
 
     def __init__(self, path: Path) -> None:
+        super().__init__(list(read_facts(path).facts) if path.exists() else [])
         self.path = path
-        self.facts: list[Fact] = list(read_facts(path).facts) if path.exists() else []
-        self.runs: dict[tuple[str, str], SearchRun] = {(fact.source, fact.label): fact for fact in self.facts
-                                                       if isinstance(fact, SearchRun)}
-
-    def next_sequence(self) -> int:
-        return self.facts[-1].sequence + 1 if self.facts else 1
 
     def append(self, fact: Fact) -> None:
-        if fact.sequence != self.next_sequence():
-            raise ValueError(f"the next fact of {self.path} is number {self.next_sequence()}, not {fact.sequence}")
-        if isinstance(fact, SearchRun) and (fact.source, fact.label) in self.runs:
-            raise ValueError(f"{self.path} holds the search run {fact.label} of {fact.source} already")
+        super().append(fact)
         with self.path.open("a", encoding="utf-8") as lines:
             lines.write(f"{FACT.dump_json(fact).decode()}\n")
-        self.facts.append(fact)
-        if isinstance(fact, SearchRun):
-            self.runs[(fact.source, fact.label)] = fact
-
-    def snapshot(self) -> Facts:
-        return Facts(facts=tuple(self.facts))
 
 
 class RunOrigin:

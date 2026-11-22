@@ -300,3 +300,30 @@ class Facts(BaseModel):
         if not found:
             raise ValueError(f"the facts hold no {kind.__name__}")
         return found[-1]
+
+    def holds[F: BaseModel](self, kind: type[F]) -> bool:
+        return any(isinstance(fact, kind) for fact in self.facts)
+
+
+class FactList:
+    """Facts appended in sequence order, every fact numbered next and every search run's identity written once."""
+
+    def __init__(self, facts: list[Fact]) -> None:
+        self.facts = facts
+        self.runs: dict[tuple[str, str], SearchRun] = {(fact.source, fact.label): fact for fact in facts
+                                                       if isinstance(fact, SearchRun)}
+
+    def next_sequence(self) -> int:
+        return self.facts[-1].sequence + 1 if self.facts else 1
+
+    def append(self, fact: Fact) -> None:
+        if fact.sequence != self.next_sequence():
+            raise ValueError(f"the next fact is number {self.next_sequence()}, not {fact.sequence}")
+        if isinstance(fact, SearchRun) and (fact.source, fact.label) in self.runs:
+            raise ValueError(f"the search run {fact.label} of {fact.source} is written already")
+        self.facts.append(fact)
+        if isinstance(fact, SearchRun):
+            self.runs[(fact.source, fact.label)] = fact
+
+    def snapshot(self) -> Facts:
+        return Facts(facts=tuple(self.facts))
