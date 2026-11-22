@@ -6,12 +6,13 @@ description = "Fault points that both inject and observe faults, for counterfact
 
 [features]
 default = []
+tokio = ["dep:tokio"]
 # The rpc_server boundary as a tower layer, which the rewriter wires at axum::serve.
-tower = ["dep:tower", "dep:http", "dep:tokio", "dep:regex", "dep:opentelemetry_sdk", "dep:opentelemetry-http"]
+tower = ["dep:tower", "dep:http", "tokio", "dep:regex", "dep:opentelemetry_sdk", "dep:opentelemetry-http"]
 # The store points the rewriter places at sqlx and redis-rs call sites; the copy supplies the client's own types.
-store = ["dep:tokio", "dep:regex", "dep:sqlparser"]
+store = ["tokio", "dep:regex", "dep:sqlparser"]
 # Protocol boundaries inserted in the dependency copies of reqwest and tonic.
-client = ["dep:tokio", "dep:http", "dep:regex", "dep:opentelemetry_sdk", "dep:opentelemetry-http"]
+client = ["tokio", "dep:http", "dep:regex", "dep:opentelemetry_sdk", "dep:opentelemetry-http"]
 
 [dependencies]
 opentelemetry = "0.33"

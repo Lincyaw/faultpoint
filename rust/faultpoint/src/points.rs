@@ -141,6 +141,13 @@ impl ClockReading for Instant {
     }
 }
 
+#[cfg(feature = "tokio")]
+impl ClockReading for tokio::time::Instant {
+    fn shifted(self, seconds: f64) -> Self {
+        Self::from_std(self.into_std().shifted(seconds))
+    }
+}
+
 /// A clock reading, moved by a shift rule's seconds.
 pub fn clock<T: ClockReading>(point: &str, reading: T) -> T {
     own(|| {
