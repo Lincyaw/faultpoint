@@ -201,8 +201,8 @@ class PointInventory(FactBody):
 
     @property
     def identity(self) -> str:
-        return sha256(self.model_dump_json(include={"system", "revision", "sdk_build", "deployment",
-                                                    "controls"}).encode()).hexdigest()[:12]
+        return digest(self.model_dump(mode="json", include={"system", "revision", "sdk_build", "deployment",
+                                                            "controls"}))
 
 
 class SystemTopology(FactBody):

@@ -1,3 +1,4 @@
+import json
 from collections import defaultdict
 from collections.abc import Iterable
 from enum import StrEnum
@@ -75,9 +76,12 @@ def point_scoped(point: str, layer: Layer, kinds: KindTable) -> bool:
 
 
 def action_text(action: Action, probability: float) -> str:
-    parameters = sorted(action.model_dump(exclude={"kind"}).items())
+    """An action's parameters sorted by name, a structured value such as fail's when as JSON with its keys sorted, so
+    that the text, and the fault's key and digest, never depend on the order the parameters were written in."""
+    parameters = [f"{name}={json.dumps(value, sort_keys=True) if isinstance(value, dict | list) else value}"
+                  for name, value in sorted(action.model_dump(exclude={"kind"}).items())]
     chance = [f"{PROBABILITY}={probability}"] if probability < 1 else []
-    return " ".join([action.kind, *(f"{name}={value}" for name, value in parameters), *chance])
+    return " ".join([action.kind, *parameters, *chance])
 
 
 class Following(BaseModel):
