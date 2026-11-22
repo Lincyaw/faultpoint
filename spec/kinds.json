@@ -69,15 +69,17 @@
       "actions": ["fail", "fail_after", "duplicate", "delay", "crash"],
       "outcomes": ["2xx", "3xx", "4xx", "5xx", "timeout", "refused", "error"],
       "status": true,
+      "code": true,
       "errors": ["timeout", "refused"],
-      "details": ["status", "error", "sent"]
+      "details": ["status", "code", "error", "sent"]
     },
     "rpc_server": {
       "actions": ["fail", "fail_after", "delay", "crash"],
       "outcomes": ["2xx", "3xx", "4xx", "5xx", "error"],
       "status": true,
+      "code": true,
       "errors": [],
-      "details": ["status", "error", "abandoned"]
+      "details": ["status", "code", "error", "abandoned"]
     },
     "store_read": {
       "actions": ["fail", "empty", "delay", "crash"],

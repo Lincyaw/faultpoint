@@ -20,8 +20,28 @@
       {"kind": "duplicate"},
       {"kind": "delay", "ms": 500}
     ],
+    "publish": [
+      {"kind": "fail"}, {"kind": "fail_after"},
+      {"kind": "duplicate"}, {"kind": "delay", "ms": 500}
+    ],
+    "consume": [
+      {"kind": "fail"}, {"kind": "fail_after"},
+      {"kind": "duplicate"}, {"kind": "delay", "ms": 500}
+    ],
     "syscall": [{"kind": "fail", "error": "EIO"}],
     "packet": [{"kind": "delay", "ms": 500}]
+  },
+  "grpc": {
+    "rpc_client": [
+      {"kind": "fail", "code": "14"},
+      {"kind": "fail_after", "code": "14"},
+      {"kind": "delay", "ms": 500}
+    ],
+    "rpc_server": [
+      {"kind": "fail", "code": "14"},
+      {"kind": "fail_after", "code": "14"},
+      {"kind": "delay", "ms": 500}
+    ]
   },
   "library": {
     "branch": [{"kind": "fail"}],

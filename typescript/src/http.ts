@@ -10,7 +10,7 @@ import { z } from "zod";
 
 import { PROPAGATOR } from "./context.js";
 import { ACTS_AFTER, ACTS_BEFORE, CORE, EVERY_LOCATOR, type Plugin, errorName } from "./core.js";
-import { type Rule, numberParameter, pointId, stringParameter } from "./rules.js";
+import { type Rule, numberParameter, pointId, pointParts, stringParameter } from "./rules.js";
 
 const DEFAULT_FAILURE_STATUS = 503;
 
@@ -457,6 +457,14 @@ export const httpPlugin: Plugin = {
       rpc_server: ["fail", "fail_after", "delay", "crash"],
       rpc_client: ["fail", "fail_after", "duplicate", "delay", "crash"],
     }, EVERY_LOCATOR);
+    core.check((rule) => {
+      const { kind, locator } = pointParts(rule.point);
+      if ((kind === "rpc_client" || kind === "rpc_server") && !locator.startsWith("gRPC ")
+        && (rule.action.kind === "fail" || rule.action.kind === "fail_after") && rule.action.code !== undefined) {
+        return "HTTP failures require status, not a native RPC code";
+      }
+      return null;
+    });
     for (const server of [http.Server.prototype, https.Server.prototype]) {
       const emit = server.emit as (this: http.Server, event: string | symbol, ...arguments_: unknown[]) => boolean;
       server.emit = function (this: http.Server, event: string | symbol, ...arguments_: unknown[]): boolean {
