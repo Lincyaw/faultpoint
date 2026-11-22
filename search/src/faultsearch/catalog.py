@@ -6,6 +6,7 @@ from functools import cached_property
 from hashlib import sha256
 from pathlib import Path
 from typing import Final, Self
+from urllib.parse import urlsplit
 
 from faultpoint.observations import ObservationRecord
 from faultpoint.placement import Manifest
@@ -46,6 +47,7 @@ RPC_CLIENT: Final = "rpc_client"
 RPC_SERVER: Final = "rpc_server"
 BOUNDARY_KINDS: Final = frozenset({RPC_CLIENT, RPC_SERVER})
 """The kinds of the points where one service meets another."""
+GRPC_METHOD: Final = "gRPC"
 
 
 def point_kind(point: str) -> str:
@@ -54,6 +56,31 @@ def point_kind(point: str) -> str:
 
 def point_service(point: str) -> str:
     return point.split(":", 1)[0]
+
+
+class RpcPeers(BaseModel):
+    """Explicit host ownership, or unambiguous legacy listening ports, for RPC client locators."""
+
+    model_config = FROZEN
+
+    ports: dict[str, int]
+    hosts: dict[str, str] = {}
+
+    @cached_property
+    def unique_ports(self) -> dict[int, str]:
+        owners: dict[int, list[str]] = defaultdict(list)
+        for service, port in self.ports.items():
+            owners[port].append(service)
+        return {port: services[0] for port, services in owners.items() if len(services) == 1}
+
+    def server_point(self, client: str) -> str | None:
+        """The called server point, absent when its locator does not establish a known peer."""
+        method, target = client.split(":", 2)[2].split(" ", 1)
+        address = urlsplit(target if "://" in target else f"//{target}" if not target.startswith("/") else target)
+        if address.hostname is None:
+            return None
+        service = self.hosts.get(address.hostname) if self.hosts else self.unique_ports.get(address.port)
+        return f"{service}:{RPC_SERVER}:{method} {address.path}" if service is not None else None
 
 
 def point_symbol(point: str) -> str:
@@ -139,6 +166,7 @@ class ActionTable(BaseModel):
     model_config = FROZEN
 
     kinds: dict[str, tuple[Action, ...]]
+    grpc: dict[str, tuple[Action, ...]] = {}
     library: dict[str, tuple[Action, ...]] = {}
     functions: dict[str, tuple[Action, ...]] = {}
     """The actions at the points the kernel agent places in an upstream component's functions, by function, since a
@@ -152,6 +180,8 @@ class ActionTable(BaseModel):
         """The actions to try at a point, none when its kind, or its function, has no list for its layer."""
         if layer == Layer.UPSTREAM and point_kind(point) in FUNCTION_KINDS:
             return self.functions.get(point_symbol(point))
+        if point_kind(point) in BOUNDARY_KINDS and point.split(":", 2)[2].partition(" ")[0] == GRPC_METHOD:
+            return self.grpc.get(point_kind(point))
         return (self.library if layer == Layer.LIBRARY else self.kinds).get(point_kind(point))
 
 

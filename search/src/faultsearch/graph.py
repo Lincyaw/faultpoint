@@ -8,7 +8,7 @@ from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel
 
 from faultsearch.allocation import Allocation, Assignment, Phase, Strategy, allocation_of
-from faultsearch.catalog import (FOLLOWING_SEPARATOR, FROZEN, ActionTable, Catalog, Fault, Following, build_catalog,
+from faultsearch.catalog import (FOLLOWING_SEPARATOR, FROZEN, ActionTable, Catalog, Fault, Following, RpcPeers, build_catalog,
                                  control_executions, point_layer, point_manifests, point_scoped)
 from faultsearch.chains import Stitcher, Stitching
 from faultsearch.counterfactual import ControlRecord, Group, Repetitions, Statuses, TreatmentRecord, tenant_names
@@ -280,7 +280,7 @@ class FactGraph:
                             update={"terminal_outcomes": self.topology.terminal_outcomes}),
                         catalog=self.catalog, kinds=self.kinds, upstream=self.topology.upstream,
                         targets=self.topology.targets,
-                        services={port: service for service, port in self.topology.ports.items()},
+                        peers=RpcPeers(ports=self.topology.ports, hosts=self.topology.hosts),
                         manifests=point_manifests(self.inventory.manifests),
                         min_count_increase=settings.min_count_increase, min_mean_increase=settings.min_mean_increase,
                         acceptance=settings.acceptance, width=settings.width, max_hops=settings.max_hops,

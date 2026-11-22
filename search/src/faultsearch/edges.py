@@ -4,7 +4,6 @@ from enum import StrEnum
 from pathlib import Path
 from statistics import fmean
 from typing import Final, Self
-from urllib.parse import urlsplit
 
 from faultpoint.actions import ActionKind
 from faultpoint.placement import Manifest
@@ -14,7 +13,7 @@ from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, JsonValue
 
 from faultsearch.allocation import Assignment, Phase, Strategy
-from faultsearch.catalog import (DATA, FROZEN, RPC_CLIENT, RPC_SERVER, Catalog, Fault, Following, Layer, implements,
+from faultsearch.catalog import (DATA, FROZEN, RPC_CLIENT, RPC_SERVER, Catalog, Fault, Following, Layer, RpcPeers, implements,
                                  point_kind, point_layer, point_scoped, point_service, point_symbol)
 from faultsearch.counterfactual import EffectKey, Load, Scenarios, TreatmentRecord
 
@@ -39,14 +38,6 @@ type DetailValues = dict[str, tuple[str, ...]]
 
 def shows(detail: dict[str, str], required: DetailValues) -> bool:
     return all(detail.get(name) in values for name, values in required.items())
-
-
-def peer_point(client: str, services: dict[int, str]) -> str:
-    """The server point a client point calls: the service listening on the locator's port, at the same method and
-    path."""
-    method, target = client.split(":", 2)[2].split(" ", 1)
-    address = urlsplit(f"//{target}")
-    return f"{services[address.port]}:{RPC_SERVER}:{method} {address.path}"
 
 
 class Registration(StrEnum):
@@ -270,11 +261,11 @@ def holds(effect: Effect, min_count_increase: float) -> bool:
             or fmean(effect.treatment) >= (1 + min_count_increase) * fmean(effect.control))
 
 
-def peer_effects(effect: EffectKey, runs: list[dict[str, Effect]], services: dict[int, str]) -> list[EffectKey]:
+def peer_effects(effect: EffectKey, runs: list[dict[str, Effect]], peers: RpcPeers) -> list[EffectKey]:
     """For a client point's effect, the effects of the server point it called that every run where it held showed."""
     if point_kind(effect.point) != RPC_CLIENT:
         return []
-    peer = peer_point(effect.point, services)
+    peer = peers.server_point(effect.point)
     return [EffectKey.of(found) for key, found in runs[0].items()
             if found.point == peer and all(key in run for run in runs)]
 
@@ -353,14 +344,15 @@ def effect_profile(held_runs: list[TreatmentRecord], held: list[Sighting], key: 
                          rate=fmean(rates) if rates else 1.0)
 
 
-def behaves_alike(natural: TreatmentRecord, substitute: TreatmentRecord, service: str, services: dict[int, str],
+def behaves_alike(natural: TreatmentRecord, substitute: TreatmentRecord, service: str, peers: RpcPeers,
                   min_count_increase: float, min_mean_increase: float, acceptance: Acceptance) -> bool:
     """Whether a substitute run behaves as the natural run it stands for where callers see it: at the server points of
     the effect's service and at the client points that call them, every outcome within the smallest change that
     counts as an effect, in executions per repetition unless only timing is compared, and in their mean."""
     points = {point for point in (*natural.boundary, *substitute.boundary)
               if (point_kind(point) == RPC_SERVER and point_service(point) == service)
-              or (point_kind(point) == RPC_CLIENT and point_service(peer_point(point, services)) == service)}
+              or (point_kind(point) == RPC_CLIENT and (peer := peers.server_point(point)) is not None
+                  and point_service(peer) == service)}
     seen_points = {point: (natural.boundary.get(point, {}), substitute.boundary.get(point, {})) for point in points}
     loads = [(seen.get(outcome, ABSENT), stand.get(outcome, ABSENT))
              for seen, stand in seen_points.values() for outcome in {*seen, *stand}]
@@ -371,13 +363,13 @@ def behaves_alike(natural: TreatmentRecord, substitute: TreatmentRecord, service
 
 
 def mismatched_counterparts(cause: Fault, effect: EffectKey, held_in: list[str], faults: tuple[Fault, ...],
-                            runs: dict[tuple[str, str], TreatmentRecord], services: dict[int, str],
+                            runs: dict[tuple[str, str], TreatmentRecord], peers: RpcPeers,
                             min_count_increase: float, min_mean_increase: float,
                             acceptance: Acceptance) -> tuple[str, ...]:
     """The counterparts whose substitute runs behaved unlike the natural run in every scenario where the edge held and
     both ran, which no chain continues the edge with; a counterpart no such scenario ran is not judged."""
     return tuple(fault.key for fault in faults if (checks := [
-        behaves_alike(runs[(cause.key, scenario)], runs[(fault.key, scenario)], point_service(effect.point), services,
+        behaves_alike(runs[(cause.key, scenario)], runs[(fault.key, scenario)], point_service(effect.point), peers,
                       min_count_increase, min_mean_increase, acceptance)
         for scenario in held_in if (fault.key, scenario) in runs]) and not any(checks))
 
@@ -439,7 +431,7 @@ def following_rules(change: PointChange, changes: list[PointChange], runs: list[
 
 
 def point_changes(runs: list[TreatmentRecord], shown: dict[str, dict[str, Effect]], effects: EffectMap,
-                  catalog: Catalog, kinds: KindTable, upstream: frozenset[str], services: dict[int, str],
+                  catalog: Catalog, kinds: KindTable, upstream: frozenset[str], peers: RpcPeers,
                   manifests: dict[str, Manifest]) -> list[PointChange]:
     """Every effect a fault's runs showed, where it held and did not, and its own counterparts."""
     changes = []
@@ -451,7 +443,7 @@ def point_changes(runs: list[TreatmentRecord], shown: dict[str, dict[str, Effect
         profile = effect_profile([run for run in runs if run.workload in held_in], held, key, effect)
         counterpart, faults = counterparts(effect, {sighting.effect.verdict for sighting in held}, layer,
                                            manifests.get(effect.point),
-                                           peer_effects(effect, [shown[name] for name in held_in], services),
+                                           peer_effects(effect, [shown[name] for name in held_in], peers),
                                            effects, catalog, kinds, profile)
         changes.append(PointChange(effect=effect, layer=layer, held=tuple(held),
                                    not_held=tuple(run.workload for run in runs if run.workload not in held_in),
@@ -460,7 +452,7 @@ def point_changes(runs: list[TreatmentRecord], shown: dict[str, dict[str, Effect
 
 
 def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: EffectMap, catalog: Catalog,
-                kinds: KindTable, upstream: frozenset[str], targets: dict[str, str], services: dict[int, str],
+                kinds: KindTable, upstream: frozenset[str], targets: dict[str, str], peers: RpcPeers,
                 manifests: dict[str, Manifest], min_count_increase: float, min_mean_increase: float,
                 acceptance: Acceptance) -> list[Edge]:
     """Every (fault, effect) pair the exercised records show, over the scenarios each fault was tested in, with
@@ -475,7 +467,7 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
         cause = runs[0].fault
         shown = {run.workload: {EffectKey.of(effect).key: effect for effect in run.effects
                                 if holds(effect, min_count_increase)} for run in runs}
-        changes = point_changes(runs, shown, effects, catalog, kinds, upstream, services, manifests)
+        changes = point_changes(runs, shown, effects, catalog, kinds, upstream, peers, manifests)
         for change in changes:
             following = following_rules(change, changes, runs, catalog)
             faults = tuple(fault.model_copy(update={"following": following}) for fault in change.faults)
@@ -488,7 +480,7 @@ def build_edges(records: list[TreatmentRecord], scenarios: Scenarios, effects: E
                 terminal=effects.terminal(change.effect), effect_layer=change.layer,
                 injected=effects.injected(change.effect),
                 mismatched=mismatched_counterparts(cause, change.effect, list(change.held_in), faults, by_run,
-                                                   services, min_count_increase, min_mean_increase, acceptance),
+                                                   peers, min_count_increase, min_mean_increase, acceptance),
                 acts_on=None if cause.scoped else targets[point_service(cause.point)]))
     return edges
 

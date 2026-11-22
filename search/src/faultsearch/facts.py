@@ -207,8 +207,8 @@ class PointInventory(FactBody):
 
 class SystemTopology(FactBody):
     """What computing a system's graph needs to know of its deployment: its upstream components, the service whose
-    responses the user sees and which of them are failures, the port each service listens on, which tells the service
-    a client point calls, and what a fault no rule can scope acts on."""
+    responses the user sees and which of them are failures, the hosts or unique listening ports that identify RPC
+    peers, and what a fault no rule can scope acts on."""
 
     kind: Literal[FactKind.SYSTEM_TOPOLOGY] = FactKind.SYSTEM_TOPOLOGY
     system: str
@@ -216,6 +216,8 @@ class SystemTopology(FactBody):
     entry_service: str
     terminal_outcomes: tuple[str, ...]
     ports: dict[str, int]
+    hosts: dict[str, str] = Field(default_factory=dict, exclude_if=lambda hosts: not hosts)
+    """Explicit URL host ownership; when supplied, unknown hosts have no inferred peer."""
     targets: dict[str, str]
 
     @field_serializer("upstream")

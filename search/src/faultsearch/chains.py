@@ -11,7 +11,7 @@ from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel
 
 from faultsearch.allocation import Allocation, Strategy
-from faultsearch.catalog import FROZEN, Catalog, Fault, Layer, point_service
+from faultsearch.catalog import FROZEN, Catalog, Fault, Layer, RpcPeers, point_service
 from faultsearch.counterfactual import EffectKey, Scenarios, TreatmentRecord
 from faultsearch.edges import Acceptance, Condition, Edge, EffectMap, build_edges, holds
 from faultsearch.evidence import ClassChecks, MappingFeedback, step_classes, step_probability
@@ -338,7 +338,7 @@ class Stitcher(BaseModel):
     kinds: KindTable
     upstream: frozenset[str]
     targets: dict[str, str]
-    services: dict[int, str]
+    peers: RpcPeers
     manifests: dict[str, Manifest]
     min_count_increase: float
     min_mean_increase: float
@@ -349,7 +349,7 @@ class Stitcher(BaseModel):
 
     def edges(self, records: list[TreatmentRecord]) -> list[Edge]:
         return build_edges(records, self.scenarios, self.effects, self.catalog, self.kinds, self.upstream, self.targets,
-                           self.services, self.manifests, self.min_count_increase, self.min_mean_increase,
+                           self.peers, self.manifests, self.min_count_increase, self.min_mean_increase,
                            self.acceptance)
 
     def chains(self, edges: list[Edge], allocation: Allocation, records: list[TreatmentRecord],
