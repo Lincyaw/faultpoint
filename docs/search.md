@@ -30,7 +30,18 @@
 
 ## 2. 流程
 
-`faultsearch explore|replay|stitch|complete|validate|report EXPERIMENT`，所有输入、运行、效果、边、簇、链和验证都以 JSON 保存在 `runs/search/EXPERIMENT/` 下。已有的记录在重新执行时直接读取，因此中断后可以续跑；输入（场景、动作表、效果映射、运行与分配设置）在第一次执行时记录，之后不同则拒绝执行，保证续跑的记录可比。服务用 `--sdk-root` 指定的 SDK 提交构建；`search` 按路径依赖 `../python`，它随仓库的其他工作变化，所以实验时把 `search` 环境中的 faultpoint 换成同一提交的 worktree（`uv pip install -e <worktree>/python[tools]`，之后用 `uv run --no-sync`），比较与观测解析也就来自这个提交。
+`search/` 分成两个包：
+- **核心包 `faultsearch`**（`search/`）：只依赖 `faultpoint[tools]` 和数值库，可以按 git 子目录安装。它定义只追加的事实（搜索运行、故障点表、系统拓扑、负载变体，以及评议、等价、作废），由事实算出图的 `compute_graph`，规划 `plan`，以及执行器接口。图是事实的函数：处理记录、边、链和路径判定都由事实重新算出，不另存。`faultsearch-facts-schema` 输出事实的 JSON Schema。
+- **本地包 `faultsearch-local`**（`search/local/`）：在本机容器中运行示例系统的执行器和命令行。示例系统以入口点 `faultsearch.systems` 注册。
+
+`faultsearch search EXPERIMENT` 按阶段规划并运行，直到规划结束：
+- 每个请求的搜索运行在它的重复跑完后追加到 `runs/search/EXPERIMENT/facts.jsonl`；事实中已有的身份不再重跑。
+- 规划状态在每一步后存进 `plan-state.json`，中断后从它续跑。
+- 设置在第一次执行时记录，之后不同则拒绝执行，保证续跑的事实可比。
+
+`chains` 和 `report` 读由事实算出的图，`budgets` 在一份完整实验的事实上离线比较规划，`trial` 单独注入给定的故障。之前格式的实验目录用 `import-facts` 转成事实，`graph-check` 把算出的图与它们的旧记录逐项比较。
+
+服务用 `--sdk-root` 指定的 SDK 提交构建。`search` 按路径依赖 `../python`，它随仓库的其他工作变化，所以实验时把环境中的 faultpoint 换成同一提交的 worktree（`uv pip install -e <worktree>/python[tools]`，之后用 `uv run --no-sync`），比较与观测解析也就来自这个提交。
 
 ### 2.1 反事实故障分析：对照、处理与打包
 
@@ -50,8 +61,10 @@
 
 随机分配用同样的预算，从所有“故障 × 执行该故障点的场景”中均匀抽样。两种分配的同一个（故障，场景）对共用一份处理记录。
 
-- **重放**：`replay NEW --source OLD` 用新的 SDK 构建，在另一个实验的场景和设置下重跑它分阶段分配的全部（故障，场景）对，再把目录中这些分配没有覆盖的故障（例如新的故障来源）各注入一次；簇由每个故障的第一次运行重新计算。同一实验只用一个构建。
-- **对应故障**：`complete` 把边的效果所对应、但还没有任何分配注入过的故障（多数是细节给出的状态码或错误类型），在这个效果成立的每个场景中注入一次，记为 `counterpart` 阶段，使拼接能经过它们；`stitch` 先报告还需要多少次这样的注入。
+- **对应故障**：规划的补跑阶段把边的效果所对应、但还没有任何分配注入过的故障（多数是细节给出的状态码或错误类型）注入到执行它的场景中，使拼接能经过它们，预算为 `--refill-budget`：
+  - `--refill rounds`：每轮列出现有的边需要的全部对应，按随机顺序注入，记为 `counterpart` 阶段；
+  - `--refill candidate`：用候选链阶段挑选（第 8.13 节），记为 `candidate` 阶段。
+- **规划的阶段**：对照、覆盖、轮转、加权（随机分配时是一次抽样）、补跑、合并负载的对照、验证各批。各变体的对照跑完后，执行方写入故障点表。打包后泄漏的组，规划先补排它们的单独运行。
 
 ### 2.3 边、条件与拼接
 
