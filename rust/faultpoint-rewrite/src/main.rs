@@ -13,6 +13,8 @@ use syn::spanned::Spanned;
 use syn::visit_mut::{self, VisitMut};
 use syn::{Block, Expr, ExprIf, ExprReturn, ImplItemFn, ItemFn, ItemImpl, ReturnType, Stmt, Type, parse_quote};
 
+mod clients;
+
 const MANIFEST_FILE: &str = "faultpoint-manifest.json";
 const IGNORED: [&str; 3] = ["target", ".git", SCOPE_DIRECTORY];
 /// Where the copies of the dependency crates the placement scope names go, inside the rewritten copy.
@@ -567,8 +569,19 @@ fn place_scope(target: &Path, sdk: &Path, service: &str, placement: &Placement) 
         .parse().expect("Cargo.toml is not valid TOML");
     let mut points = Vec::new();
     let excluded: Vec<&str> = ALWAYS_EXCLUDED.iter().copied().chain(placement.exclude.iter().map(String::as_str)).collect();
-    for entry in placement.scope.iter().filter(|entry| !excluded.contains(&entry.include.as_str())) {
-        let packages: Vec<_> = metadata.packages.iter().filter(|package| package.name == entry.include).collect();
+    let mut scope = placement.scope.clone();
+    for package in &metadata.packages {
+        if ["reqwest", "tonic"].contains(&package.name.as_str()) && package.version.major == 0 && package.version.minor == 12
+            && !excluded.contains(&package.name.as_str())
+            && !scope.iter().any(|entry| entry.include == package.name || entry.include == format!("{}@{}", package.name, package.version)) {
+            scope.push(faultpoint::config::ScopeEntry {
+                include: format!("{}@{}", package.name, package.version), kinds: Some(vec!["rpc_client".into()]),
+            });
+        }
+    }
+    for entry in scope.iter().filter(|entry| !excluded.contains(&entry.include.as_str())) {
+        let packages: Vec<_> = metadata.packages.iter().filter(|package| package.name == entry.include
+            || format!("{}@{}", package.name, package.version) == entry.include).collect();
         let [package] = packages[..] else {
             panic!("the scope names {}, which the dependency graph holds {} times", entry.include, packages.len());
         };
@@ -584,7 +597,14 @@ fn place_scope(target: &Path, sdk: &Path, service: &str, placement: &Placement) 
         files.sort();
         let prefix = format!("{}@{}/", package.name, package.version);
         points.extend(place_files(&files, &copy, &prefix, entry.kinds.as_deref(), service, placement).0);
-        require_sdk(&copy, sdk, &[]);
+        let client = package.version.major == 0 && package.version.minor == 12;
+        match package.name.as_str() {
+            "reqwest" if client => clients::rewrite_reqwest(&copy),
+            "tonic" if client => clients::rewrite_tonic(&copy),
+            _ => {}
+        }
+        let client_features = if client && ["reqwest", "tonic"].contains(&package.name.as_str()) { &["client"][..] } else { &[] };
+        require_sdk(&copy, sdk, client_features);
         let mut patch = toml_edit::InlineTable::new();
         patch.insert("path", format!("{SCOPE_DIRECTORY}/{name}").into());
         let patches = manifest["patch"].or_insert(toml_edit::table()).as_table_mut().expect("[patch] is a table");
