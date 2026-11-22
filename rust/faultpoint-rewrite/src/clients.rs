@@ -143,9 +143,23 @@ pub fn rewrite_tonic(copy: &Path) {
                 if let ImplItem::Fn(method) = item && method.sig.ident == "unary" {
                     let original = method.block.clone();
                     method.block = parse_quote!({
+                        if !::faultpoint::core().enabled {
+                            return (async move #original).await;
+                        }
                         let locator = ::faultpoint::client::locator("gRPC",
                             self.config.origin.authority().map_or("", |authority| authority.as_str()), path.path());
-                        let context = ::faultpoint::client::context(&request.metadata().clone().into_headers());
+                        let headers = request.metadata().clone().into_headers();
+                        let context = ::faultpoint::client::context(&headers);
+                        #[cfg(any(feature = "server", feature = "channel"))]
+                        let deadline = crate::transport::try_parse_grpc_timeout(&headers).unwrap_or_else(|invalid| {
+                            // Tonic's native transport ignores malformed timeout metadata.
+                            tracing::trace!("Error parsing `grpc-timeout` header {:?}", invalid);
+                            None
+                        }).map(|duration| ::faultpoint::client::Deadline {
+                            duration, failure: || Status::from_error(Box::new(crate::TimeoutExpired(()))),
+                        });
+                        #[cfg(not(any(feature = "server", feature = "channel")))]
+                        let deadline = None;
                         ::faultpoint::client::call(locator, context, async move #original,
                             |rule| {
                                 if rule.action.parameters.contains_key("status") || rule.action.parameters.contains_key("error") {
@@ -167,7 +181,7 @@ pub fn rewrite_tonic(copy: &Path) {
                                     outcome: if result.is_ok() { "2xx" } else { "error" }.into(), detail, successful: result.is_ok(),
                                 }
                             },
-                            None,
+                            deadline,
                         ).await
                     });
                     changed += 1;
@@ -179,4 +193,28 @@ pub fn rewrite_tonic(copy: &Path) {
         panic!("tonic's client layout is unsupported: rewrote {changed} of 1 unary boundary");
     }
     std::fs::write(path, prettyplease::unparse(&syntax)).expect("cannot write tonic client");
+    expose_tonic_deadline(copy);
+}
+
+/// Reuse the transport's timeout parser within the same instrumented crate.
+pub fn expose_tonic_deadline(copy: &Path) {
+    let path = copy.join("src/transport/service/grpc_timeout.rs");
+    let mut syntax = syn::parse_file(&std::fs::read_to_string(&path).expect("cannot read tonic timeout"))
+        .expect("cannot parse tonic timeout");
+    let mut changed = 0;
+    for item in &mut syntax.items {
+        if let Item::Fn(parser) = item && parser.sig.ident == "try_parse_grpc_timeout" {
+            parser.vis = parse_quote!(pub(crate));
+            changed += 1;
+        }
+    }
+    if changed != 1 {
+        panic!("tonic's timeout layout is unsupported: found {changed} of 1 parser");
+    }
+    std::fs::write(path, prettyplease::unparse(&syntax)).expect("cannot write tonic timeout");
+    let path = copy.join("src/transport/mod.rs");
+    let mut syntax = syn::parse_file(&std::fs::read_to_string(&path).expect("cannot read tonic transport"))
+        .expect("cannot parse tonic transport");
+    syntax.items.push(parse_quote!(pub(crate) use service::grpc_timeout::try_parse_grpc_timeout;));
+    std::fs::write(path, prettyplease::unparse(&syntax)).expect("cannot write tonic transport");
 }

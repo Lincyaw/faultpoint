@@ -42,15 +42,17 @@ pub static PROPAGATOR: LazyLock<TextMapCompositePropagator> = LazyLock::new(|| {
 
 /// The method, destination and bounded path of an outgoing HTTP or unary gRPC call.
 pub fn locator(method: &str, authority: &str, path: &str) -> String {
-    let path = path.split('/').map(|segment| {
-        if IDENTIFIER_SEGMENT.is_match(segment) { "{}" } else { segment }
-    }).collect::<Vec<_>>().join("/");
-    format!("{method} {authority}{path}")
+    own(|| {
+        let path = path.split('/').map(|segment| {
+            if IDENTIFIER_SEGMENT.is_match(segment) { "{}" } else { segment }
+        }).collect::<Vec<_>>().join("/");
+        format!("{method} {authority}{path}")
+    })
 }
 
 /// The wire headers bridge independently versioned OpenTelemetry clients without a shared SDK type.
 pub fn context(headers: &http::HeaderMap) -> opentelemetry::Context {
-    PROPAGATOR.extract(&HeaderExtractor(headers))
+    own(|| PROPAGATOR.extract(&HeaderExtractor(headers)))
 }
 
 /// The native client's result classification, supplied inside its instrumented build copy.
