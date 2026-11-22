@@ -3,12 +3,12 @@ from hashlib import sha256
 from typing import Protocol
 
 from faultpoint.rules import RuleSet
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from faultsearch.allocation import Phase
 from faultsearch.catalog import FROZEN, Fault
 from faultsearch.counterfactual import Group, NamedWorkload, control_labels
-from faultsearch.facts import CONTROL_GROUP, FactList, Facts, PathRequest, Purpose, SearchRun
+from faultsearch.facts import CONTROL_GROUP, FactList, Facts, NaturalPath, PathRequest, Purpose, RepetitionCount, SearchRun
 
 
 def repetition_seed(label: str) -> int:
@@ -38,17 +38,30 @@ class RunRequest(BaseModel):
     workload: NamedWorkload
     faults: tuple[Fault, ...] = ()
     purpose: Purpose
+    natural: NaturalPath | None = Field(default=None, exclude_if=lambda value: value is None)
     phases: tuple[Phase, ...] = ()
     """For an edge run, the allocation phase of each fault."""
     requests: tuple[PathRequest, ...] = ()
     """For a path run, the chains that ask for it."""
-    repetitions: int = Field(ge=2)
+    repetitions: RepetitionCount
+
+    @model_validator(mode="after")
+    def validate_natural_request(self) -> "RunRequest":
+        if (self.purpose == Purpose.NATURAL) != (self.natural is not None):
+            raise ValueError("a natural request names its path, and only a natural request does")
+        if self.natural is not None and (self.faults or self.repetitions != self.natural.repetitions):
+            raise ValueError("a natural request has no injected faults and keeps its repetition count")
+        return self
 
     @property
     def group(self) -> str:
+        if self.natural is not None:
+            return self.natural.group
         return Group(workload=self.workload, faults=self.faults).digest if self.faults else CONTROL_GROUP
 
     def labels(self) -> list[str]:
+        if self.natural is not None:
+            return [f"{self.workload.name}.{self.group}.{index}" for index in range(self.repetitions)]
         if not self.faults:
             return control_labels(self.workload, self.repetitions)
         return Group(workload=self.workload, faults=self.faults).labels(self.repetitions)

@@ -10,8 +10,8 @@ from pydantic import BaseModel, JsonValue, TypeAdapter
 from faultsearch.allocation import Phase
 from faultsearch.catalog import FROZEN, read_manifests
 from faultsearch.counterfactual import DEFAULT_SEED, NamedWorkload, Statuses
-from faultsearch.execution import RunRequest
-from faultsearch.facts import (CONTROL_GROUP, FACT, Facts, PathRequest, PointInventory, Purpose, SearchRun, canonical,
+from faultsearch.execution import RunRequest, repetition_seed
+from faultsearch.facts import (CONTROL_GROUP, FACT, Facts, NaturalPath, PathRequest, PointInventory, Purpose, SearchRun, canonical,
                                read_facts, tallies)
 
 RULES_FILE: Final = "rules.json"
@@ -70,7 +70,8 @@ class RunOrigin(BaseModel):
     environment: str
 
     def search_run(self, directory: Path, root: Path, sequence: int, workload: NamedWorkload, group: str, index: int,
-                   purpose: Purpose, phases: tuple[Phase, ...], requests: tuple[PathRequest, ...]) -> SearchRun:
+                   purpose: Purpose, phases: tuple[Phase, ...], requests: tuple[PathRequest, ...],
+                   natural: NaturalPath | None = None) -> SearchRun:
         """A repetition's run directory as a search run: its rules, workload, deployment, seed, statuses or refusal,
         and its observation files summed, named by their paths relative to the root. A directory whose rule set is
         another repetition's, or that holds neither statuses nor a refusal, is an error."""
@@ -89,11 +90,63 @@ class RunOrigin(BaseModel):
             group=group, index=index, system=self.system, revision=self.revision, sdk_build=self.sdk_build,
             build=self.build, deployment=PARAMETERS.validate_json((directory / INSTRUMENTATION_FILE).read_bytes()),
             environment=self.environment, seed=int(seed.read_text()) if seed.exists() else DEFAULT_SEED,
-            purpose=purpose, phases=phases, requests=requests, rules=rules.rules, tallies=tallies(read_records(files)),
+            purpose=purpose, phases=phases, requests=requests, natural=natural,
+            rules=rules.rules, tallies=tallies(read_records(files)),
             statuses=Statuses.model_validate_json(statuses.read_bytes()) if statuses.exists()
             else Statuses(tenants={}),
             refusal=refusal.read_text() if refusal.exists() else None,
             observations=tuple(str(path.relative_to(root)) for path in files))
+
+
+class RepetitionLookup(BaseModel):
+    model_config = FROZEN
+
+    through: int
+    recorded: str | None
+
+
+def lookup_repetition(facts: Facts, origin: RunOrigin, request: RunRequest, deployment: dict[str, JsonValue],
+                      index: int) -> RepetitionLookup:
+    if not 0 <= index < request.repetitions:
+        raise ValueError("the repetition index must be within the request")
+    label = request.labels()[index]
+    matches = [run for run in facts.standing_runs() if run.label == label
+               and (run.source == origin.source if request.purpose == Purpose.NATURAL
+                    else run.purpose != Purpose.NATURAL)]
+    if len(matches) > 1:
+        raise ValueError(f"two search runs have the label {label}")
+    through = facts.facts[-1].sequence if facts.facts else 0
+    if not matches:
+        return RepetitionLookup(through=through, recorded=None)
+    run = matches[0]
+    if ((run.system, run.revision, run.sdk_build, run.environment)
+            != (origin.system, origin.revision, origin.sdk_build, origin.environment)
+            or canonical(run.build) != canonical(origin.build)
+            or canonical(run.deployment) != canonical(deployment)
+            or canonical(run.workload.model_dump(mode="json")) != canonical(request.workload.model_dump(mode="json"))
+            or run.seed != repetition_seed(label) or run.rules != request.ruleset(label).rules
+            or run.natural != request.natural or run.phases != request.phases or run.requests != request.requests
+            or (run.group != CONTROL_GROUP and run.purpose != request.purpose)):
+        raise ValueError(f"the recorded search run {run.identity} has different execution inputs")
+    return RepetitionLookup(through=through, recorded=run.identity)
+
+
+def print_repetition_lookup() -> None:
+    """Find a standing repetition with the requested execution inputs, or refuse a conflicting label.
+
+    Controls and injected runs have one label across sources. Natural checks keep their own source;
+    they do not enter edge comparisons. A matching run is reused under its actual recorded identity.
+    """
+    parser = argparse.ArgumentParser(description=print_repetition_lookup.__doc__)
+    parser.add_argument("facts", type=Path, help="The current fact file.")
+    parser.add_argument("origin", type=Path, help="The proposed run origin.")
+    parser.add_argument("request", type=Path, help="The planned run request.")
+    parser.add_argument("deployment", type=Path, help="The deployment configuration the executor will use.")
+    parser.add_argument("--index", type=int, required=True, help="The repetition's index in the request.")
+    arguments = parser.parse_args()
+    print(lookup_repetition(read_facts(arguments.facts), RunOrigin.model_validate_json(arguments.origin.read_bytes()),
+        RunRequest.model_validate_json(arguments.request.read_bytes()),
+        PARAMETERS.validate_json(arguments.deployment.read_bytes()), arguments.index).model_dump_json())
 
 
 def point_inventory(facts: Facts, controls: tuple[str, ...], manifests: Path, configured: tuple[str, ...],
@@ -127,7 +180,7 @@ def print_search_run() -> None:
     request = RunRequest.model_validate_json(arguments.request.read_bytes())
     run = RunOrigin.model_validate_json(arguments.origin.read_bytes()).search_run(
         arguments.directory, arguments.root, arguments.sequence, request.workload, request.group, arguments.index,
-        request.purpose, request.phases, request.requests)
+        request.purpose, request.phases, request.requests, request.natural)
     print(FACT.dump_json(run).decode())
 
 

@@ -258,6 +258,12 @@ def pack(pairs: list[tuple[Fault, NamedWorkload]]) -> list[Group]:
     return groups
 
 
+def merge_scope_effects(scoped: tuple[Effect, ...], unscoped: tuple[Effect, ...]) -> tuple[Effect, ...]:
+    shown = {(effect.point, effect.outcome, effect.metric) for effect in scoped}
+    return (*scoped, *(effect for effect in unscoped
+                      if (effect.point, effect.outcome, effect.metric) not in shown))
+
+
 class Repetitions(ABC):
     """The repetitions of an experiment, by label, as observations, statuses, seeds and refusals, and the comparisons
     that turn a group's repetitions and its workload's controls into the group's treatment records."""
@@ -304,10 +310,8 @@ class Repetitions(ABC):
             comparison = self.comparison(control, labels, tenant)
             injected = [sum(injection.counts[index] for injection in (*comparison.injections, *unscoped.injections)
                             if injection.rule in fault.rule_ids()) for index in range(len(labels))]
-            shown = {(effect.point, effect.outcome, effect.metric) for effect in comparison.effects}
-            beyond = tuple(effect for effect in unscoped.effects if len(group.faults) == 1
-                           and (effect.point, effect.outcome, effect.metric) not in shown)
-            effects = (*comparison.effects, *beyond)
+            effects = (merge_scope_effects(comparison.effects, unscoped.effects)
+                       if len(group.faults) == 1 else comparison.effects)
             records.append(TreatmentRecord(
                 fault=fault, workload=group.workload.name, tenant=tenant, labels=tuple(labels),
                 packed_with=tuple(other.key for other in group.faults if other != fault), injected=tuple(injected),

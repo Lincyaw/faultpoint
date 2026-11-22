@@ -2,7 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from faultsearch.catalog import FROZEN, point_service
 from faultsearch.chains import Chain
@@ -11,6 +11,7 @@ from faultsearch.edges import Edge, Sighting
 from faultsearch.facts import (Conclusion, DeviationReference, FailureCategory, Facts, LoadVariants, PathIdentity,
                                PointInventory, SystemTopology, read_facts)
 from faultsearch.graph import ComputeSettings, FactGraph
+from faultsearch.natural import NaturalJudgement
 from faultsearch.validation import HopCheck, RunKey, RunVerdict, hop_checks, run_key, run_verdict
 
 
@@ -58,6 +59,7 @@ class CandidatePath(BaseModel):
     """No load variant showed the path end to end: it exists only by stitching."""
     crosses_layers: bool
     appraisals: tuple[PathAppraisal, ...]
+    natural: tuple[NaturalJudgement, ...] = Field(default=(), exclude_if=lambda runs: not runs)
 
 
 class CandidatePaths(BaseModel):
@@ -69,28 +71,26 @@ class CandidatePaths(BaseModel):
     paths: tuple[CandidatePath, ...]
 
 
-def path_identity(chain: Chain, inventory: str) -> PathIdentity:
-    """The path a chain stands for, whichever substitutes continue it: its first fault and its hops' effects at the
-    points of one point inventory."""
-    return PathIdentity(head=chain.hops[0].cause.key,
-                        deviations=tuple(DeviationReference(inventory=inventory, point=hop.effect.point,
-                                                            effect=hop.effect.key) for hop in chain.hops))
-
-
 def candidate_path(rank: int, chain: Chain, identity: PathIdentity, graph: FactGraph, edges: dict[str, Edge],
                    path_records: dict[RunKey, TreatmentRecord], appraisals: list[PathAppraisal]) -> CandidatePath:
     """A ranked chain with the evidence of its hops, in the load variants and in its path run, and its judgement."""
     scenarios = graph.variants.scenarios
     record = path_records.get(run_key(chain, scenarios))
     checks = hop_checks(chain, record, graph.settings.min_count_increase) if record else None
+    natural = tuple(run for run in graph.natural if run.path == identity)
+    completed = [run for run in natural if run.judgement != RunVerdict.NEEDS_RUN]
+    judgement = run_verdict(chain, path_records, scenarios, graph.settings.min_count_increase)
+    if completed:
+        checks = completed[-1].hops
+        judgement = completed[-1].judgement
     return CandidatePath(
         rank=rank, path=identity, head_service=point_service(chain.hops[0].cause.point), chain=chain.key,
         hops=tuple(CandidateHop(injection=hop.cause.key, deviation=deviation, service=point_service(hop.effect.point),
                                 sightings=edges[f"[{hop.cause.key}] {hop.effect.key}"].held,
                                 run=checks[index] if checks else None)
                    for index, (hop, deviation) in enumerate(zip(chain.hops, identity.deviations, strict=True))),
-        judgement=run_verdict(chain, path_records, scenarios, graph.settings.min_count_increase),
-        stitched_only=chain.stitched_only, crosses_layers=chain.crosses_layers, appraisals=tuple(appraisals))
+        judgement=judgement, natural=natural, stitched_only=chain.stitched_only,
+        crosses_layers=chain.crosses_layers, appraisals=tuple(appraisals))
 
 
 def candidate_paths(facts: Facts, settings: ComputeSettings) -> CandidatePaths:
@@ -106,7 +106,7 @@ def candidate_paths(facts: Facts, settings: ComputeSettings) -> CandidatePaths:
     order = {key: rank for rank, key in enumerate(stitching.keys)}
     inventory = graph.inventory.identity
     chains = {chain.key: chain for chain in (*stitching.top, *stitching.top_cross_layer) if chain.terminal}
-    identities = {key: path_identity(chain, inventory) for key, chain in chains.items()}
+    identities = {key: PathIdentity.from_chain(chain, inventory) for key, chain in chains.items()}
     appraised: dict[PathIdentity, list[PathAppraisal]] = {}
     for appraisal in graph.facts.appraisals():
         appraised.setdefault(appraisal.path, []).append(PathAppraisal(

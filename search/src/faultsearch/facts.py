@@ -11,19 +11,24 @@ from typing import Annotated, Final, Literal
 from faultpoint.observations import ObservationRecord
 from faultpoint.placement import Manifest
 from faultpoint.rules import Rule
-from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, field_serializer
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, field_serializer, model_validator
 
 from faultsearch.allocation import Phase
 from faultsearch.catalog import FROZEN, RPC_SERVER
+from faultsearch.chains import Chain
 from faultsearch.counterfactual import NamedWorkload, Scenarios, Statuses
 from faultsearch.validation import Selection
 
 CONTROL_GROUP: Final = "control"
 """The group of a control run, which injects nothing."""
+NATURAL_GROUP_PREFIX: Final = "natural-"
 FACTS_FILE: Final = "facts.jsonl"
 """The file of a fact directory: one fact per line, in sequence order."""
 CONTENT_EXCLUDED: Final = frozenset({"sequence"})
 """What a fact's content leaves out: its number, which a store that keeps facts of several sources assigns anew."""
+
+type GitRevision = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+type RepetitionCount = Annotated[int, Field(ge=2)]
 
 
 class FactKind(StrEnum):
@@ -43,6 +48,8 @@ class Purpose(StrEnum):
     """A run in a load variant, from which edges are learned."""
     PATH = "path"
     """A run in a merged workload, which judges paths and measures their headroom."""
+    NATURAL = "natural"
+    """A run at a rewritten revision, with no intervention, checking a named path against healthy runs."""
 
 
 class Tally(BaseModel):
@@ -138,6 +145,50 @@ class PathRequest(BaseModel):
     selection: Selection
 
 
+class DeviationReference(BaseModel):
+    """One deviation of a propagation path: an effect at a point of a point inventory."""
+
+    model_config = FROZEN
+
+    inventory: str
+    point: str
+    effect: str
+
+
+class PathIdentity(BaseModel):
+    """The first intervention and the deviations a propagation path reaches, in order."""
+
+    model_config = FROZEN
+
+    head: str
+    deviations: tuple[DeviationReference, ...]
+
+    @classmethod
+    def from_chain(cls, chain: Chain, inventory: str) -> "PathIdentity":
+        return cls(head=chain.hops[0].cause.key,
+                   deviations=tuple(DeviationReference(inventory=inventory, point=hop.effect.point,
+                                                       effect=hop.effect.key) for hop in chain.hops))
+
+
+class NaturalPath(BaseModel):
+    """The path and rewritten revision a natural run checks, with the identities of its healthy controls."""
+
+    model_config = FROZEN
+
+    path: PathIdentity
+    revision: GitRevision
+    controls: frozenset[str] = Field(min_length=2)
+    repetitions: RepetitionCount
+
+    @field_serializer("controls")
+    def sorted_controls(self, controls: frozenset[str]) -> list[str]:
+        return sorted(controls)
+
+    @property
+    def group(self) -> str:
+        return f"{NATURAL_GROUP_PREFIX}{digest(self.model_dump(mode='json'))}"
+
+
 class SearchRun(FactBody):
     """One repetition: the deployment reset, then one workload run to its end under one seed and one intervention,
     an empty one for a control. Its identity is its source, its workload, its group and its index; its results never
@@ -160,6 +211,7 @@ class SearchRun(FactBody):
     environment: str
     seed: int
     purpose: Purpose
+    natural: NaturalPath | None = Field(default=None, exclude_if=lambda value: value is None)
     phases: tuple[Phase, ...] = ()
     """For an edge run, the allocation phase of each fault it injects, in the order of its rules."""
     requests: tuple[PathRequest, ...] = ()
@@ -171,6 +223,18 @@ class SearchRun(FactBody):
     """What a service said when it refused one of the rules, which then ended the run."""
     observations: tuple[str, ...] = Field(min_length=1)
     """The observation files the tallies come from; every run leaves at least one."""
+
+    @model_validator(mode="after")
+    def validate_natural_run(self) -> "SearchRun":
+        if (self.purpose == Purpose.NATURAL) != (self.natural is not None):
+            raise ValueError("a natural run names the path it checks, and only a natural run does")
+        if self.natural is not None and (self.rules or self.revision != self.natural.revision
+                                        or self.group != self.natural.group
+                                        or not 0 <= self.index < self.natural.repetitions
+                                        or any(tally.rule is not None and tally.experiment == self.label
+                                               for tally in self.tallies)):
+            raise ValueError("a natural run has no rules and matches its rewritten revision and group")
+        return self
 
     @property
     def label(self) -> str:
@@ -251,28 +315,6 @@ class PointReference(BaseModel):
 
     inventory: str
     point: str
-
-
-class DeviationReference(BaseModel):
-    """One deviation of a propagation path: an effect at a point of a point inventory."""
-
-    model_config = FROZEN
-
-    inventory: str
-    point: str
-    effect: str
-    """The deviation's key: its point, outcome, detail and metric."""
-
-
-class PathIdentity(BaseModel):
-    """What a propagation path is, whichever substitute injections reached it: the intervention it starts with and
-    the deviations it goes through, in order."""
-
-    model_config = FROZEN
-
-    head: str
-    """The key of the fault the path starts with."""
-    deviations: tuple[DeviationReference, ...]
 
 
 class Conclusion(StrEnum):

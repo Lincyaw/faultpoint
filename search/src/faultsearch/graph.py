@@ -5,7 +5,7 @@ from functools import cached_property
 from faultpoint.observations import ObservationRecord
 from faultpoint.rules import Rule
 from faultpoint.tools.kinds import KindTable
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from faultsearch.allocation import Allocation, Assignment, Phase, Strategy, allocation_of
 from faultsearch.catalog import (FOLLOWING_SEPARATOR, FROZEN, ActionTable, Catalog, Fault, Following, RpcPeers, build_catalog,
@@ -15,6 +15,7 @@ from faultsearch.counterfactual import ControlRecord, Group, Repetitions, Status
 from faultsearch.edges import Acceptance, Edge, EffectMap
 from faultsearch.evidence import MappingFeedback
 from faultsearch.facts import CONTROL_GROUP, Facts, LoadVariants, PointInventory, Purpose, SearchRun, SystemTopology
+from faultsearch.natural import NaturalJudgement, natural_judgements
 from faultsearch.validation import (Headroom, Validation, Validations, adjudications, headroom, hop_checks,
                                     mapping_checks, merged_workload, merged_workloads)
 
@@ -62,6 +63,7 @@ class PropagationGraph(BaseModel):
     validations: Validations
     feedback: MappingFeedback
     judged_stitching: Stitching
+    natural: tuple[NaturalJudgement, ...] = Field(default=(), exclude_if=lambda runs: not runs)
 
 
 class FactRepetitions(Repetitions):
@@ -231,7 +233,7 @@ class FactGraph:
         self.topology = facts.latest(SystemTopology)
         self.variants = facts.latest(LoadVariants)
         self.kinds = KindTable.installed()
-        self.runs = facts.standing_runs()
+        self.runs = [run for run in facts.standing_runs() if run.purpose != Purpose.NATURAL]
         self.repetitions = FactRepetitions(self.runs, settings)
         self.controls = control_records(self.runs)
 
@@ -310,13 +312,20 @@ class FactGraph:
         """The chains stitched again with what the path runs confirmed and refuted."""
         return self.stitcher.chains(self.edges, self.allocation, self.records, self.feedback)
 
+    @cached_property
+    def natural(self) -> tuple[NaturalJudgement, ...]:
+        return natural_judgements(self.facts, self.judged_stitching, self.inventory,
+                                  self.settings.alpha, self.settings.min_mean_increase,
+                                  self.settings.min_count_increase)
+
     def graph(self) -> PropagationGraph:
         path_records, room, validations = self.judgement
         return PropagationGraph(
             settings=self.settings, through=self.facts.facts[-1].sequence, catalog=self.catalog,
             controls=tuple(self.controls.values()), records=tuple(self.records), allocation=self.allocation,
             edges=tuple(self.edges), stitching=self.stitching, path_records=path_records, headroom=room,
-            validations=validations, feedback=self.feedback, judged_stitching=self.judged_stitching)
+            validations=validations, feedback=self.feedback, judged_stitching=self.judged_stitching,
+            natural=self.natural)
 
 
 def compute_graph(facts: Facts, settings: ComputeSettings) -> PropagationGraph:

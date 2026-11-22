@@ -16,9 +16,10 @@ from faultsearch.chains import Chain
 from faultsearch.counterfactual import Group, NamedWorkload, pack
 from faultsearch.edges import counterpart_assignments
 from faultsearch.execution import Executor, PlannedRequest, RunRequest
-from faultsearch.facts import (CONTROL_GROUP, FactList, Facts, LoadVariants, PathRequest, PointInventory, Purpose,
+from faultsearch.facts import (CONTROL_GROUP, FactList, Facts, LoadVariants, NaturalPath, PathIdentity, PathRequest, PointInventory, Purpose,
                                read_facts)
 from faultsearch.graph import ComputeSettings, FactGraph
+from faultsearch.natural import NaturalPlan, NaturalPlanning
 from faultsearch.refill import candidate_batch, hypotheses
 from faultsearch.validation import Selection, chosen_runs, merged_workload, merged_workloads, run_key
 
@@ -387,6 +388,51 @@ def print_plan_step() -> None:
     state = PlanState.model_validate_json(arguments.state.read_bytes()) if arguments.state else \
         PlanState.start(settings)
     print(plan(read_facts(arguments.facts), state, settings).model_dump_json(indent=2))
+
+
+def plan_natural_run(facts: Facts, settings: ComputeSettings, planning: NaturalPlanning) -> NaturalPlan:
+    graph = FactGraph(facts, settings)
+    inventory = graph.inventory
+    chain = next(chain for chain in (*graph.judged_stitching.top, *graph.judged_stitching.top_cross_layer)
+                 if PathIdentity.from_chain(chain, inventory.identity) == planning.path)
+    workload = merged_workload(chain.condition, graph.variants.scenarios)
+    controls = [run for run in graph.runs if run.group == CONTROL_GROUP and run.refusal is None
+                and run.workload.workload == workload.workload and run.revision == inventory.revision
+                and run.sdk_build == inventory.sdk_build and run.deployment == inventory.deployment]
+    if inventory.revision is None:
+        raise ValueError("natural verification requires the recorded healthy revision")
+    if len(controls) < planning.repetitions:
+        request = RunRequest(workload=workload, purpose=Purpose.PATH, repetitions=planning.repetitions)
+        held = {run.label for run in controls}
+        planned = PlannedRequest.of(request)
+        return NaturalPlan(revision=inventory.revision, sdk_build=inventory.sdk_build,
+            planned=planned.model_copy(update={"repetitions": tuple(
+                repetition for repetition in planned.repetitions if repetition.label not in held)}))
+    return NaturalPlan(revision=planning.revision, sdk_build=inventory.sdk_build,
+        planned=PlannedRequest.of(RunRequest(
+            workload=workload, purpose=Purpose.NATURAL, repetitions=planning.repetitions,
+            natural=NaturalPath(path=planning.path, revision=planning.revision, repetitions=planning.repetitions,
+                                controls=frozenset(run.identity for run in controls[:planning.repetitions])))))
+
+
+def print_natural_request() -> None:
+    """Print the healthy controls still needed, or a no-injection request at the rewritten revision.
+
+    The inputs are unchanged facts, compute settings and one candidate PathIdentity. Append the planned
+    controls before asking again. A ready request names its actual healthy run identities, uses separate
+    labels and rules with no intervention, and never changes the original inventory or edge runs.
+    """
+    parser = argparse.ArgumentParser(description=print_natural_request.__doc__)
+    parser.add_argument("facts", type=Path)
+    parser.add_argument("settings", type=Path)
+    parser.add_argument("path", type=Path)
+    parser.add_argument("revision", help="The rewritten Git commit.")
+    parser.add_argument("--repetitions", type=int, default=2)
+    arguments = parser.parse_args()
+    print(plan_natural_run(read_facts(arguments.facts),
+        ComputeSettings.model_validate_json(arguments.settings.read_bytes()),
+        NaturalPlanning(path=PathIdentity.model_validate_json(arguments.path.read_bytes()),
+                        revision=arguments.revision, repetitions=arguments.repetitions)).model_dump_json(indent=2))
 
 
 def print_step_schema() -> None:
