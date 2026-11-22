@@ -13,7 +13,7 @@ from faultsearch.allocation import AllocationSettings, Assignment, Phase, Strate
     cluster_similarities, first_runs
 from faultsearch.catalog import FROZEN, Fault
 from faultsearch.chains import Chain
-from faultsearch.counterfactual import NamedWorkload, pack
+from faultsearch.counterfactual import Group, NamedWorkload, pack
 from faultsearch.edges import counterpart_assignments
 from faultsearch.execution import Executor, PlannedRequest, RunRequest
 from faultsearch.facts import (CONTROL_GROUP, FactList, Facts, LoadVariants, PathRequest, PointInventory, Purpose,
@@ -157,7 +157,7 @@ class Planning:
         pairs = [(assignment.fault, self.workloads[assignment.scenario]) for assignment in assignments]
         phases = {(assignment.fault.key, assignment.scenario): assignment.phase for assignment in assignments}
         groups = pack(pairs) if self.settings.pack_tenants else [
-            group for fault, workload in pairs for group in pack([(fault, workload)])]
+            Group(workload=workload, faults=(fault,)) for fault, workload in pairs]
         self.tried |= set(phases)
         self.state = self.state.model_copy(update={"tried": (*self.state.tried, *phases)})
         return [RunRequest(workload=group.workload, faults=group.faults, purpose=Purpose.EDGE,
