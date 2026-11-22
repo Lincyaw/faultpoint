@@ -8,7 +8,8 @@ from faultsearch.catalog import FROZEN, point_service
 from faultsearch.chains import Chain
 from faultsearch.counterfactual import TreatmentRecord
 from faultsearch.edges import Edge, Sighting
-from faultsearch.facts import Conclusion, DeviationReference, FailureCategory, PathIdentity, read_facts
+from faultsearch.facts import (Conclusion, DeviationReference, FailureCategory, Facts, LoadVariants, PathIdentity,
+                               PointInventory, SystemTopology, read_facts)
 from faultsearch.graph import ComputeSettings, FactGraph
 from faultsearch.validation import HopCheck, RunKey, RunVerdict, hop_checks, run_key, run_verdict
 
@@ -92,11 +93,15 @@ def candidate_path(rank: int, chain: Chain, identity: PathIdentity, graph: FactG
         stitched_only=chain.stitched_only, crosses_layers=chain.crosses_layers, appraisals=tuple(appraisals))
 
 
-def candidate_paths(graph: FactGraph) -> CandidatePaths:
+def candidate_paths(facts: Facts, settings: ComputeSettings) -> CandidatePaths:
     """The paths that end in a failure the user sees, from the kept chains stitched with the path runs' judgement:
     those that exist only by stitching and cross layers first, then the others, each in the stitching's order. A path
     a standing appraisal finds failing goes after every other, so that no such appraisal raises its rank; a path
-    several chains stand for takes the place of the best of them."""
+    several chains stand for takes the place of the best of them. Facts that lack the system's topology, its load
+    variants or a point inventory have no edges yet, and so no candidate path."""
+    if not all(facts.holds(kind) for kind in (SystemTopology, LoadVariants, PointInventory)):
+        return CandidatePaths(through=facts.facts[-1].sequence if facts.facts else 0, paths=())
+    graph = FactGraph(facts, settings)
     stitching = graph.judged_stitching
     order = {key: rank for rank, key in enumerate(stitching.keys)}
     inventory = graph.inventory.identity
@@ -128,8 +133,8 @@ def print_candidate_paths() -> None:
     parser.add_argument("settings", type=Path, help="The compute settings, a JSON object.")
     parser.add_argument("--limit", type=int, help="The most paths to print, best first; every path when left out.")
     arguments = parser.parse_args()
-    found = candidate_paths(FactGraph(read_facts(arguments.facts),
-                                      ComputeSettings.model_validate_json(arguments.settings.read_bytes())))
+    found = candidate_paths(read_facts(arguments.facts),
+                            ComputeSettings.model_validate_json(arguments.settings.read_bytes()))
     print(found.model_copy(update={"paths": found.paths[:arguments.limit]}).model_dump_json(indent=2))
 
 

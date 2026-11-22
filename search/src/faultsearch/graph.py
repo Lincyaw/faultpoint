@@ -192,24 +192,30 @@ def judged(stitching: Stitching, edges: list[Edge], path_runs: list[tuple[Group,
            controls: dict[str, ControlRecord], repetitions: FactRepetitions, variants: LoadVariants,
            settings: ComputeSettings) -> tuple[tuple[TreatmentRecord, ...], Headroom, Validations]:
     """The path runs' records, the headroom of the kept chains, and the judgement of the chains the path runs were
-    asked for, then of every other kept chain one of those runs decides."""
+    asked for, then of every other kept chain one of those runs decides. Only a merged workload with control runs
+    compares: a kept chain whose workload has none yet has no headroom, and a path run in such a workload judges
+    nothing, so the chains it would check still need a run; a path run asked for by a chain no longer kept judges
+    only the kept chains it decides."""
     scenarios = variants.scenarios
     order = {key: rank for rank, key in enumerate(stitching.keys)}
     kept = sorted({chain.key: chain for chain in (*stitching.top, *stitching.top_cross_layer)}.values(),
                   key=lambda chain: order[chain.key])
     by_key = {chain.key: chain for chain in kept}
-    room = headroom(kept, edges, scenarios, settings.min_count_increase,
-                    [controls[workload.name] for workload in merged_workloads(kept, scenarios)], repetitions)
+    controlled = [chain for chain in kept if merged_workload(chain.condition, scenarios).name in controls]
+    room = headroom(controlled, edges, scenarios, settings.min_count_increase,
+                    [controls[workload.name] for workload in merged_workloads(controlled, scenarios)], repetitions)
     records = []
     requested = []
     for group, members in path_runs:
+        if group.workload.name not in controls:
+            continue
         record = repetitions.group_records(group, controls[group.workload.name].labels,
                                            [run.label for run in members])[0]
         records.append(record)
         requested += [Validation(chain=by_key[request.chain], selection=request.selection,
                                  workload=merged_workload(by_key[request.chain].condition, scenarios), record=record,
                                  hops=hop_checks(by_key[request.chain], record, settings.min_count_increase))
-                      for request in members[0].requests]
+                      for request in members[0].requests if request.chain in by_key]
     decided = adjudications(Validations(validations=tuple(requested)), kept, scenarios, settings.min_count_increase)
     return tuple(records), room, Validations(validations=(*requested, *decided))
 

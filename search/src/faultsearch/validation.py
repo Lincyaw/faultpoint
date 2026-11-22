@@ -116,7 +116,8 @@ class ChainRoom(BaseModel):
 
 
 class Headroom(BaseModel):
-    """The headroom of the chains a validation chooses from, in their rank order."""
+    """The headroom of the chains a validation chooses from whose merged workload has control runs, in their rank
+    order."""
 
     model_config = FROZEN
 
