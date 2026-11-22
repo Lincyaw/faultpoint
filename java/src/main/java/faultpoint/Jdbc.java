@@ -23,8 +23,10 @@ import java.util.regex.Pattern;
 import net.bytebuddy.matcher.ElementMatchers;
 import net.sf.jsqlparser.JSQLParserException;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.statement.SetStatement;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.UnsupportedStatement;
+import net.sf.jsqlparser.statement.create.index.CreateIndex;
 import net.sf.jsqlparser.statement.select.ParenthesedSelect;
 import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.select.Select;
@@ -77,6 +79,11 @@ public final class Jdbc {
             return null;
         }
 
+        @Override
+        public <S> Void visit(CreateIndex index, S context) {
+            return index.getTable().accept(this, context);
+        }
+
         Set<String> tables(Statement statement) {
             Set<String> tables = new TreeSet<>(getTables(statement));
             tables.removeAll(named);
@@ -90,7 +97,8 @@ public final class Jdbc {
 
     /** The kind and locator of a statement: a query that writes through neither a WITH item nor INTO is read and
      * anything else written, the tables it touches and the hash of its normalised text. A statement the parser does
-     * not understand is written, since the parser recognises every query form a driver is sent. */
+     * not understand is written, since the parser recognises every query form a driver is sent. Session SET
+     * statements have no store point. */
     static Kind statementPoint(String sql) {
         return STATEMENTS.computeIfAbsent(sql, text -> {
             List<Statement> statements = new ArrayList<>();
@@ -103,6 +111,9 @@ public final class Jdbc {
             var tables = new TreeSet<String>();
             var shape = new StringBuilder();
             for (Statement statement : statements) {
+                if (statement instanceof SetStatement) {
+                    continue;
+                }
                 if (statement instanceof UnsupportedStatement) {
                     reads = false;
                 } else {
@@ -111,6 +122,9 @@ public final class Jdbc {
                     reads = reads && statement instanceof Select && !touched.writes();
                 }
                 shape.append(statement instanceof UnsupportedStatement ? text.strip() : statement.toString()).append(';');
+            }
+            if (shape.isEmpty()) {
+                return null;
             }
             String table = tables.isEmpty() ? "-" : String.join("+", tables);
             return new Kind(reads ? "store_read" : "store_write", table + "#" + Placement.digest(shape.toString()));
@@ -150,6 +164,9 @@ public final class Jdbc {
         String sql = arguments.length > 0 && arguments[0] instanceof String text ? text : PREPARED.get(statement);
         Kind kind = sql == null && !(statement instanceof java.sql.PreparedStatement) ? new Kind("store_write", BATCH)
                 : statementPoint(requireSql(core, sql));
+        if (kind == null) {
+            return null;
+        }
         String point = RuleSet.pointId(core.settings.service(), kind.kind(), kind.locator());
         Rule rule = core.decide(point, Core.ACTS_BEFORE);
         // The query timeout cuts a rule's wait short as it cuts a slow server: the driver cancels the statement at the
