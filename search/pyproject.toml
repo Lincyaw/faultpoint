@@ -10,6 +10,9 @@ dependencies = [
     "scipy>=1.13",
 ]
 
+[project.scripts]
+faultsearch-facts-schema = "faultsearch.facts:print_schema"
+
 [tool.uv.sources]
 faultpoint = { path = "../python", editable = true }
 

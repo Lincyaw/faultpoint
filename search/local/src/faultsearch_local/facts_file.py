@@ -7,7 +7,7 @@ from faultsearch.allocation import Allocation, Phase, Strategy
 from faultsearch.catalog import read_manifests
 from faultsearch.counterfactual import DEFAULT_SEED, ControlRecord, NamedWorkload, Scenarios, Statuses, TreatmentRecord
 from faultsearch.edges import EffectMap
-from faultsearch.facts import (CONTROL_GROUP, Fact, Facts, LoadVariants, PathRequest, PointInventory, Purpose,
+from faultsearch.facts import (CONTROL_GROUP, FACT, Fact, Facts, LoadVariants, PathRequest, PointInventory, Purpose,
                                SearchRun, SystemTopology, tallies)
 from faultsearch.validation import VALIDATION_PREFIX, Selection, Validations
 from pydantic import BaseModel, JsonValue, TypeAdapter
@@ -24,7 +24,6 @@ LOCAL_ENVIRONMENT: Final = "local-docker"
 RULES_FILE: Final = "rules.json"
 WORKLOAD_FILE: Final = "workload.json"
 INSTRUMENTATION_FILE: Final = "instrumentation.json"
-FACT: Final = TypeAdapter(Fact)
 
 
 def write_facts(path: Path, facts: Facts) -> None:

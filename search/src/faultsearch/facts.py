@@ -1,3 +1,4 @@
+import json
 from collections import defaultdict
 from collections.abc import Iterable
 from enum import StrEnum
@@ -7,7 +8,7 @@ from typing import Annotated, Final, Literal
 from faultpoint.observations import ObservationRecord
 from faultpoint.placement import Manifest
 from faultpoint.rules import Rule
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter
 
 from faultsearch.allocation import Phase
 from faultsearch.catalog import FROZEN
@@ -270,6 +271,12 @@ class Voiding(BaseModel):
 
 type Fact = Annotated[SearchRun | PointInventory | SystemTopology | LoadVariants | Appraisal | Equivalence | Voiding,
                       Field(discriminator="kind")]
+FACT: Final = TypeAdapter(Fact)
+
+
+def print_schema() -> None:
+    """Print the JSON Schema of a fact, the union of every kind tagged by its kind, for the stores that keep facts."""
+    print(json.dumps(FACT.json_schema(), indent=2))
 
 
 class Facts(BaseModel):
