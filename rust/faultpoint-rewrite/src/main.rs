@@ -535,6 +535,14 @@ fn require_sdk(target: &Path, sdk: &Path, features: &[&str]) {
     std::fs::write(&manifest_path, manifest.to_string()).expect("cannot write Cargo.toml");
 }
 
+/// Cargo custom-build targets execute before the application and receive no runtime fault points.
+fn exclude_build_scripts(files: &mut Vec<PathBuf>, package: &cargo_metadata::Package, copy: &Path) {
+    let root = package.manifest_path.parent().expect("a manifest is in a directory");
+    let scripts: Vec<PathBuf> = package.targets.iter().filter(|target| target.is_custom_build())
+        .map(|target| copy.join(target.src_path.strip_prefix(root).expect("a build script is in the package"))).collect();
+    files.retain(|file| !scripts.contains(file));
+}
+
 /// The points placed in the given files of a copy, which are rewritten in place, and whether they wired a server
 /// boundary and a store boundary.
 fn place_files(files: &[PathBuf], root: &Path, prefix: &str, kinds: Option<&[String]>, service: &str,
@@ -636,6 +644,7 @@ fn place_scope(target: &Path, sdk: &Path, service: &str, placement: &Placement) 
         let sources = copy.join(library.src_path.parent().expect("a source file is in a directory")
             .strip_prefix(package.manifest_path.parent().expect("a manifest is in a directory")).expect("sources are in the package"));
         files.retain(|file| file.starts_with(&sources));
+        exclude_build_scripts(&mut files, package, &copy);
         files.sort();
         let prefix = format!("{}@{}/", package.name, package.version);
         let (placed, serves, stores) = place_files(&files, &copy, &prefix, entry.kinds.as_deref(), service, placement);
@@ -684,6 +693,9 @@ fn main() {
     }
     let mut files = Vec::new();
     copy_tree(&source, &target, &mut files);
+    let metadata = cargo_metadata::MetadataCommand::new().manifest_path(target.join("Cargo.toml")).no_deps().exec()
+        .expect("cargo metadata failed on the copy");
+    exclude_build_scripts(&mut files, metadata.root_package().expect("the rewritten crate is a package"), &target);
     files.sort();
     let (mut points, serves, stores) = place_files(&files, &target, "", None, &service, &config.placement);
     let features: Vec<&str> = [(serves, "tower"), (stores, "store")].into_iter()
