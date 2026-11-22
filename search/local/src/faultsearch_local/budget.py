@@ -4,28 +4,20 @@ from enum import StrEnum
 from statistics import fmean
 from typing import Final
 
-from faultsearch.allocation import Allocation, AllocationSettings, Assignment, Strategy
-from faultsearch.catalog import FROZEN, Catalog
-from faultsearch.chains import Chain, Stitcher, Stitching
-from faultsearch.counterfactual import Scenarios
-from faultsearch.edges import Edge
-from faultsearch.evidence import MappingFeedback
-from faultsearch.validation import (Selection, Validation, Validations, adjudications, chosen_runs, headroom,
-                                    hop_checks, mapping_checks, merged_workload, merged_workloads, run_key)
+from faultsearch.allocation import AllocationSettings, Strategy
+from faultsearch.catalog import FROZEN
+from faultsearch.counterfactual import TreatmentRecord
+from faultsearch.execution import RecordedExecutor
+from faultsearch.facts import FactList, Facts, LoadVariants, PointInventory, SystemTopology
+from faultsearch.graph import ComputeSettings, FactGraph
+from faultsearch.plan import PlanSettings, PlanState, Refill, Stage, ValidationSettings, search
+from faultsearch.validation import Selection, hop_checks, run_key
 from pydantic import BaseModel
 
-from faultsearch_local.exploration import Exploration, phased_allocation, random_allocation
-from faultsearch_local.refill import candidate_phase, counterpart_rounds, stitched
-from faultsearch_local.runner import Runner
-from faultsearch_local.store import CONTROLS
-
-BUDGETS: Final = "budgets"
+BUDGETS: Final = "plan-budgets"
 """The directory, in the full experiment's, of the offline comparison's trajectories."""
-RANKED_RUNS: Final = 10
-RUN_BATCH: Final = 5
-RUNS_PER_GROUP: Final = 3
-"""The validation the comparison simulates: as many ranked runs, chosen in batches of as many, at most as many a
-group, as the validations of the full experiments ran."""
+OFFLINE_VALIDATION: Final = ValidationSettings(runs=10, batch=5, per_group=3, single_scenario_cross_layer=0)
+"""The validation the comparison simulates: the ranked runs of the full experiments' validations, without controls."""
 TOP_RANKS: Final = 3
 """The rank among the stitched-only chains across layers a target must reach for the selection criterion."""
 
@@ -41,25 +33,6 @@ class Plan(StrEnum):
     """Pairs drawn uniformly, then the counterparts in random order, round by round."""
 
 
-class RecordedExploration(Exploration):
-    """An exploration that takes its treatments from a full exploration's records and runs none: a pair the records
-    lack is charged to the budget and stays untried."""
-
-    def __init__(self, runner: Runner, catalog: Catalog, scenarios: Scenarios, settings: AllocationSettings) -> None:
-        super().__init__(runner, catalog, scenarios, settings)
-        self.unavailable: set[tuple[str, str]] = set()
-
-    def run(self, assignments: list[Assignment]) -> None:
-        missing = {(fault.key, workload.name) for fault, workload in self.runner.missing(
-            [(assignment.fault, self.workloads[assignment.scenario]) for assignment in assignments])}
-        self.unavailable |= missing
-        super().run([assignment for assignment in assignments
-                     if (assignment.fault.key, assignment.scenario) not in missing])
-
-    def tried(self) -> set[tuple[str, str]]:
-        return super().tried() | self.unavailable
-
-
 class RunVerdict(StrEnum):
     CONFIRMED = "confirmed"
     REFUTED = "refuted"
@@ -68,7 +41,7 @@ class RunVerdict(StrEnum):
 
 
 class RankedRun(BaseModel):
-    """A validation run the ranking picked, and what the full experiment's records say of the chain that picked it."""
+    """A validation run the ranking picked, and what the full experiment's runs say of the chain that picked it."""
 
     model_config = FROZEN
 
@@ -86,15 +59,15 @@ class Snapshot(BaseModel):
     refill: int
     """The refill budget."""
     explored: int
-    """The injections the exploring phases spent."""
+    """The injections the exploring stages asked for."""
     refilled: int
-    """The refill injections charged, those the records lack included."""
+    """The refill injections asked for, those the records lack included."""
     unavailable: int
-    """The injections the full records lack, which would need new runs."""
+    """The injections the full experiment's runs lack, which would need new runs."""
     cross_layer: tuple[str, ...]
     """The stitched-only chains across layers that end in a failure the user sees, best ranked first."""
     verdicts: dict[str, bool]
-    """Whether its run confirms each of those chains, for those whose run the full experiment validated."""
+    """Whether its run confirms each of those chains, for those whose run the full experiment ran."""
     runs: tuple[RankedRun, ...]
 
 
@@ -109,85 +82,79 @@ class Trajectory(BaseModel):
     snapshots: tuple[Snapshot, ...]
 
 
-def recorded_runs(chains: list[Chain], runner: Runner, scenarios: Scenarios,
-                  min_count_increase: float) -> dict[str, Validation]:
-    """Every chain's check against its validation run, for the chains whose run the full experiment recorded."""
-    runs = {chain.key: (chain, [(chain.hops[0].cause, merged_workload(chain.condition, scenarios))])
-            for chain in chains}
-    records = {key: runner.recorded(pairs)[0] for key, (_, pairs) in runs.items() if not runner.missing(pairs)}
-    return {key: Validation(chain=runs[key][0], selection=Selection.CROSS_LAYER, workload=runs[key][1][0][1],
-                            record=record, hops=hop_checks(runs[key][0], record, min_count_increase))
-            for key, record in records.items()}
+class Comparison:
+    """A full experiment's facts, which an offline allocation draws its runs from, and what they say of every chain's
+    path run."""
 
+    def __init__(self, recorded: Facts, compute: ComputeSettings, allocation: AllocationSettings,
+                 repetitions: int, pack_tenants: bool) -> None:
+        self.recorded = recorded
+        self.compute = compute
+        self.allocation = allocation
+        self.repetitions = repetitions
+        self.pack_tenants = pack_tenants
+        graph = FactGraph(recorded, compute)
+        self.full = len(graph.assignments)
+        self.path_records: dict[tuple[str, str], TreatmentRecord] = {
+            (record.fault.key, record.workload): record for record in graph.judgement[0]}
 
-def ranked_runs(stitching: Stitching, edges: list[Edge], runner: Runner, scenarios: Scenarios) -> tuple[RankedRun, ...]:
-    """The validation the validate command would run, decided from the full experiment's validation runs alone: the
-    candidates with headroom that no natural witness contradicts pick runs in batches, and the checks of the runs the
-    records hold update the chances that rank the next batch."""
-    order = {key: rank for rank, key in enumerate(stitching.keys)}
-    kept = sorted({chain.key: chain for chain in (*stitching.top, *stitching.top_cross_layer)}.values(),
-                  key=lambda chain: order[chain.key])
-    workloads = merged_workloads(kept, scenarios)
-    missing = sorted(workload.name for workload in workloads if not runner.store.has(CONTROLS, f"{workload.name}.json"))
-    if missing:
-        raise RuntimeError(f"an offline comparison runs nothing, and these merged workloads have no controls: {missing}")
-    roomy = {room.chain for room in headroom(kept, edges, scenarios, stitching.min_count_increase,
-                                             runner.controls(workloads), runner).chains if room.room}
-    candidates = [chain for chain in kept if chain.crosses_layers and chain.terminal and chain.key in roomy
-                  and chain.stitched_only and not chain.contradicted]
-    validations: list[Validation] = []
-    feedback = MappingFeedback(checks=())
-    picked: list[Chain] = []
-    runs: list[RankedRun] = []
-    for start in range(0, RANKED_RUNS, RUN_BATCH):
-        picks = chosen_runs(candidates, scenarios, feedback.class_checks(), min(RUN_BATCH, RANKED_RUNS - start),
-                            RUNS_PER_GROUP, {run_key(chain, scenarios) for chain in picked},
-                            Counter(chain.group for chain in picked))
-        picked += picks
-        chosen = list(recorded_runs(picks, runner, scenarios, stitching.min_count_increase).values())
-        decided = adjudications(Validations(validations=(*validations, *chosen)), kept, scenarios,
-                                stitching.min_count_increase)
-        validations += [*chosen, *decided]
-        feedback = feedback.merged(mapping_checks(Validations(validations=(*chosen, *decided))))
-        verdicts = {validation.chain.key: validation.confirmed for validation in chosen}
-        runs += [RankedRun(first=pick.hops[0].cause.key, workload=merged_workload(pick.condition, scenarios).name,
-                           chain=pick.key, verdict=RunVerdict.NEEDS_RUN if pick.key not in verdicts
-                           else RunVerdict.CONFIRMED if verdicts[pick.key] else RunVerdict.REFUTED)
-                 for pick in picks]
-    return tuple(runs)
+    def started(self) -> FactList:
+        """A new allocation's facts: the full experiment's topology and load variants."""
+        log = FactList([])
+        log.append(self.recorded.latest(SystemTopology).model_copy(update={"sequence": 1}))
+        log.append(self.recorded.latest(LoadVariants).model_copy(update={"sequence": 2}))
+        return log
 
+    def inventory(self, labels: tuple[str, ...], sequence: int) -> PointInventory:
+        return self.recorded.latest(PointInventory).model_copy(update={"sequence": sequence})
 
-def snapshot(exploration: RecordedExploration, strategy: Strategy, refill: int, explored: int, refilled: int,
-             stitcher: Stitcher) -> Snapshot:
-    _, edges, stitching = stitched(exploration, strategy, stitcher)
-    runner = exploration.runner
-    across = [chain for chain in stitching.top_cross_layer if chain.stitched_only]
-    checks = recorded_runs(across, runner, stitcher.scenarios, stitching.min_count_increase)
-    return Snapshot(refill=refill, explored=explored, refilled=refilled, unavailable=len(exploration.unavailable),
-                    cross_layer=tuple(chain.key for chain in across),
-                    verdicts={key: validation.confirmed for key, validation in checks.items()},
-                    runs=ranked_runs(stitching, edges, runner, stitcher.scenarios))
+    def ranked_runs(self, log: FactList, state: PlanState, settings: PlanSettings) -> tuple[RankedRun, ...]:
+        """The validation of an allocation's chains, run on a copy of its facts with the full experiment's path
+        runs: every chain that picked a ranked run and its run's verdict, or that the full experiment never ran it."""
+        copy = FactList(list(log.facts))
+        validating = settings.model_copy(update={"validation": OFFLINE_VALIDATION})
+        done = search(copy, state.model_copy(update={"stage": Stage.PATH_CONTROLS}), validating,
+                      RecordedExecutor(self.recorded, copy), self.inventory, lambda saved: None)
+        graph = FactGraph(copy.snapshot(), self.compute)
+        verdicts = {validation.chain.key: validation.confirmed for validation in graph.judgement[2].validations
+                    if validation.selection == Selection.CROSS_LAYER}
+        scenarios = graph.variants.scenarios
+        chains = {chain.key: chain for chain in (*graph.stitching.top, *graph.stitching.top_cross_layer)}
+        return tuple(RankedRun(first=run_key(chains[key], scenarios)[0], workload=run_key(chains[key], scenarios)[1],
+                               chain=key, verdict=RunVerdict.NEEDS_RUN if key not in verdicts
+                               else RunVerdict.CONFIRMED if verdicts[key] else RunVerdict.REFUTED)
+                     for key in done.picked)
 
+    def snapshot(self, log: FactList, state: PlanState, settings: PlanSettings, unavailable: int) -> Snapshot:
+        graph = FactGraph(log.snapshot(), self.compute)
+        scenarios = graph.variants.scenarios
+        across = [chain for chain in graph.stitching.top_cross_layer if chain.stitched_only]
+        return Snapshot(refill=settings.refill_budget, explored=state.spent, refilled=state.refilled,
+                        unavailable=unavailable, cross_layer=tuple(chain.key for chain in across),
+                        verdicts={chain.key: all(hop.confirmed for hop in hop_checks(
+                            chain, record, self.compute.min_count_increase)) and record.exercised
+                            for chain in across if (record := self.path_records.get(run_key(chain, scenarios)))},
+                        runs=self.ranked_runs(log, state, settings))
 
-def simulate(plan: Plan, explore: int, refills: list[int], seed: int, runner: Runner, settings: AllocationSettings,
-             stitcher: Stitcher) -> Trajectory:
-    """One plan replayed on a full experiment's records with an exploring budget and a seed, seen after the
-    exploring phases and at every refill budget, the larger budgets continuing where the smaller stopped."""
-    exploration = RecordedExploration(runner, stitcher.catalog, stitcher.scenarios,
-                                      settings.model_copy(update={"budget": explore, "seed": seed}))
-    strategy = Strategy.RANDOM if plan == Plan.RANDOM else Strategy.PHASED
-    if plan == Plan.RANDOM:
-        random_allocation(exploration)
-    else:
-        phased_allocation(exploration)
-    explored = len(exploration.assignments)
-    refill_phase = candidate_phase if plan == Plan.CANDIDATE else counterpart_rounds
-    spent = 0
-    snapshots = []
-    for refill in sorted(refills):
-        spent += refill_phase(exploration, refill - spent, strategy, stitcher)
-        snapshots.append(snapshot(exploration, strategy, refill, explored, spent, stitcher))
-    return Trajectory(plan=plan, explore=explore, seed=seed, snapshots=tuple(snapshots))
+    def simulate(self, plan: Plan, explore: int, refills: list[int], seed: int) -> Trajectory:
+        """One plan replayed on the full experiment's runs with an exploring budget and a seed, seen at every refill
+        budget, the larger budgets continuing where the smaller stopped with a new round."""
+        settings = PlanSettings(
+            strategy=Strategy.RANDOM if plan == Plan.RANDOM else Strategy.PHASED,
+            allocation=self.allocation.model_copy(update={"budget": explore, "seed": seed}),
+            repetitions=self.repetitions, pack_tenants=self.pack_tenants,
+            refill=Refill.CANDIDATE if plan == Plan.CANDIDATE else Refill.ROUNDS, refill_budget=0,
+            validation=ValidationSettings(runs=0), compute=self.compute)
+        log = self.started()
+        executor = RecordedExecutor(self.recorded, log)
+        state = PlanState.start(settings)
+        snapshots = []
+        for refill in sorted(refills):
+            settings = settings.model_copy(update={"refill_budget": refill})
+            state = search(log, state.model_copy(update={"stage": Stage.REFILL}) if state.stage == Stage.DONE else state,
+                           settings, executor, self.inventory, lambda saved: None)
+            snapshots.append(self.snapshot(log, state, settings, executor.unavailable))
+        return Trajectory(plan=plan, explore=explore, seed=seed, snapshots=tuple(snapshots))
 
 
 def target_rank(snapshot: Snapshot, target: Callable[[str], bool]) -> int | None:
@@ -195,7 +162,7 @@ def target_rank(snapshot: Snapshot, target: Callable[[str], bool]) -> int | None
     return next((rank for rank, key in enumerate(snapshot.cross_layer, 1) if target(key)), None)
 
 
-def budget_table(trajectories: list[Trajectory], target: Callable[[str], bool], full: Allocation) -> list[str]:
+def budget_table(trajectories: list[Trajectory], target: Callable[[str], bool], full: int) -> list[str]:
     """Per plan, exploring budget and refill budget, over the seeds: how often a target chain was stitched, its ranks,
     how often it ranked in the top ranks with its run confirming it, the ranked runs' verdicts and the injections,
     against the full experiment's."""
@@ -214,6 +181,5 @@ def budget_table(trajectories: list[Trajectory], target: Callable[[str], bool], 
                      f"/{len(found)}, ranks {ranks}, top {TOP_RANKS} and confirmed {selected}/{len(found)}; runs "
                      f"{verdicts[RunVerdict.CONFIRMED]} confirmed, {verdicts[RunVerdict.REFUTED]} refuted, "
                      f"{verdicts[RunVerdict.NEEDS_RUN]} need new runs; injections {injections:.0f} "
-                     f"({injections / len(full.assignments):.0%} of {len(full.assignments)}), "
-                     f"{fmean(one.unavailable for one in found):.0f} not recorded")
+                     f"({injections / full:.0%} of {full}), {fmean(one.unavailable for one in found):.0f} not recorded")
     return lines

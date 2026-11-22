@@ -5,20 +5,19 @@ from pydantic import BaseModel
 
 SEARCH_RUNS: Final = Path(__file__).resolve().parents[4] / "runs" / "search"
 REPETITIONS: Final = "repetitions"
-CONTROLS: Final = "controls"
-TREATMENTS: Final = "treatments"
-LEAKS: Final = "leaks"
 INPUTS: Final = "inputs"
 SCENARIOS_INPUT: Final = "scenarios.json"
-ACTIONS_INPUT: Final = "actions.json"
-EFFECTS_INPUT: Final = "effects.json"
 RUN_SETTINGS: Final = "run-settings.json"
 ALLOCATION_SETTINGS: Final = "allocation-settings.json"
+REPORT: Final = "report.json"
+CONTROLS: Final = "controls"
+"""The control records of an experiment directory written before facts, as the files below are."""
+TREATMENTS: Final = "treatments"
+EFFECTS_INPUT: Final = "effects.json"
 CATALOG: Final = "catalog.json"
 VALIDATIONS: Final = "validations.json"
 HEADROOM: Final = "headroom.json"
 MAPPING_FEEDBACK: Final = "mapping-feedback.json"
-REPORT: Final = "report.json"
 
 
 def allocation_file(strategy: str) -> str:

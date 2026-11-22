@@ -2,15 +2,18 @@ import os
 import subprocess
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from hashlib import sha256
+from pathlib import Path
 from typing import Final
 
 from faultpoint.tools.kinds import KindTable
+from faultsearch.catalog import FROZEN
 from faultsearch.counterfactual import Statuses
 from faultsearch.execution import RunRequest
 from faultsearch.facts import SearchRun
+from pydantic import BaseModel, Field, JsonValue
 
 from faultsearch_local.facts_file import FactLog, RunOrigin
-from faultsearch_local.runner import RunSettings, repetition_seed
 from faultsearch_local.store import Store
 from faultsearch_local.systems import REFUSAL_FILE, STATUSES_FILE, System
 
@@ -19,6 +22,35 @@ LOAD_POLL_S: Final = 2.0
 
 type Running = list[tuple[str, Future[Statuses]]]
 """Repetitions submitted, by label."""
+
+
+class RunSettings(BaseModel):
+    """How an experiment's repetitions run: the SDK checkout and the commit its services are built from, the
+    repetitions of every request, the comparison's thresholds, how many run side by side, whether faults share
+    repetitions, the system and its instrumentation."""
+
+    model_config = FROZEN
+
+    sdk: Path
+    commit: str
+    repetitions: int = Field(ge=2)
+    alpha: float
+    min_mean_increase: float
+    workers: int = Field(ge=1)
+    pack_tenants: bool = True
+    """Whether faults share repetitions in different tenants; off when upstream components are observed, since no
+    tenant scope separates their observations."""
+    system: str = "shop"
+    """The system the experiment explores, by name."""
+    instrumentation: dict[str, JsonValue]
+    """What of faultpoint runs and what the kernel agent observes, the same in every repetition, as the system's
+    deployment reads it."""
+
+
+def repetition_seed(label: str) -> int:
+    """The FAULTPOINT_SEED of a repetition, from its label, so that the repetitions of one group draw their rules'
+    chances anew and a repetition run again draws the same."""
+    return int(sha256(label.encode()).hexdigest()[:15], 16)
 
 
 class LocalExecutor:

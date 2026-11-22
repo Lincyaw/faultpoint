@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Final
 
 from faultsearch.counterfactual import SCOPE_KEY
-from faultsearch_local.runner import repetition_seed
+from faultsearch_local.executor import repetition_seed
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from shop.deployment import (MANIFESTS, RESPONSES_FILE, RUNS, Instrumentation, Responses, build, refusal, repetition,

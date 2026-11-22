@@ -13,8 +13,8 @@ from faultsearch.graph import PropagationGraph
 from faultsearch.validation import VALIDATION_PREFIX, Headroom, Selection, Validation, Validations
 from pydantic import BaseModel
 
+from faultsearch_local.executor import RunSettings
 from faultsearch_local.facts_file import RULES_FILE, RunOrigin
-from faultsearch_local.runner import RunSettings
 from faultsearch_local.store import (CATALOG, CONTROLS, EFFECTS_INPUT, HEADROOM, INPUTS, MAPPING_FEEDBACK, REPETITIONS,
                                      RUN_SETTINGS, SCENARIOS_INPUT, TREATMENTS, VALIDATIONS, Store, allocation_file,
                                      chains_file, edges_file)

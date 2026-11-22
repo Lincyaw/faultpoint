@@ -235,15 +235,6 @@ class Group(BaseModel):
                                    *((rule.action, rule.probability) for rule in fault.following)], strict=True)))
 
 
-class Leak(BaseModel):
-    """A packed group whose untreated tenants changed, so that its faults ran again alone."""
-
-    model_config = FROZEN
-
-    group: Group
-    leakage: dict[str, tuple[Effect, ...]]
-
-
 def control_labels(workload: NamedWorkload, repetitions: int) -> list[str]:
     return [f"{workload.name}.control.{index}" for index in range(repetitions)]
 
