@@ -202,26 +202,31 @@ def control_executions(records: Iterable[ObservationRecord], repetitions: int, t
     return {point: count / (repetitions * tenants) for point, count in counts.items()}
 
 
-def point_manifests(manifests: Path) -> dict[str, Manifest]:
+def read_manifests(directory: Path) -> tuple[Manifest, ...]:
+    """A build's manifests, in the order of their file names."""
+    return tuple(Manifest.model_validate_json(path.read_text(encoding="utf-8"))
+                 for path in sorted(directory.glob("*.json")))
+
+
+def point_manifests(manifests: tuple[Manifest, ...]) -> dict[str, Manifest]:
     """The manifest that lists each point, with its language and the errors its build registers: a service can have
     several, such as its SDK's and that of its native hook points; a point no manifest lists has none."""
     listed: dict[str, Manifest] = {}
-    for path in sorted(manifests.glob("*.json")):
-        manifest = Manifest.model_validate_json(path.read_text(encoding="utf-8"))
+    for manifest in manifests:
         for entry in manifest.points:
             if entry.id in listed:
-                raise ValueError(f"{entry.id} is listed in the manifests of {listed[entry.id].service} and of {path}")
+                raise ValueError(f"{entry.id} is listed in the manifests of {listed[entry.id].service} and of "
+                                 f"{manifest.service}")
             listed[entry.id] = manifest
     return listed
 
 
-def build_catalog(manifests: Path, executions: dict[str, dict[str, float]], configured: list[str],
+def build_catalog(manifests: tuple[Manifest, ...], executions: dict[str, dict[str, float]], configured: list[str],
                   actions: ActionTable, kinds: KindTable, upstream: frozenset[str]) -> Catalog:
     """Every point the manifests list, a control observed or the deployment configures, times the actions its kind
     takes in its layer that the point implements; the points no control executed where a rule reaches them are
     excluded."""
-    entries = [entry for path in sorted(manifests.glob("*.json"))
-               for entry in Manifest.model_validate_json(path.read_text(encoding="utf-8")).points]
+    entries = [entry for manifest in manifests for entry in manifest.points]
     placed = {entry.id for entry in entries}
     narrower = {entry.id: entry.actions for entry in entries if entry.actions is not None}
     points = sorted(placed | set(configured) | {point for per_point in executions.values() for point in per_point})

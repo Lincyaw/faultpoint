@@ -8,7 +8,7 @@ from faultpoint.rules import Action
 from faultpoint.tools.kinds import KindTable
 from faultsearch.allocation import Allocation, AllocationSettings, Strategy
 from faultsearch.catalog import (FROZEN, ActionTable, Catalog, Fault, build_catalog, control_executions, point_layer,
-                                 point_manifests, point_scoped)
+                                 point_manifests, point_scoped, read_manifests)
 from faultsearch.chains import Stitcher, Stitching
 from faultsearch.counterfactual import EffectKey, NamedWorkload, Scenarios, tenant_names
 from faultsearch.edges import Acceptance, Condition, EdgeSet, EffectMap, counterpart_assignments, holds
@@ -19,6 +19,7 @@ from pydantic import BaseModel, TypeAdapter
 
 from faultsearch_local.budget import BUDGETS, Plan, Trajectory, budget_table, simulate
 from faultsearch_local.exploration import Exploration, extended_allocation, phased_allocation, random_allocation
+from faultsearch_local.facts_file import FACTS, experiment_facts, write_facts
 from faultsearch_local.refill import candidate_phase
 from faultsearch_local.report import render, summarise
 from faultsearch_local.runner import Runner, RunSettings, treatment_record
@@ -74,7 +75,7 @@ def recorded_stitcher(store: Store, system: System, min_count_increase: float, a
                     effects=store.record_input(EffectMap.read(system.entry_service), INPUTS, EFFECTS_INPUT),
                     catalog=store.load(Catalog, CATALOG), kinds=KindTable.installed(), upstream=system.upstream,
                     targets=system.targets, services=services_by_port(system),
-                    manifests=point_manifests(system.manifests), min_count_increase=min_count_increase,
+                    manifests=point_manifests(read_manifests(system.manifests)), min_count_increase=min_count_increase,
                     min_mean_increase=store.load(RunSettings, RUN_SETTINGS).min_mean_increase, acceptance=acceptance,
                     width=width, max_hops=max_hops, kept=kept)
 
@@ -88,7 +89,8 @@ def scenario_catalog(store: Store, runner: Runner, scenarios: Scenarios) -> Cata
         [record for label in control.labels for record in runner.observations(label)], len(control.labels),
         len(tenant_names(control.workload.workload)), runner.kinds, runner.system.upstream) for control in controls}
     actions = store.record_input(ActionTable.read(), INPUTS, ACTIONS_INPUT)
-    return store.record_input(build_catalog(runner.system.manifests, executions, list(runner.system.configured),
+    return store.record_input(build_catalog(read_manifests(runner.system.manifests), executions,
+                                            list(runner.system.configured),
                                             actions, runner.kinds, runner.system.upstream), CATALOG)
 
 
@@ -276,6 +278,22 @@ def rerecord(experiment: Experiment) -> None:
                                                       workload=scenarios.workload(assignment.scenario)))
                      for assignment in assignments])
     typer.echo(f"{len(assignments)} injections recorded again")
+
+
+@app.command("import-facts")
+def import_facts(experiment: Experiment) -> None:
+    """Convert an experiment directory into facts, written to its facts.jsonl: the system's topology and load
+    variants, the point inventory, and a search run for every repetition a control, treatment or validation record of
+    the experiment refers to. The other repetition directories are left out and counted."""
+    store = Store(experiment)
+    imported = experiment_facts(store, recorded_system(store))
+    write_facts(store.path(FACTS), imported.facts)
+    kinds = Counter(str(fact.kind) for fact in imported.facts.facts)
+    purposes = Counter(str(fact.purpose) for fact in imported.facts.standing_runs())
+    typer.echo(f"{len(imported.facts.facts)} facts: {dict(kinds)}; search runs by purpose {dict(purposes)}")
+    typer.echo(f"left out: {len(imported.unreferenced)} repetitions that ran to their end but no record of the "
+               f"experiment refers to, by workload {dict(Counter(label.split('.')[0] for label in imported.unreferenced))};"
+               f" {len(imported.unfinished)} that never ran to their end")
 
 
 @app.command("chains")
