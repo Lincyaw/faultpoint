@@ -524,6 +524,9 @@ fn require_sdk(target: &Path, sdk: &Path, features: &[&str]) {
         .parse().expect("Cargo.toml is not valid TOML");
     let mut dependency = toml_edit::InlineTable::new();
     dependency.insert("path", sdk.display().to_string().into());
+    let features: Vec<&str> = features.iter().copied().chain(
+        manifest.get("dependencies").and_then(toml_edit::Item::as_table_like)
+            .is_some_and(|dependencies| dependencies.contains_key("tokio")).then_some("tokio")).collect();
     if !features.is_empty() {
         dependency.insert("features", toml_edit::Array::from_iter(features.iter().copied()).into());
     }
