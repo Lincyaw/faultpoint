@@ -11,7 +11,7 @@ from faultsearch.execution import RecordedExecutor
 from faultsearch.facts import FactList, Facts, LoadVariants, PointInventory, SystemTopology
 from faultsearch.graph import ComputeSettings, FactGraph
 from faultsearch.plan import PlanSettings, PlanState, Refill, Stage, ValidationSettings, search
-from faultsearch.validation import Selection, hop_checks, run_key
+from faultsearch.validation import RunKey, RunVerdict, Selection, run_key, run_verdict
 from pydantic import BaseModel
 
 BUDGETS: Final = "plan-budgets"
@@ -31,13 +31,6 @@ class Plan(StrEnum):
     """Coverage, round robin and weighting, then the candidate phase."""
     RANDOM = "random"
     """Pairs drawn uniformly, then the counterparts in random order, round by round."""
-
-
-class RunVerdict(StrEnum):
-    CONFIRMED = "confirmed"
-    REFUTED = "refuted"
-    NEEDS_RUN = "needs-new-run"
-    """The full experiment never ran this validation."""
 
 
 class RankedRun(BaseModel):
@@ -95,7 +88,7 @@ class Comparison:
         self.pack_tenants = pack_tenants
         graph = FactGraph(recorded, compute)
         self.full = len(graph.assignments)
-        self.path_records: dict[tuple[str, str], TreatmentRecord] = {
+        self.path_records: dict[RunKey, TreatmentRecord] = {
             (record.fault.key, record.workload): record for record in graph.judgement[0]}
 
     def started(self) -> FactList:
@@ -131,9 +124,9 @@ class Comparison:
         across = [chain for chain in graph.stitching.top_cross_layer if chain.stitched_only]
         return Snapshot(refill=settings.refill_budget, explored=state.spent, refilled=state.refilled,
                         unavailable=unavailable, cross_layer=tuple(chain.key for chain in across),
-                        verdicts={chain.key: all(hop.confirmed for hop in hop_checks(
-                            chain, record, self.compute.min_count_increase)) and record.exercised
-                            for chain in across if (record := self.path_records.get(run_key(chain, scenarios)))},
+                        verdicts={chain.key: verdict == RunVerdict.CONFIRMED for chain in across
+                                  if (verdict := run_verdict(chain, self.path_records, scenarios,
+                                                             self.compute.min_count_increase)) != RunVerdict.NEEDS_RUN},
                         runs=self.ranked_runs(log, state, settings))
 
     def simulate(self, plan: Plan, explore: int, refills: list[int], seed: int) -> Trajectory:

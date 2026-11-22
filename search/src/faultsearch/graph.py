@@ -1,6 +1,6 @@
+import json
 from collections import defaultdict
 from functools import cached_property
-from importlib.metadata import version
 
 from faultpoint.observations import ObservationRecord
 from faultpoint.rules import Rule
@@ -21,8 +21,8 @@ from faultsearch.validation import (Headroom, Validation, Validations, adjudicat
 
 class ComputeSettings(BaseModel):
     """What a graph is computed with besides the facts: how substitute runs are compared, the thresholds of an effect,
-    the beam, the clusters, and the versions of faultsearch and of the faultpoint analysis library, which fix the effect
-    map, the action table and the kind table."""
+    the beam and the clusters. The commit of faultsearch that computes it fixes the rest: the faultpoint analysis
+    library, the effect map, the action table and the kind table."""
 
     model_config = FROZEN
 
@@ -34,13 +34,11 @@ class ComputeSettings(BaseModel):
     max_hops: int = 4
     kept: int = 2000
     cluster_distance: float = 0.5
-    faultsearch: str
-    faultpoint: str
 
 
-def installed_settings() -> ComputeSettings:
-    """The default settings of the installed faultsearch and faultpoint."""
-    return ComputeSettings(faultsearch=version("faultsearch"), faultpoint=version("faultpoint"))
+def print_settings_schema() -> None:
+    """Print the JSON Schema of the compute settings, which a caller passes as a JSON file."""
+    print(json.dumps(ComputeSettings.model_json_schema(), indent=2))
 
 
 class PropagationGraph(BaseModel):
@@ -218,14 +216,10 @@ def judged(stitching: Stitching, edges: list[Edge], path_runs: list[tuple[Group,
 
 class FactGraph:
     """The graph the facts give under the settings, each part computed when it is first read, so that planning reads
-    only what the facts so far allow; the settings must be those of the installed faultsearch and faultpoint. Edges
-    come only from the runs in load variants; the merged workloads only judge paths and measure headroom."""
+    only what the facts so far allow. Edges come only from the runs in load variants; the merged workloads only judge
+    paths and measure headroom."""
 
     def __init__(self, facts: Facts, settings: ComputeSettings) -> None:
-        installed = installed_settings()
-        if (settings.faultsearch, settings.faultpoint) != (installed.faultsearch, installed.faultpoint):
-            raise ValueError(f"the settings are for faultsearch {settings.faultsearch} and faultpoint "
-                             f"{settings.faultpoint}, but {installed.faultsearch} and {installed.faultpoint} are installed")
         self.facts = facts
         self.settings = settings
         self.topology = facts.latest(SystemTopology)
@@ -304,14 +298,18 @@ class FactGraph:
     def feedback(self) -> MappingFeedback:
         return MappingFeedback(checks=()).merged(mapping_checks(self.judgement[2]))
 
+    @cached_property
+    def judged_stitching(self) -> Stitching:
+        """The chains stitched again with what the path runs confirmed and refuted."""
+        return self.stitcher.chains(self.edges, self.allocation, self.records, self.feedback)
+
     def graph(self) -> PropagationGraph:
         path_records, room, validations = self.judgement
         return PropagationGraph(
             settings=self.settings, through=self.facts.facts[-1].sequence, catalog=self.catalog,
             controls=tuple(self.controls.values()), records=tuple(self.records), allocation=self.allocation,
             edges=tuple(self.edges), stitching=self.stitching, path_records=path_records, headroom=room,
-            validations=validations, feedback=self.feedback,
-            judged_stitching=self.stitcher.chains(self.edges, self.allocation, self.records, self.feedback))
+            validations=validations, feedback=self.feedback, judged_stitching=self.judged_stitching)
 
 
 def compute_graph(facts: Facts, settings: ComputeSettings) -> PropagationGraph:

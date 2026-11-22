@@ -1,14 +1,17 @@
+import argparse
 import json
-from collections import defaultdict
+import sys
+from abc import abstractmethod
 from collections.abc import Iterable
 from enum import StrEnum
 from hashlib import sha256
+from pathlib import Path
 from typing import Annotated, Final, Literal
 
 from faultpoint.observations import ObservationRecord
 from faultpoint.placement import Manifest
 from faultpoint.rules import Rule
-from pydantic import BaseModel, Field, JsonValue, TypeAdapter
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, field_serializer
 
 from faultsearch.allocation import Phase
 from faultsearch.catalog import FROZEN
@@ -17,6 +20,10 @@ from faultsearch.validation import Selection
 
 CONTROL_GROUP: Final = "control"
 """The group of a control run, which injects nothing."""
+FACTS_FILE: Final = "facts.jsonl"
+"""The file of a fact directory: one fact per line, in sequence order."""
+CONTENT_EXCLUDED: Final = frozenset({"sequence"})
+"""What a fact's content leaves out: its number, which a store that keeps facts of several sources assigns anew."""
 
 
 class FactKind(StrEnum):
@@ -93,6 +100,35 @@ def tallies(records: Iterable[ObservationRecord]) -> tuple[Tally, ...]:
                  (count, total, elapsed, start, end) in sums.items())
 
 
+def canonical(value: JsonValue) -> str:
+    """JSON text that two equal values always have: keys sorted, no spaces."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def digest(value: JsonValue) -> str:
+    return sha256(canonical(value).encode()).hexdigest()
+
+
+class FactBody(BaseModel):
+    """What every kind of fact has: a number in its store's order, content without that number, and an identity under
+    which a store writes it once."""
+
+    model_config = FROZEN
+
+    sequence: int
+
+    @property
+    @abstractmethod
+    def identity(self) -> str: ...
+
+    def content(self) -> JsonValue:
+        """The fact as JSON without its number, every set sorted, which two facts of one identity must share."""
+        return self.model_dump(mode="json", exclude=set(CONTENT_EXCLUDED))
+
+    def same_content(self, other: "FactBody") -> bool:
+        return canonical(self.content()) == canonical(other.content())
+
+
 class PathRequest(BaseModel):
     """A chain that asked for a path run, and how it was chosen."""
 
@@ -102,15 +138,12 @@ class PathRequest(BaseModel):
     selection: Selection
 
 
-class SearchRun(BaseModel):
+class SearchRun(FactBody):
     """One repetition: the deployment reset, then one workload run to its end under one seed and one intervention,
     an empty one for a control. Its identity is its source, its workload, its group and its index; its results never
     enter the identity."""
 
-    model_config = FROZEN
-
     kind: Literal[FactKind.SEARCH_RUN] = FactKind.SEARCH_RUN
-    sequence: int
     source: str
     """The workflow or experiment that produced the run."""
     workload: NamedWorkload
@@ -143,19 +176,20 @@ class SearchRun(BaseModel):
     def label(self) -> str:
         return f"{self.workload.name}.{self.group}.{self.index}"
 
+    @property
+    def identity(self) -> str:
+        return f"{self.source}/{self.label}"
+
     def records(self) -> list[ObservationRecord]:
         return [tally.record() for tally in self.tallies]
 
 
-class PointInventory(BaseModel):
+class PointInventory(FactBody):
     """Every point of a system at one revision, SDK build and deployment: those its rewriters' manifests list, with
     their language, actions and the errors each service registers; those its deployment configures; and those the
     control runs it names observe."""
 
-    model_config = FROZEN
-
     kind: Literal[FactKind.POINT_INVENTORY] = FactKind.POINT_INVENTORY
-    sequence: int
     system: str
     revision: str | None
     sdk_build: str
@@ -171,15 +205,12 @@ class PointInventory(BaseModel):
                                                     "controls"}).encode()).hexdigest()[:12]
 
 
-class SystemTopology(BaseModel):
+class SystemTopology(FactBody):
     """What computing a system's graph needs to know of its deployment: its upstream components, the service whose
     responses the user sees and which of them are failures, the port each service listens on, which tells the service
     a client point calls, and what a fault no rule can scope acts on."""
 
-    model_config = FROZEN
-
     kind: Literal[FactKind.SYSTEM_TOPOLOGY] = FactKind.SYSTEM_TOPOLOGY
-    sequence: int
     system: str
     upstream: frozenset[str]
     entry_service: str
@@ -187,20 +218,29 @@ class SystemTopology(BaseModel):
     ports: dict[str, int]
     targets: dict[str, str]
 
+    @field_serializer("upstream")
+    def sorted_upstream(self, upstream: frozenset[str]) -> list[str]:
+        return sorted(upstream)
 
-class LoadVariants(BaseModel):
+    @property
+    def identity(self) -> str:
+        return digest(self.content())
+
+
+class LoadVariants(FactBody):
     """A system's baseline workload and its variants."""
 
-    model_config = FROZEN
-
     kind: Literal[FactKind.LOAD_VARIANTS] = FactKind.LOAD_VARIANTS
-    sequence: int
     system: str
     scenarios: Scenarios
 
+    @property
+    def identity(self) -> str:
+        return digest(self.content())
+
 
 class PointReference(BaseModel):
-    """One point of one point inventory."""
+    """One point of one point inventory, by the inventory's identity."""
 
     model_config = FROZEN
 
@@ -208,75 +248,99 @@ class PointReference(BaseModel):
     point: str
 
 
-class Conclusion(StrEnum):
-    PLAUSIBLE = "plausible"
-    IMPLAUSIBLE = "implausible"
-    CONDITIONAL = "conditional"
-    """Plausible only under a condition the appraisal names."""
-
-
 class DeviationReference(BaseModel):
     """One deviation of a propagation path: an effect at a point of a point inventory."""
 
     model_config = FROZEN
 
-    point: PointReference
+    inventory: str
+    point: str
     effect: str
+    """The deviation's key: its point, outcome, detail and metric."""
 
 
-class Appraisal(BaseModel):
-    """An agent's reading of the code behind a propagation path, which ranks and plans but establishes nothing."""
+class PathIdentity(BaseModel):
+    """What a propagation path is, whichever substitute injections reached it: the intervention it starts with and
+    the deviations it goes through, in order."""
 
     model_config = FROZEN
 
+    head: str
+    """The key of the fault the path starts with."""
+    deviations: tuple[DeviationReference, ...]
+
+
+class Conclusion(StrEnum):
+    """Whether the propagation an appraisal judges takes place."""
+
+    HOLDS = "holds"
+    FAILS = "fails"
+    CONDITIONAL = "conditional"
+    """It takes place only under a condition the appraisal names."""
+
+
+class FailureCategory(StrEnum):
+    """Why a propagation fails."""
+
+    HOP = "hop"
+    """One of its hops does not take place in the code."""
+    SUBSTITUTION = "substitution"
+    """A substitute injection does not reproduce what the natural deviation does."""
+
+
+class Appraisal(FactBody):
+    """An agent's reading of the code behind a propagation path, which ranks and plans but establishes nothing."""
+
     kind: Literal[FactKind.APPRAISAL] = FactKind.APPRAISAL
-    sequence: int
     call: str
     index: int
-    head: str
-    """The intervention the path starts with."""
-    deviations: tuple[DeviationReference, ...]
+    path: PathIdentity
     conclusion: Conclusion
-    category: str | None = None
-    """For an implausible path, what kind of reason makes it so."""
+    category: FailureCategory | None = None
+    """For a path that fails, why."""
     condition: str | None = None
     """For a conditional path, what it needs."""
     locations: tuple[str, ...]
     reason: str
 
+    @property
+    def identity(self) -> str:
+        return f"{self.call}#{self.index}"
 
-class Equivalence(BaseModel):
+
+class Equivalence(FactBody):
     """Two concrete points that are one point, by a named rule of the code that writes it."""
 
-    model_config = FROZEN
-
     kind: Literal[FactKind.EQUIVALENCE] = FactKind.EQUIVALENCE
-    sequence: int
     left: PointReference
     right: PointReference
     rule: str
 
+    @property
+    def identity(self) -> str:
+        return digest(self.model_dump(mode="json", include={"left", "right", "rule"}))
 
-class Voiding(BaseModel):
-    """The search runs and equivalences one source wrote up to this fact, which the graph no longer uses; a voiding is
-    never undone, and what it voided returns only as new facts."""
 
-    model_config = FROZEN
+class Voiding(FactBody):
+    """The facts, named by their identities, that the graph no longer uses, and why; a voiding is never undone, and
+    what it voided returns only as new facts."""
 
     kind: Literal[FactKind.VOIDING] = FactKind.VOIDING
-    sequence: int
-    source: str
+    voided: tuple[str, ...]
     reason: str
+
+    @field_serializer("voided")
+    def sorted_voided(self, voided: tuple[str, ...]) -> list[str]:
+        return sorted(voided)
+
+    @property
+    def identity(self) -> str:
+        return digest(self.content())
 
 
 type Fact = Annotated[SearchRun | PointInventory | SystemTopology | LoadVariants | Appraisal | Equivalence | Voiding,
                       Field(discriminator="kind")]
 FACT: Final = TypeAdapter(Fact)
-
-
-def print_schema() -> None:
-    """Print the JSON Schema of a fact, the union of every kind tagged by its kind, for the stores that keep facts."""
-    print(json.dumps(FACT.json_schema(), indent=2))
 
 
 class Facts(BaseModel):
@@ -286,13 +350,17 @@ class Facts(BaseModel):
 
     facts: tuple[Fact, ...]
 
+    def voided(self) -> set[str]:
+        return {identity for fact in self.facts if isinstance(fact, Voiding) for identity in fact.voided}
+
     def standing_runs(self) -> list[SearchRun]:
-        """The search runs no later voiding of their source voids, in sequence order."""
-        voided = defaultdict(int)
-        for fact in self.facts:
-            if isinstance(fact, Voiding):
-                voided[fact.source] = max(voided[fact.source], fact.sequence)
-        return [fact for fact in self.facts if isinstance(fact, SearchRun) and fact.sequence > voided[fact.source]]
+        """The search runs no voiding names, in sequence order."""
+        voided = self.voided()
+        return [fact for fact in self.facts if isinstance(fact, SearchRun) and fact.identity not in voided]
+
+    def appraisals(self) -> list[Appraisal]:
+        voided = self.voided()
+        return [fact for fact in self.facts if isinstance(fact, Appraisal) and fact.identity not in voided]
 
     def latest[F: BaseModel](self, kind: type[F]) -> F:
         """The last fact of one kind."""
@@ -320,10 +388,54 @@ class FactList:
         if fact.sequence != self.next_sequence():
             raise ValueError(f"the next fact is number {self.next_sequence()}, not {fact.sequence}")
         if isinstance(fact, SearchRun) and (fact.source, fact.label) in self.runs:
-            raise ValueError(f"the search run {fact.label} of {fact.source} is written already")
+            raise ValueError(f"the search run {fact.identity} is written already")
         self.facts.append(fact)
         if isinstance(fact, SearchRun):
             self.runs[(fact.source, fact.label)] = fact
 
     def snapshot(self) -> Facts:
         return Facts(facts=tuple(self.facts))
+
+
+def write_facts(path: Path, facts: Facts) -> None:
+    path.write_text("".join(f"{FACT.dump_json(fact).decode()}\n" for fact in facts.facts), encoding="utf-8")
+
+
+def read_facts(path: Path) -> Facts:
+    return Facts(facts=tuple(FACT.validate_json(line) for line in path.read_text(encoding="utf-8").splitlines()))
+
+
+class NormalizedFact(BaseModel):
+    """A fact as a store outside faultsearch compares it: its kind, its identity and its content."""
+
+    kind: FactKind
+    identity: str
+    content: JsonValue
+
+
+def print_schema() -> None:
+    """Print the JSON Schema of a fact, the union of every kind tagged by its kind, for the stores that keep facts."""
+    print(json.dumps(FACT.json_schema(), indent=2))
+
+
+def normalize_facts() -> None:
+    """Read facts, one per line, from a file or standard input, and print every one's kind, identity and content as
+    a line of JSON with its keys sorted; a line that is no valid fact, or a fact whose identity an earlier line holds
+    with other content, stops it with an exit status of 1 and the line's number and reason."""
+    parser = argparse.ArgumentParser(description=normalize_facts.__doc__)
+    parser.add_argument("facts", nargs="?", type=Path, help="A fact file; standard input when left out.")
+    arguments = parser.parse_args()
+    lines = (arguments.facts.read_text(encoding="utf-8") if arguments.facts else sys.stdin.read()).splitlines()
+    seen: dict[str, tuple[int, str]] = {}
+    for number, line in enumerate(lines, 1):
+        try:
+            fact = FACT.validate_json(line)
+        except ValidationError as error:
+            sys.exit(f"line {number}: not a fact: {error}")
+        content = canonical(fact.content())
+        if fact.identity in seen and seen[fact.identity][1] != content:
+            sys.exit(f"line {number}: the identity {fact.identity} of line {seen[fact.identity][0]} with other content")
+        seen.setdefault(fact.identity, (number, content))
+        # canonical text, with every key sorted, which pydantic's own dump does not give
+        print(canonical(NormalizedFact(kind=fact.kind, identity=fact.identity,
+                                       content=fact.content()).model_dump(mode="json")))

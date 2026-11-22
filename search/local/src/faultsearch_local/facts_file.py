@@ -5,28 +5,18 @@ from faultpoint.observations import read_records
 from faultpoint.rules import RuleSet
 from faultsearch.allocation import Phase
 from faultsearch.counterfactual import DEFAULT_SEED, NamedWorkload, Statuses
-from faultsearch.facts import FACT, Fact, FactList, Facts, PathRequest, Purpose, SearchRun, tallies
+from faultsearch.facts import FACT, Fact, FactList, PathRequest, Purpose, SearchRun, read_facts, tallies
 from pydantic import JsonValue, TypeAdapter
 
 from faultsearch_local.store import Store
 from faultsearch_local.systems import REFUSAL_FILE, SEED_FILE, STATUSES_FILE
 
-FACTS: Final = "facts.jsonl"
-"""The local fact directory's file: one fact per line, in sequence order."""
 LOCAL_ENVIRONMENT: Final = "local-docker"
 """Where the local executor runs repetitions: its own containers and network namespaces on this host."""
 RULES_FILE: Final = "rules.json"
 WORKLOAD_FILE: Final = "workload.json"
 INSTRUMENTATION_FILE: Final = "instrumentation.json"
 PARAMETERS: Final = TypeAdapter(dict[str, JsonValue])
-
-
-def write_facts(path: Path, facts: Facts) -> None:
-    path.write_text("".join(f"{FACT.dump_json(fact).decode()}\n" for fact in facts.facts), encoding="utf-8")
-
-
-def read_facts(path: Path) -> Facts:
-    return Facts(facts=tuple(FACT.validate_json(line) for line in path.read_text(encoding="utf-8").splitlines()))
 
 
 class FactLog(FactList):

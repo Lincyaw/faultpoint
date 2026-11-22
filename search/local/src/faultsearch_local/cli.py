@@ -11,15 +11,16 @@ from faultsearch.catalog import FROZEN, Fault, point_layer, point_scoped, read_m
 from faultsearch.counterfactual import EffectKey, Group, Scenarios
 from faultsearch.edges import Condition, EffectMap, holds
 from faultsearch.execution import RunRequest
-from faultsearch.facts import LoadVariants, PointInventory, Purpose, SystemTopology
-from faultsearch.graph import ComputeSettings, FactGraph, FactRepetitions, compute_graph, installed_settings
+from faultsearch.facts import (FACTS_FILE, LoadVariants, PointInventory, Purpose, SystemTopology, read_facts,
+                               write_facts)
+from faultsearch.graph import ComputeSettings, FactGraph, FactRepetitions, compute_graph
 from faultsearch.plan import PlanSettings, PlanState, Refill, ValidationSettings, search
 from faultsearch.validation import merged_workload
 from pydantic import BaseModel, TypeAdapter
 
 from faultsearch_local.budget import BUDGETS, Comparison, Plan, Trajectory, budget_table
 from faultsearch_local.executor import LocalExecutor, RunSettings
-from faultsearch_local.facts_file import FACTS, FactLog, read_facts, write_facts
+from faultsearch_local.facts_file import FactLog
 from faultsearch_local.report import render, summarise
 from faultsearch_local.run_directories import experiment_facts, graph_differences
 from faultsearch_local.store import (ALLOCATION_SETTINGS, INPUTS, REPORT, RUN_SETTINGS, SCENARIOS_INPUT, Store)
@@ -51,17 +52,16 @@ def recorded_scenarios(store: Store, system: System) -> Scenarios:
 
 
 def recorded_settings(store: Store) -> ComputeSettings:
-    """The graph settings of an experiment's comparison thresholds and clustering, with the installed versions."""
+    """The graph settings of an experiment's comparison thresholds and clustering."""
     settings = store.load(RunSettings, RUN_SETTINGS)
     clustering = {"cluster_distance": store.load(AllocationSettings, ALLOCATION_SETTINGS).cluster_distance} \
         if store.has(ALLOCATION_SETTINGS) else {}
-    return installed_settings().model_copy(update={"alpha": settings.alpha, "kept": KEPT,
-                                                   "min_mean_increase": settings.min_mean_increase, **clustering})
+    return ComputeSettings(alpha=settings.alpha, kept=KEPT, min_mean_increase=settings.min_mean_increase, **clustering)
 
 
 def started_log(store: Store, system: System) -> FactLog:
     """The experiment's fact log, begun with the system's topology and load variants when it is new."""
-    log = FactLog(store.path(FACTS))
+    log = FactLog(store.path(FACTS_FILE))
     if not log.facts:
         log.append(SystemTopology(sequence=1, system=system.name, upstream=system.upstream,
                                   entry_service=system.entry_service,
@@ -141,7 +141,7 @@ def search_command(
 
 
 def experiment_graph(store: Store) -> FactGraph:
-    return FactGraph(read_facts(store.path(FACTS)), recorded_settings(store))
+    return FactGraph(read_facts(store.path(FACTS_FILE)), recorded_settings(store))
 
 
 @app.command("chains")
@@ -195,7 +195,7 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
         sdk=sdk_root.resolve(), commit=explored.verified_build(sdk_root.resolve()), repetitions=repetitions,
         alpha=alpha, min_mean_increase=min_mean_increase, workers=workers, pack_tenants=False, system=system,
         instrumentation=explored.instrumentation), RUN_SETTINGS)
-    log = FactLog(store.path(FACTS))
+    log = FactLog(store.path(FACTS_FILE))
     scenarios = recorded_scenarios(store, explored)
     kinds = KindTable.installed()
     requests = [RunRequest(workload=merged_workload(item.condition, scenarios), faults=(Fault(
@@ -206,8 +206,8 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
     controls = [RunRequest(workload=workload, purpose=Purpose.PATH, repetitions=repetitions)
                 for workload in {request.workload.name: request.workload for request in requests}.values()]
     LocalExecutor(store, settings, explored, log, max_load).run(controls + requests)
-    read = FactRepetitions(log.snapshot().standing_runs(), installed_settings().model_copy(
-        update={"alpha": alpha, "min_mean_increase": min_mean_increase}))
+    read = FactRepetitions(log.snapshot().standing_runs(),
+                           ComputeSettings(alpha=alpha, min_mean_increase=min_mean_increase))
     labels = {control.workload.name: tuple(control.labels()) for control in controls}
     for request in requests:
         record = read.group_records(Group(workload=request.workload, faults=request.faults),
@@ -245,7 +245,7 @@ def budgets(experiment: Experiment,
     the table shows a target chain's ranks among the stitched-only chains across layers ending at the user."""
     store = Store(experiment)
     run_settings = store.load(RunSettings, RUN_SETTINGS)
-    comparison = Comparison(read_facts(store.path(FACTS)), recorded_settings(store),
+    comparison = Comparison(read_facts(store.path(FACTS_FILE)), recorded_settings(store),
                             store.load(AllocationSettings, ALLOCATION_SETTINGS), run_settings.repetitions,
                             run_settings.pack_tenants)
     trajectories = []
@@ -273,7 +273,7 @@ def import_facts(experiment: Experiment) -> None:
     validation record of the experiment refers to. The other repetition directories are left out and counted."""
     store = Store(experiment)
     imported = experiment_facts(store, recorded_system(store))
-    write_facts(store.path(FACTS), imported.facts)
+    write_facts(store.path(FACTS_FILE), imported.facts)
     kinds = Counter(str(fact.kind) for fact in imported.facts.facts)
     purposes = Counter(str(fact.purpose) for fact in imported.facts.standing_runs())
     typer.echo(f"{len(imported.facts.facts)} facts: {dict(kinds)}; search runs by purpose {dict(purposes)}")
@@ -289,6 +289,7 @@ def graph_check(experiment: Experiment,
     """Compute the propagation graph from the facts.jsonl of an experiment directory written before facts and
     compare it, part by part, with the records that experiment's own commands wrote."""
     store = Store(experiment)
-    graph = compute_graph(read_facts(store.path(FACTS)), recorded_settings(store).model_copy(update={"kept": kept}))
+    graph = compute_graph(read_facts(store.path(FACTS_FILE)),
+                          recorded_settings(store).model_copy(update={"kept": kept}))
     for line in graph_differences(graph, store):
         typer.echo(line)

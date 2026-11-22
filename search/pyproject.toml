@@ -12,6 +12,10 @@ dependencies = [
 
 [project.scripts]
 faultsearch-facts-schema = "faultsearch.facts:print_schema"
+faultsearch-normalize-facts = "faultsearch.facts:normalize_facts"
+faultsearch-candidate-paths = "faultsearch.candidates:print_candidate_paths"
+faultsearch-candidate-paths-schema = "faultsearch.candidates:print_schema"
+faultsearch-compute-settings-schema = "faultsearch.graph:print_settings_schema"
 
 [tool.uv.sources]
 faultpoint = { path = "../python", editable = true }

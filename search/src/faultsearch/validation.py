@@ -206,3 +206,23 @@ def hop_checks(chain: Chain, record: TreatmentRecord, min_count_increase: float)
     observed = {EffectKey.of(effect).key: effect for effect in record.effects if holds(effect, min_count_increase)}
     return tuple(HopCheck(hop=index, effect=hop.effect, confirmed=hop.effect.key in observed,
                           observed=observed.get(hop.effect.key)) for index, hop in enumerate(chain.hops))
+
+
+class RunVerdict(StrEnum):
+    """What the path run of a chain's first fault in its merged workload says of the chain."""
+
+    CONFIRMED = "confirmed"
+    """The first fault was injected in every repetition and every hop's effect appeared."""
+    REFUTED = "refuted"
+    NEEDS_RUN = "needs-new-run"
+    """No such path run has run."""
+
+
+def run_verdict(chain: Chain, path_records: dict[RunKey, TreatmentRecord], scenarios: Scenarios,
+                min_count_increase: float) -> RunVerdict:
+    """A chain judged by the path run that checks it, the path runs' records given by their run keys."""
+    record = path_records.get(run_key(chain, scenarios))
+    if record is None:
+        return RunVerdict.NEEDS_RUN
+    confirmed = record.exercised and all(hop.confirmed for hop in hop_checks(chain, record, min_count_increase))
+    return RunVerdict.CONFIRMED if confirmed else RunVerdict.REFUTED
