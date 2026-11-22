@@ -34,8 +34,47 @@
 - **核心包 `faultsearch`**（`search/`）：只依赖 `faultpoint[tools]` 和数值库，可以按 git 子目录安装。它定义只追加的事实（搜索运行、故障点表、系统拓扑、负载变体，以及评议、等价、作废），由事实算出图的 `compute_graph`，规划 `plan`，以及执行器接口。图是事实的函数：处理记录、边、链和路径判定都由事实重新算出，不另存。计算设置只含比较、束和簇的参数，faultsearch 的 commit 固定其余的一切。
   - 每个事实有身份，同一身份只写一次；内容是去掉序号、集合排好序的 JSON，两个同一身份的事实内容必须相同。作废按身份列出被作废的事实，所以它是幂等的。
   - 候选路径供构造使用：取带判定反馈的拼接中保留下来、终止于用户的链，只靠拼接得到的跨层路径在前，其余按原排名在后；有“不成立”评议的路径排到最后，所以新增这样的评议不会让它的名次上升。路径的身份是起点故障和各跳的偏离，与替代注入无关；几条链是同一条路径时取排名最好的一条。
-  - 命令：`faultsearch-facts-schema` 输出事实的 JSON Schema；`faultsearch-normalize-facts` 从文件或标准输入读事实，逐行输出 `{kind, identity, content}`，事实无效或同一身份内容不同时以非零退出；`faultsearch-candidate-paths` 由事实文件和计算设置输出全部候选路径，给出 `--limit N` 时只输出前 N 条；`faultsearch-candidate-paths-schema` 和 `faultsearch-compute-settings-schema` 输出这两者的 JSON Schema。
 - **本地包 `faultsearch-local`**（`search/local/`）：在本机容器中运行示例系统的执行器和命令行。示例系统以入口点 `faultsearch.systems` 注册。
+
+核心包的命令是调用方（cgfs 的 workflow 和它的执行器）使用 faultsearch 的唯一途径，彼此交换 JSON 文件：
+
+| 命令 | 输入 | 输出 |
+| --- | --- | --- |
+| `faultsearch-normalize-facts [FILE]` | 事实文件，或标准输入中的事实 | 每条事实一行 `{kind, identity, content}`；事实无效或同一身份内容不同时以 1 退出 |
+| `faultsearch-candidate-paths FACTS COMPUTE [--limit N]` | 事实文件、计算设置 | 全部候选路径，给出 N 时只输出前 N 条 |
+| `faultsearch-plan FACTS SETTINGS [--state STATE]` | 事实文件、规划设置、上一步给出的规划状态（第一步省略） | 规划的下一步 |
+| `faultsearch-point-inventory FACTS MANIFESTS --control L… [--configured P…] --sequence N` | 事实文件、构建的清单目录、这一步指名的对照运行、部署配置的点 | 一行故障点表事实 |
+| `faultsearch-record-run ORIGIN REQUEST DIR --index I --sequence N --root ROOT` | 运行来源、规划给出的请求、一次重复的运行目录 | 一行搜索运行事实 |
+
+`faultsearch-facts-schema`、`faultsearch-candidate-paths-schema`、`faultsearch-compute-settings-schema`、`faultsearch-plan-settings-schema`、`faultsearch-plan-state-schema`、`faultsearch-plan-step-schema`、`faultsearch-run-request-schema` 和 `faultsearch-run-origin-schema` 输出各自的 JSON Schema；`faultsearch-run-directory` 列出运行目录中的文件，以及各文件内容的 JSON Schema。
+
+规划的一步：
+- `requests`：要运行的请求。每个请求列出它的全部重复，每个重复给出序号、标签、种子（`FAULTPOINT_SEED`）和服务要载入的规则集，执行方不必自己计算。
+- `inventory`：不为空时，这一步没有请求，调用方先用 `faultsearch-point-inventory` 写入故障点表，再规划下一步。故障点表的系统、修订、SDK 构建和部署取自指名的对照运行。
+- `stop`：不为空时规划结束。`complete` 表示每个阶段都在预算和事实允许的范围内问完了。
+- `state`：交给下一步的规划状态，只含阶段、随机数状态、问过的注入、各阶段的预算和用量、簇的成员和验证的进度，不含观测或图。
+
+给定事实、规划状态和设置，输出完全确定。事实的顺序也是输入的一部分：组、簇和分配都按事实首次出现的顺序计算。
+
+调用方的循环：
+1. 第一步之前写入系统拓扑和负载变体。
+2. 规划；需要时写入故障点表。
+3. 运行每个请求的每个重复：先重置部署，再在请求的负载下、用给定的种子和规则集跑完，把运行目录交给 `faultsearch-record-run`，按下一个序号追加得到的事实。事实中已有的标签不再运行。
+4. 回到第 2 步，直到 `stop`。
+
+运行目录是执行方的产出：
+
+| 文件 | 必需 | 内容 |
+| --- | --- | --- |
+| `rules.json` | 是 | 服务载入的规则集，`experiment` 是重复的标签 |
+| `workload.json` | 是 | 负载实际使用的参数 |
+| `instrumentation.json` | 是 | 部署配置：faultpoint 的哪些部分在运行，内核代理观测什么 |
+| `seed.txt` | 是 | 服务使用的 `FAULTPOINT_SEED`，十进制整数；缺少时按种子 0 记录，只有保存种子之前的目录会缺少它 |
+| `statuses.json` | 与下一项二选一 | 负载结束后，各租户的请求收到每种响应状态的个数 |
+| `refusal.txt` | 与上一项二选一 | 服务拒绝某条规则时给出的原因，这次重复就此结束 |
+| `*.jsonl` | 是 | 各服务、各进程的观测记录，每行一条 |
+
+`faultsearch-record-run` 要求 `rules.json` 的 `experiment` 是这次重复的标签，并且 `statuses.json` 和 `refusal.txt` 至少有一个。观测文件在事实中记为相对 `--root` 的路径。本地执行器在进程内走同一条路径：同一个规划、同一种运行目录、同样的记录和故障点表。
 
 `faultsearch search EXPERIMENT` 按阶段规划并运行，直到规划结束：
 - 每个请求的搜索运行在它的重复跑完后追加到 `runs/search/EXPERIMENT/facts.jsonl`；事实中已有的身份不再重跑。
