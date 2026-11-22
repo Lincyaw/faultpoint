@@ -24,12 +24,14 @@ const (
 	pgxPackage     = "faultpoint/fppgx"
 	redisPackage   = "faultpoint/fpredis"
 	ginPackage     = "faultpoint/fpgin"
+	grpcPackage    = "faultpoint/fpgrpc"
 	pointsPlugin   = "points"
 	httpPlugin     = "http"
 	sqlPlugin      = "sql"
 	pgxPlugin      = "pgx"
 	redisPlugin    = "redis"
 	ginPlugin      = "gin"
+	grpcPlugin     = "grpc"
 	redisModule    = "github.com/redis/go-redis/v9"
 	pgxModule      = "github.com/jackc/pgx/v5"
 	ginPath        = "github.com/gin-gonic/gin"
@@ -41,7 +43,12 @@ const (
 
 // pluginPackages are the packages of the plugins a configuration can enable.
 var pluginPackages = map[string]string{pointsPlugin: pointsPackage, httpPlugin: httpPackage, sqlPlugin: sqlPackage,
-	pgxPlugin: pgxPackage, redisPlugin: redisPackage, ginPlugin: ginPackage}
+	pgxPlugin: pgxPackage, redisPlugin: redisPackage, ginPlugin: ginPackage, grpcPlugin: grpcPackage}
+
+// constructorWrappers replace constructors whose interceptors must be installed before the library builds them.
+var constructorWrappers = map[string]wrapper{
+	"google.golang.org/grpc.NewServer": {plugin: grpcPlugin, pkg: grpcPackage, function: "NewServer"},
+}
 
 // wrapper is the adapter function the copy applies to a value it hands to a library, or to a value a library returns.
 type wrapper struct {
@@ -159,6 +166,12 @@ func (w *wirer) post(cursor *astutil.Cursor) bool {
 		w.wireArgument(node)
 		w.wireMethod(node)
 		w.wireResult(cursor, node)
+		if callee, ok := typeutil.Callee(w.info, node).(*types.Func); ok {
+			if target, found := constructorWrappers[callee.FullName()]; found && slices.Contains(w.plugins, target.plugin) {
+				w.imports[target.pkg] = true
+				node.Fun = sdkCall(target.pkg, target.function).Fun
+			}
+		}
 	case *ast.CompositeLit:
 		w.wireLiteral(node)
 	case *ast.AssignStmt:
@@ -217,7 +230,8 @@ func wired(info *types.Info, call *ast.CallExpr) bool {
 	if callee, ok := typeutil.Callee(info, call).(*types.Func); ok {
 		_, argument := argumentWrappers[callee.FullName()]
 		_, result := resultWrappers[callee.FullName()]
-		if argument || result {
+		_, constructor := constructorWrappers[callee.FullName()]
+		if argument || result || constructor {
 			return true
 		}
 	}

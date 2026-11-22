@@ -43,7 +43,7 @@ type Config struct {
 }
 
 func readConfig(path string) Config {
-	config := Config{Plugins: []string{pointsPlugin, httpPlugin, ginPlugin, sqlPlugin, pgxPlugin, redisPlugin},
+	config := Config{Plugins: []string{pointsPlugin, httpPlugin, ginPlugin, sqlPlugin, pgxPlugin, redisPlugin, grpcPlugin},
 		Placement: Placement{Branch: true, Call: true, Check: true, Loop: true, Clock: []string{"time.Now"}, Errors: true}}
 	if path == "" {
 		return config
@@ -122,6 +122,12 @@ type rewritten struct {
 func rewriteFile(pkg *packages.Package, file *ast.File, imports []string) []byte {
 	for _, imported := range imports {
 		astutil.AddImport(pkg.Fset, file, imported)
+	}
+	for constructor := range constructorWrappers {
+		imported := constructor[:strings.LastIndex(constructor, ".")]
+		if !astutil.UsesImport(file, imported) {
+			astutil.DeleteImport(pkg.Fset, file, imported)
+		}
 	}
 	var content bytes.Buffer
 	if err := format.Node(&content, pkg.Fset, file); err != nil {
