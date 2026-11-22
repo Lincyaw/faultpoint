@@ -2,17 +2,19 @@ from collections import Counter, defaultdict
 from typing import Final
 
 from faultpoint.tools.analysis import Metric
-from pydantic import BaseModel
-
 from faultsearch.allocation import Allocation, Strategy
 from faultsearch.catalog import FROZEN, Catalog, Exclusion, Layer
 from faultsearch.chains import LAYER_PATH_SEPARATOR, Chain, Stitching, Visibility
-from faultsearch.counterfactual import ControlRecord, EffectKey, Leak, RunSettings, TreatmentRecord, treatment_record
+from faultsearch.counterfactual import ControlRecord, EffectKey, Leak, TreatmentRecord
 from faultsearch.edges import Edge, EdgeSet, EffectMap
-from faultsearch.store import (CATALOG, CONTROLS, EFFECTS_INPUT, INPUTS, LEAKS, MAPPING_FEEDBACK, REPETITIONS,
-                               RUN_SETTINGS, TREATMENTS, VALIDATIONS, Store, allocation_file, chains_file, edges_file)
 from faultsearch.evidence import MappingFeedback
 from faultsearch.validation import VALIDATION_PREFIX, Selection, Validations
+from pydantic import BaseModel
+
+from faultsearch_local.runner import RunSettings, treatment_record
+from faultsearch_local.store import (CATALOG, CONTROLS, EFFECTS_INPUT, INPUTS, LEAKS, MAPPING_FEEDBACK, REPETITIONS,
+                                     RUN_SETTINGS, TREATMENTS, VALIDATIONS, Store, allocation_file, chains_file,
+                                     edges_file)
 
 EXAMPLES_PER_CONDITION: Final = 2
 CROSS_LAYER_SHOWN: Final = 15

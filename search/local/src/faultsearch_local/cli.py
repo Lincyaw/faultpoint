@@ -6,29 +6,26 @@ from typing import Annotated, Final
 import typer
 from faultpoint.rules import Action
 from faultpoint.tools.kinds import KindTable
-from pydantic import BaseModel, TypeAdapter
-from shop.deployment import SYSTEM as SHOP
-from shop.deployment import System
-from shop.upstream import PACKET_POINTS, UNSCOPED_TARGETS, UPSTREAM_SERVICES
-from stitch_mechanism.deployment import SYSTEMS as STITCH_MECHANISM_BUILDS
-
-from faultsearch.allocation import (Allocation, AllocationSettings, Exploration, Strategy, extended_allocation,
-                                    phased_allocation, random_allocation)
-from faultsearch.budget import BUDGETS, Plan, Trajectory, budget_table, simulate
+from faultsearch.allocation import Allocation, AllocationSettings, Strategy
 from faultsearch.catalog import (FROZEN, ActionTable, Catalog, Fault, build_catalog, control_executions, point_layer,
                                  point_manifests, point_scoped)
 from faultsearch.chains import Stitcher, Stitching
-from faultsearch.counterfactual import (EffectKey, NamedWorkload, Runner, RunSettings, Scenarios, tenant_names,
-                                        treatment_record)
+from faultsearch.counterfactual import EffectKey, NamedWorkload, Scenarios, tenant_names
 from faultsearch.edges import Acceptance, Condition, EdgeSet, EffectMap, counterpart_assignments, holds
-from faultsearch.refill import candidate_phase
-from faultsearch.report import render, summarise
-from faultsearch.store import (ACTIONS_INPUT, ALLOCATION_SETTINGS, CATALOG, EFFECTS_INPUT, HEADROOM, INPUTS,
-                               MAPPING_FEEDBACK, REPORT, RUN_SETTINGS, SCENARIOS_INPUT, VALIDATIONS, Store,
-                               allocation_file, chains_file, edges_file)
 from faultsearch.evidence import MappingFeedback
 from faultsearch.validation import (Headroom, Selection, Validations, adjudications, chosen_runs, headroom,
-                                    mapping_checks, merged_workload, validate)
+                                    mapping_checks, merged_workload, merged_workloads)
+from pydantic import BaseModel, TypeAdapter
+
+from faultsearch_local.budget import BUDGETS, Plan, Trajectory, budget_table, simulate
+from faultsearch_local.exploration import Exploration, extended_allocation, phased_allocation, random_allocation
+from faultsearch_local.refill import candidate_phase
+from faultsearch_local.report import render, summarise
+from faultsearch_local.runner import Runner, RunSettings, treatment_record
+from faultsearch_local.store import (ACTIONS_INPUT, ALLOCATION_SETTINGS, CATALOG, EFFECTS_INPUT, HEADROOM, INPUTS,
+                                     MAPPING_FEEDBACK, REPORT, RUN_SETTINGS, SCENARIOS_INPUT, VALIDATIONS, Store,
+                                     allocation_file, chains_file, edges_file)
+from faultsearch_local.systems import System, installed_systems
 
 app = typer.Typer(no_args_is_help=True, help=(
     "Causal stitching over faultpoint: inject faults into named workloads, stitch the causal edges across "
@@ -37,7 +34,8 @@ Experiment = Annotated[str, typer.Argument(help="The experiment's name, its dire
 Chosen = Annotated[Strategy, typer.Option(help="The allocation strategy.")]
 SdkRoot = Annotated[Path, typer.Option(help="A clean checkout of the SDK commit the system runs with.")]
 Rebuild = Annotated[bool, typer.Option(help="Build the SDK and the system first.")]
-SYSTEMS: Final = {system.name: system for system in (SHOP, *STITCH_MECHANISM_BUILDS)}
+SYSTEMS: Final = installed_systems()
+SHOP: Final = "shop"
 Explored = Annotated[str, typer.Option(help=f"The system to explore, one of {', '.join(SYSTEMS)}.")]
 MaxLoad = Annotated[float, typer.Option(
     help="The host's 1-minute load above which no new repetition starts while others still run.")]
@@ -74,8 +72,8 @@ def recorded_stitcher(store: Store, system: System, min_count_increase: float, a
                       max_hops: int, kept: int) -> Stitcher:
     return Stitcher(scenarios=recorded_scenarios(store, system),
                     effects=store.record_input(EffectMap.read(system.entry_service), INPUTS, EFFECTS_INPUT),
-                    catalog=store.load(Catalog, CATALOG), kinds=KindTable.installed(), upstream=UPSTREAM_SERVICES,
-                    targets=UNSCOPED_TARGETS, services=services_by_port(system),
+                    catalog=store.load(Catalog, CATALOG), kinds=KindTable.installed(), upstream=system.upstream,
+                    targets=system.targets, services=services_by_port(system),
                     manifests=point_manifests(system.manifests), min_count_increase=min_count_increase,
                     min_mean_increase=store.load(RunSettings, RUN_SETTINGS).min_mean_increase, acceptance=acceptance,
                     width=width, max_hops=max_hops, kept=kept)
@@ -88,10 +86,10 @@ def scenario_catalog(store: Store, runner: Runner, scenarios: Scenarios) -> Cata
                                 for scenario in scenarios.scenarios])
     executions = {control.workload.name: control_executions(
         [record for label in control.labels for record in runner.observations(label)], len(control.labels),
-        len(tenant_names(control.workload.workload)), runner.kinds, UPSTREAM_SERVICES) for control in controls}
+        len(tenant_names(control.workload.workload)), runner.kinds, runner.system.upstream) for control in controls}
     actions = store.record_input(ActionTable.read(), INPUTS, ACTIONS_INPUT)
-    return store.record_input(build_catalog(runner.system.manifests, executions, list(PACKET_POINTS), actions,
-                                            runner.kinds, UPSTREAM_SERVICES), CATALOG)
+    return store.record_input(build_catalog(runner.system.manifests, executions, list(runner.system.configured),
+                                            actions, runner.kinds, runner.system.upstream), CATALOG)
 
 
 def catalog_exploration(store: Store, runner: Runner, settings: AllocationSettings) -> Exploration:
@@ -117,7 +115,7 @@ def explore(experiment: Experiment, sdk_root: SdkRoot, strategy: Chosen = Strate
             pack_tenants: Annotated[bool, typer.Option(
                 help="Let faults share repetitions in different tenants; off when upstream components are "
                      "observed.")] = True,
-            rebuild: Rebuild = False, system: Explored = SHOP.name, max_load: MaxLoad = math.inf) -> None:
+            rebuild: Rebuild = False, system: Explored = SHOP, max_load: MaxLoad = math.inf) -> None:
     """Run the controls of every scenario, build the fault catalog, and spend the budget with one strategy."""
     store = Store(experiment)
     sdk = sdk_root.resolve()
@@ -125,7 +123,8 @@ def explore(experiment: Experiment, sdk_root: SdkRoot, strategy: Chosen = Strate
     commit = explored.build(sdk) if rebuild else explored.verified_build(sdk)
     runner = Runner(store, store.record_input(RunSettings(
         sdk=sdk, commit=commit, repetitions=repetitions, alpha=alpha, min_mean_increase=min_mean_increase,
-        workers=workers, pack_tenants=pack_tenants, system=system), RUN_SETTINGS), explored, max_load)
+        workers=workers, pack_tenants=pack_tenants, system=system, instrumentation=explored.instrumentation),
+        RUN_SETTINGS), explored, max_load)
     exploration = catalog_exploration(store, runner, AllocationSettings(
         budget=budget, seed=seed, round_robin_share=round_robin_share, cluster_distance=cluster_distance,
         epsilon=epsilon, batch=batch))
@@ -330,8 +329,8 @@ def validate_command(experiment: Experiment,
     order = {key: rank for rank, key in enumerate(stitching.keys)}
     kept = sorted({kept.key: kept for kept in (*stitching.top, *stitching.top_cross_layer)}.values(),
                   key=lambda kept: order[kept.key])
-    room = headroom(runner, kept, list(store.load(EdgeSet, edges_file(Strategy.PHASED)).edges), scenarios,
-                    stitching.min_count_increase)
+    room = headroom(kept, list(store.load(EdgeSet, edges_file(Strategy.PHASED)).edges), scenarios,
+                    stitching.min_count_increase, runner.controls(merged_workloads(kept, scenarios)), runner)
     store.save(room, HEADROOM)
     roomy = frozenset(chain_room.chain for chain_room in room.chains if chain_room.room)
     across = [kept_chain for kept_chain in kept if kept_chain.crosses_layers and kept_chain.terminal
@@ -348,8 +347,8 @@ def validate_command(experiment: Experiment,
                             {(validation.record.fault.key, validation.workload.name) for validation in validations},
                             Counter(validation.chain.group for validation in validations
                                     if validation.selection == Selection.CROSS_LAYER))
-        chosen = validate(runner, [(pick, Selection.CROSS_LAYER) for pick in picks] + (besides if start == 0 else []),
-                          scenarios, stitching.min_count_increase).validations
+        chosen = runner.validate([(pick, Selection.CROSS_LAYER) for pick in picks] + (besides if start == 0 else []),
+                                 scenarios, stitching.min_count_increase).validations
         decided = adjudications(Validations(validations=(*validations, *chosen)), kept, scenarios,
                                 stitching.min_count_increase)
         validations += [*chosen, *decided]
@@ -389,7 +388,7 @@ class Trial(BaseModel):
 @app.command()
 def trial(experiment: Experiment, sdk_root: SdkRoot,
           trials: Annotated[Path, typer.Option(help="A JSON list of trials: point, action and condition.")],
-          system: Explored = SHOP.name, repetitions: int = 3, workers: int = 6, alpha: float = 0.1,
+          system: Explored = SHOP, repetitions: int = 3, workers: int = 6, alpha: float = 0.1,
           min_mean_increase: float = 0.5,
           min_count_increase: Annotated[float, typer.Option(
               help="The smallest relative increase of a count that counts as an effect.")] = MIN_COUNT_INCREASE,
@@ -400,11 +399,11 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
     explored = SYSTEMS[system]
     runner = Runner(store, store.record_input(RunSettings(
         sdk=sdk_root.resolve(), commit=explored.verified_build(sdk_root.resolve()), repetitions=repetitions,
-        alpha=alpha, min_mean_increase=min_mean_increase, workers=workers, pack_tenants=False, system=system),
-        RUN_SETTINGS), explored, max_load)
+        alpha=alpha, min_mean_increase=min_mean_increase, workers=workers, pack_tenants=False, system=system,
+        instrumentation=explored.instrumentation), RUN_SETTINGS), explored, max_load)
     scenarios = recorded_scenarios(store, explored)
-    pairs = [(Fault(point=item.point, action=item.action, layer=point_layer(item.point, UPSTREAM_SERVICES),
-                    scoped=point_scoped(item.point, point_layer(item.point, UPSTREAM_SERVICES), runner.kinds),
+    pairs = [(Fault(point=item.point, action=item.action, layer=point_layer(item.point, explored.upstream),
+                    scoped=point_scoped(item.point, point_layer(item.point, explored.upstream), runner.kinds),
                     probability=item.probability),
               merged_workload(item.condition, scenarios))
              for item in TypeAdapter(list[Trial]).validate_json(trials.read_bytes())]

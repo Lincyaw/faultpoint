@@ -3,7 +3,7 @@ from typing import Final
 
 from pydantic import BaseModel
 
-SEARCH_RUNS: Final = Path(__file__).resolve().parents[3] / "runs" / "search"
+SEARCH_RUNS: Final = Path(__file__).resolve().parents[4] / "runs" / "search"
 REPETITIONS: Final = "repetitions"
 CONTROLS: Final = "controls"
 TREATMENTS: Final = "treatments"

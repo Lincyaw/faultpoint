@@ -13,7 +13,8 @@ from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, ConfigDict
 
 FROZEN: Final = ConfigDict(frozen=True, extra="forbid")
-DATA: Final = Path(__file__).resolve().parents[2] / "data"
+DATA: Final = Path(__file__).resolve().parent / "data"
+"""The effect map and the action table, which ship with the package and fix what one of its versions computes."""
 ACTIONS_FILE: Final = DATA / "actions.json"
 DELAY: Final = "delay"
 PROBABILITY: Final = "probability"

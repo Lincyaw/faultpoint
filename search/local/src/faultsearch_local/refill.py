@@ -1,15 +1,16 @@
 from collections import defaultdict
 from typing import Final
 
-from pydantic import BaseModel
-from scipy.stats import entropy
-
-from faultsearch.allocation import Allocation, Assignment, Exploration, Phase, Strategy
+from faultsearch.allocation import Allocation, Assignment, Phase, Strategy
 from faultsearch.catalog import FROZEN, Fault, Layer, point_kind, point_service
 from faultsearch.chains import Stitcher, Stitching, Trail, confidence, merge_conditions, similarity_order
 from faultsearch.counterfactual import EffectKey
 from faultsearch.edges import Edge, counterpart_assignments, holds
 from faultsearch.evidence import MappingFeedback, smoothed, step_classes, step_probability
+from pydantic import BaseModel
+from scipy.stats import entropy
+
+from faultsearch_local.exploration import Exploration
 
 SHORTLIST: Final = 20
 """The best candidate chains, stitched or hypothesised, whose hypothesised hops the candidate phase decides."""

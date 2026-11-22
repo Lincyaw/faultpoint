@@ -3,7 +3,14 @@ name = "shop"
 version = "1.0.0"
 description = "The driver of the five-language shop: its workloads, its build, and one repetition under a rule set"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2.9"]
+dependencies = ["pydantic>=2.9", "faultsearch", "faultsearch-local"]
+
+[project.entry-points."faultsearch.systems"]
+shop = "shop.deployment:SYSTEM"
+
+[tool.uv.sources]
+faultsearch = { path = "../../search", editable = true }
+faultsearch-local = { path = "../../search/local", editable = true }
 
 [build-system]
 requires = ["hatchling"]

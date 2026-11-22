@@ -10,13 +10,15 @@ from pathlib import Path
 from string import ascii_lowercase
 from typing import Any, Final
 
+from faultsearch.counterfactual import Statuses
+from faultsearch_local.systems import System
 from pydantic import BaseModel, Field, JsonValue, PositiveInt
 from shop.deployment import (FLUSH_SECONDS, HOOKS_DIRECTORY, IDENTIFIER_SEGMENT, INSTRUMENTATION_FILE, LOAD_DEADLINE_S,
-                             REDIS_KEY_IDENTIFIER, WORKLOAD_FILE, Instrumentation, Response, Service, Statuses, System,
-                             answered, built_commit, isolated_repetition, record_responses, run, sdk_commit,
+                             REDIS_KEY_IDENTIFIER, WORKLOAD_FILE, Instrumentation, Response, Service, answered,
+                             built_commit, isolated_repetition, record_responses, refusal, run, sdk_commit,
                              service_environment, start, tenant_request, wait_for_host_route, wait_for_port,
                              write_config)
-from shop.upstream import UPSTREAM_FILE, Upstream, scan_hooks
+from shop.upstream import PACKET_POINTS, UNSCOPED_TARGETS, UPSTREAM_FILE, UPSTREAM_SERVICES, Upstream, scan_hooks
 from shop.workload import FROZEN
 
 MECHANISM: Final = Path(__file__).resolve().parents[2]
@@ -204,20 +206,22 @@ def serve_and_load(directory: Path, sdk: Path, build: Path) -> None:
 
 
 def repetition(directory: Path, workload: dict[str, JsonValue], rules: dict[str, Any], sdk: Path,
-               instrumentation: Instrumentation, seed: int, variant: Build) -> Statuses:
+               instrumentation: dict[str, JsonValue], seed: int, variant: Build) -> Statuses:
     """One run of quote and a build's catalog under a rule set, with the prices and discount rules in PostgreSQL and
     the cached SKUs' prices in Redis."""
     mechanism = Workload.model_validate(workload)
-    return isolated_repetition(directory, mechanism, rules, sdk, instrumentation, seed, price_sql(mechanism),
-                               cache_commands(mechanism), "stitch_mechanism.deployment", variant.directory)
+    return isolated_repetition(directory, mechanism, rules, sdk, Instrumentation.model_validate(instrumentation), seed,
+                               price_sql(mechanism), cache_commands(mechanism), "stitch_mechanism.deployment",
+                               variant.directory)
 
 
 def system(variant: Build) -> System:
     """The constructed system as the search explores one of its builds."""
     return System(name=variant.name, scenarios=SCENARIOS, manifests=variant.manifests, entry_service="quote",
-                  ports=PORTS, build=partial(build, variant=variant),
+                  ports=PORTS, upstream=UPSTREAM_SERVICES, targets=UNSCOPED_TARGETS, configured=PACKET_POINTS,
+                  instrumentation=Instrumentation().model_dump(mode="json"), build=partial(build, variant=variant),
                   verified_build=partial(verified_build, variant=variant),
-                  repetition=partial(repetition, variant=variant))
+                  repetition=partial(repetition, variant=variant), refusal=refusal)
 
 
 PLAIN: Final = Build(name="stitch-mechanism", directory=RUNS / "build", error_packages=())
@@ -226,7 +230,8 @@ CONTEXT_SENTINELS: Final = Build(name="stitch-mechanism-context-sentinels", dire
                                  error_packages=("context",))
 """Catalog registers the error variables of the context package, so a deadline's error is named
 context.DeadlineExceeded."""
-SYSTEMS: Final = (system(PLAIN), system(CONTEXT_SENTINELS))
+PLAIN_SYSTEM: Final = system(PLAIN)
+CONTEXT_SENTINELS_SYSTEM: Final = system(CONTEXT_SENTINELS)
 
 
 if __name__ == "__main__":

@@ -3,10 +3,16 @@ name = "stitch-mechanism"
 version = "1.0.0"
 description = "A constructed system for checking cross-layer stitching: a Python quote service and a Go catalog over Redis and PostgreSQL"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2.9", "shop"]
+dependencies = ["pydantic>=2.9", "shop", "faultsearch", "faultsearch-local"]
+
+[project.entry-points."faultsearch.systems"]
+stitch-mechanism = "stitch_mechanism.deployment:PLAIN_SYSTEM"
+stitch-mechanism-context-sentinels = "stitch_mechanism.deployment:CONTEXT_SENTINELS_SYSTEM"
 
 [tool.uv.sources]
 shop = { path = "../shop", editable = true }
+faultsearch = { path = "../../search", editable = true }
+faultsearch-local = { path = "../../search/local", editable = true }
 
 [build-system]
 requires = ["hatchling"]

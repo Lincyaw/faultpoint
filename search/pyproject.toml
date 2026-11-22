@@ -1,25 +1,17 @@
 [project]
 name = "faultsearch"
 version = "0.1.0"
-description = "Causal stitching over faultpoint: inject faults into named workloads, stitch the causal edges into chains, and validate the chains end to end"
+description = "Causal stitching over faultpoint: from search runs and their observations, compute the causal edges between faults and effects, stitch them into chains, and judge the chains end to end"
 requires-python = ">=3.12"
 dependencies = [
     "faultpoint[tools]",
-    "shop",
-    "stitch-mechanism",
     "pydantic>=2.9",
     "numpy>=2.0",
     "scipy>=1.13",
-    "typer>=0.12",
 ]
-
-[project.scripts]
-faultsearch = "faultsearch.cli:app"
 
 [tool.uv.sources]
 faultpoint = { path = "../python", editable = true }
-shop = { path = "../examples/shop", editable = true }
-stitch-mechanism = { path = "../examples/stitch-mechanism", editable = true }
 
 [build-system]
 requires = ["hatchling"]

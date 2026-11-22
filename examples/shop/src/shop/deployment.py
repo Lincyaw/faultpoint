@@ -12,15 +12,17 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Final
 
+from faultsearch.counterfactual import SCOPE_KEY, Statuses
+from faultsearch_local.systems import REFUSAL_FILE, SEED_FILE, STATUSES_FILE, System
 from pydantic import BaseModel, JsonValue
 
-from shop.upstream import (HOST_FROM_NAMESPACE, UPSTREAM_FILE, AgentObservation, Upstream, remove_containers,
-                           scan_hooks, start_agent, start_upstream, stop_agent)
+from shop.upstream import (HOST_FROM_NAMESPACE, PACKET_POINTS, UNSCOPED_TARGETS, UPSTREAM_FILE, UPSTREAM_SERVICES,
+                           AgentObservation, Upstream, remove_containers, scan_hooks, start_agent, start_upstream,
+                           stop_agent)
 from shop.workload import FROZEN, SCENARIOS, SHOP, Workload
 
 ROOT: Final = SHOP.parent.parent
@@ -32,7 +34,6 @@ HOOKS_DIRECTORY: Final = "hooks"
 BUILT_FROM: Final = BUILD / "sdk-commit"
 FLUSH_SECONDS: Final = 0.5
 REQUESTS_PER_TENANT: Final = 21
-SCOPE_KEY: Final = "fp.scope"
 IDENTIFIER_SEGMENT: Final = r"^(\d+|[a-z]-\d+)$"
 """Path segments that identify a record: numbers and the shop's SKUs, so that one route is one point."""
 REDIS_KEY_IDENTIFIER: Final = r"\b[a-z]-\d+\b"
@@ -47,13 +48,8 @@ LEDGER_CLASS_PATH: Final = f"{SHOP / 'ledger' / 'target' / 'classes'}:{SHOP / 'l
 """The class path ledger runs with, which its scan reads too, so that the scan lists the calls into its libraries."""
 WORKLOAD_FILE: Final = "workload.json"
 RULES_FILE: Final = "rules.json"
-STATUSES_FILE: Final = "statuses.json"
 RESPONSES_FILE: Final = "responses.json"
 INSTRUMENTATION_FILE: Final = "instrumentation.json"
-SEED_FILE: Final = "seed.txt"
-"""The repetition's FAULTPOINT_SEED, so that the rules that act on a share of the executions draw anew in every
-repetition."""
-REFUSAL_FILE: Final = "refusal.txt"
 FAULTPOINT_VARIABLES: Final = "FAULTPOINT_"
 """The prefix of the environment variables every SDK reads, none of which a service without faultpoint gets."""
 NETWORK_NAMESPACE: Final = ("unshare", "--user", "--map-root-user", "--net", "--")
@@ -84,14 +80,6 @@ class Service(BaseModel):
     attachment: dict[str, str] = {}
     """The environment that attaches the service's SDK at start, besides the FAULTPOINT_ variables every service with
     faultpoint gets; a compiled service has the SDK built in, which those variables alone enable."""
-
-
-class Statuses(BaseModel):
-    """How many of each tenant's checkouts received each response status."""
-
-    model_config = FROZEN
-
-    tenants: dict[str, dict[int, int]]
 
 
 class Response(BaseModel):
@@ -456,31 +444,17 @@ def stock_sql(workload: Workload) -> str:
 
 
 def repetition(directory: Path, workload: dict[str, JsonValue], rules: dict[str, Any], sdk: Path,
-               instrumentation: Instrumentation, seed: int) -> Statuses:
+               instrumentation: dict[str, JsonValue], seed: int) -> Statuses:
     """One run of the whole shop under a rule set, with inventory's stock in PostgreSQL and an empty price cache."""
     shop = Workload.model_validate(workload)
-    return isolated_repetition(directory, shop, rules, sdk, instrumentation, seed, stock_sql(shop), [],
-                               "shop.deployment", BUILD)
-
-
-class System(BaseModel):
-    """A system the search explores: its scenarios and manifests, the service whose responses the user sees, the port
-    each service listens on, and how to build it and run one repetition of it under a rule set."""
-
-    model_config = FROZEN
-
-    name: str
-    scenarios: Path
-    manifests: Path
-    entry_service: str
-    ports: dict[str, int]
-    build: Callable[[Path], str]
-    verified_build: Callable[[Path], str]
-    repetition: Callable[[Path, dict[str, JsonValue], dict[str, Any], Path, Instrumentation, int], Statuses]
+    return isolated_repetition(directory, shop, rules, sdk, Instrumentation.model_validate(instrumentation), seed,
+                               stock_sql(shop), [], "shop.deployment", BUILD)
 
 
 SYSTEM: Final = System(name="shop", scenarios=SCENARIOS, manifests=MANIFESTS, entry_service="gateway", ports=PORTS,
-                       build=build, verified_build=verified_build, repetition=repetition)
+                       upstream=UPSTREAM_SERVICES, targets=UNSCOPED_TARGETS, configured=PACKET_POINTS,
+                       instrumentation=Instrumentation().model_dump(mode="json"), build=build,
+                       verified_build=verified_build, repetition=repetition, refusal=refusal)
 
 
 if __name__ == "__main__":

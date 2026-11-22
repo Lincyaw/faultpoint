@@ -4,10 +4,12 @@ import subprocess
 from pathlib import Path
 from typing import Final
 
+from faultsearch.counterfactual import SCOPE_KEY
+from faultsearch_local.runner import repetition_seed
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
-from shop.deployment import (MANIFESTS, RESPONSES_FILE, RUNS, SCOPE_KEY, Instrumentation, Responses, build, refusal,
-                             repetition, run, verified_build)
+from shop.deployment import (MANIFESTS, RESPONSES_FILE, RUNS, Instrumentation, Responses, build, refusal, repetition,
+                             run, verified_build)
 from shop.upstream import PACKET_POINTS, AgentObservation
 from shop.workload import FROZEN, Scenarios
 
@@ -91,8 +93,8 @@ def compare_transparency(sdk: Path, instrumentation: Instrumentation) -> None:
         received = {}
         for mode, chosen in runs.items():
             label = f"transparency-{scenario.name}-{mode}"
-            print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": []}, sdk, chosen),
-                  flush=True)
+            print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": []}, sdk,
+                                    chosen.model_dump(mode="json"), repetition_seed(label)), flush=True)
             received[mode] = Responses.model_validate_json((RUNS / label / RESPONSES_FILE).read_text()).responses
         # Both send the same sequence, so a run that answered fewer requests within the load's deadline differs.
         pairs = list(zip(received["detached"], received["attached"]))
@@ -142,8 +144,8 @@ def main() -> None:
     workload = Scenarios.read().workload(arguments.scenario).model_dump(mode="json")
     controls = [f"control-{index}" for index in range(arguments.repetitions)]
     for label in controls:
-        print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": []}, sdk, instrumentation),
-              flush=True)
+        print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": []}, sdk,
+                                instrumentation.model_dump(mode="json"), repetition_seed(label)), flush=True)
     for name in [] if arguments.controls_only else arguments.treatments:
         rules = [rule_of(name, index, point_rule, controls[0]) for index, point_rule in enumerate(treatments[name])]
         labels = [f"{name}-{index}" for index in range(arguments.repetitions)]
@@ -151,7 +153,7 @@ def main() -> None:
         for label in labels:
             try:
                 print(label, repetition(RUNS / label, workload, {"experiment": label, "rules": rules}, sdk,
-                                        instrumentation), flush=True)
+                                        instrumentation.model_dump(mode="json"), repetition_seed(label)), flush=True)
             except subprocess.CalledProcessError:
                 refused = True
                 print(label, "refused:", refusal(RUNS / label), flush=True)

@@ -10,8 +10,8 @@ from pydantic import BaseModel
 
 from faultsearch.catalog import FROZEN, Layer, point_service
 from faultsearch.chains import Chain, Group, confidence
-from faultsearch.counterfactual import (UNSCOPED, EffectKey, NamedWorkload, Runner, Scenarios, TreatmentRecord,
-                                        tenant_names)
+from faultsearch.counterfactual import (UNSCOPED, ControlRecord, EffectKey, NamedWorkload, Repetitions, Scenarios,
+                                        TreatmentRecord, tenant_names)
 from faultsearch.edges import Condition, Edge, holds
 from faultsearch.evidence import ClassChecks, MappingCheck, step_classes
 
@@ -140,18 +140,23 @@ def chain_room(chain: Chain, workload: NamedWorkload, tallies: dict[str, list[Ob
     return ChainRoom(chain=chain.key, workload=workload.name, hops=tuple(hops))
 
 
-def headroom(runner: Runner, chains: list[Chain], edges: list[Edge], scenarios: Scenarios,
-             min_count_increase: float) -> Headroom:
-    """The headroom of every chain's count hops in its merged workload, whose controls run first where missing."""
-    workloads = {chain.key: merged_workload(chain.condition, scenarios) for chain in chains}
-    tallies: dict[str, dict[str, list[ObservationTallies]]] = {}
-    for control in runner.controls(list({workload.name: workload for workload in workloads.values()}.values())):
-        observations = {label: runner.observations(label) for label in control.labels}
-        tallies[control.workload.name] = {
-            scope: [natural_tallies(records, Repetition(experiment=label, scope=scope))
-                    for label, records in observations.items()]
-            for scope in (UNSCOPED, tenant_names(control.workload.workload)[0])}
+def merged_workloads(chains: list[Chain], scenarios: Scenarios) -> list[NamedWorkload]:
+    """The distinct workloads the chains' conditions merge into, in the chains' order."""
+    return list({workload.name: workload for workload in (merged_workload(chain.condition, scenarios)
+                                                          for chain in chains)}.values())
+
+
+def headroom(chains: list[Chain], edges: list[Edge], scenarios: Scenarios, min_count_increase: float,
+             controls: list[ControlRecord], repetitions: Repetitions) -> Headroom:
+    """The headroom of every chain's count hops in its merged workload, given the controls of those workloads."""
+    tallies: dict[str, dict[str, list[ObservationTallies]]] = {
+        control.workload.name: {scope: [natural_tallies(repetitions.observations(label),
+                                                        Repetition(experiment=label, scope=scope))
+                                        for label in control.labels]
+                                for scope in (UNSCOPED, tenant_names(control.workload.workload)[0])}
+        for control in controls}
     by_key = {edge.key: edge for edge in edges}
+    workloads = {chain.key: merged_workload(chain.condition, scenarios) for chain in chains}
     return Headroom(chains=tuple(chain_room(chain, workloads[chain.key], tallies[workloads[chain.key].name], by_key,
                                             min_count_increase) for chain in chains))
 
@@ -201,14 +206,3 @@ def hop_checks(chain: Chain, record: TreatmentRecord, min_count_increase: float)
     observed = {EffectKey.of(effect).key: effect for effect in record.effects if holds(effect, min_count_increase)}
     return tuple(HopCheck(hop=index, effect=hop.effect, confirmed=hop.effect.key in observed,
                           observed=observed.get(hop.effect.key)) for index, hop in enumerate(chain.hops))
-
-
-def validate(runner: Runner, chains: list[tuple[Chain, Selection]], scenarios: Scenarios,
-             min_count_increase: float) -> Validations:
-    workloads = [merged_workload(chain.condition, scenarios) for chain, _ in chains]
-    records = runner.isolated_treatments([(chain.hops[0].cause, workload)
-                                          for (chain, _), workload in zip(chains, workloads, strict=True)])
-    return Validations(validations=tuple(
-        Validation(chain=chain, selection=selection, workload=workload, record=record,
-                   hops=hop_checks(chain, record, min_count_increase))
-        for (chain, selection), workload, record in zip(chains, workloads, records, strict=True)))

@@ -4,19 +4,20 @@ from enum import StrEnum
 from statistics import fmean
 from typing import Final
 
-from pydantic import BaseModel
-
-from faultsearch.allocation import (Allocation, AllocationSettings, Assignment, Exploration, Strategy, phased_allocation,
-                                    random_allocation)
+from faultsearch.allocation import Allocation, AllocationSettings, Assignment, Strategy
 from faultsearch.catalog import FROZEN, Catalog
 from faultsearch.chains import Chain, Stitcher, Stitching
-from faultsearch.counterfactual import Runner, Scenarios
+from faultsearch.counterfactual import Scenarios
 from faultsearch.edges import Edge
 from faultsearch.evidence import MappingFeedback
-from faultsearch.refill import candidate_phase, counterpart_rounds, stitched
-from faultsearch.store import CONTROLS
 from faultsearch.validation import (Selection, Validation, Validations, adjudications, chosen_runs, headroom,
-                                    hop_checks, mapping_checks, merged_workload, run_key)
+                                    hop_checks, mapping_checks, merged_workload, merged_workloads, run_key)
+from pydantic import BaseModel
+
+from faultsearch_local.exploration import Exploration, phased_allocation, random_allocation
+from faultsearch_local.refill import candidate_phase, counterpart_rounds, stitched
+from faultsearch_local.runner import Runner
+from faultsearch_local.store import CONTROLS
 
 BUDGETS: Final = "budgets"
 """The directory, in the full experiment's, of the offline comparison's trajectories."""
@@ -126,12 +127,12 @@ def ranked_runs(stitching: Stitching, edges: list[Edge], runner: Runner, scenari
     order = {key: rank for rank, key in enumerate(stitching.keys)}
     kept = sorted({chain.key: chain for chain in (*stitching.top, *stitching.top_cross_layer)}.values(),
                   key=lambda chain: order[chain.key])
-    workloads = {merged_workload(chain.condition, scenarios).name for chain in kept}
-    missing = sorted(name for name in workloads if not runner.store.has(CONTROLS, f"{name}.json"))
+    workloads = merged_workloads(kept, scenarios)
+    missing = sorted(workload.name for workload in workloads if not runner.store.has(CONTROLS, f"{workload.name}.json"))
     if missing:
         raise RuntimeError(f"an offline comparison runs nothing, and these merged workloads have no controls: {missing}")
-    roomy = {room.chain for room in headroom(runner, kept, edges, scenarios, stitching.min_count_increase).chains
-             if room.room}
+    roomy = {room.chain for room in headroom(kept, edges, scenarios, stitching.min_count_increase,
+                                             runner.controls(workloads), runner).chains if room.room}
     candidates = [chain for chain in kept if chain.crosses_layers and chain.terminal and chain.key in roomy
                   and chain.stitched_only and not chain.contradicted]
     validations: list[Validation] = []
