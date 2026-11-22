@@ -21,6 +21,8 @@ PROBABILITY: Final = "probability"
 """How a fault's key names the chance that its rule acts on an execution."""
 FOLLOWED_BY: Final = "then"
 """How a fault's key joins the rules after its own."""
+FOLLOWING_SEPARATOR: Final = "-"
+"""What joins a fault's digest and the index of a rule after its own in that rule's id."""
 KERNEL_KINDS: Final = frozenset({"syscall", "packet"})
 FUNCTION_KINDS: Final = frozenset({"call", "check"})
 """The kinds of the points the kernel agent places in an upstream component's functions."""
@@ -114,7 +116,7 @@ class Fault(BaseModel):
 
     def rule_ids(self) -> tuple[str, ...]:
         """The ids of the fault's rules, its own first."""
-        return self.digest, *(f"{self.digest}-{index}" for index in range(1, len(self.following) + 1))
+        return self.digest, *(f"{self.digest}{FOLLOWING_SEPARATOR}{index}" for index in range(1, len(self.following) + 1))
 
     @property
     def delays(self) -> bool:

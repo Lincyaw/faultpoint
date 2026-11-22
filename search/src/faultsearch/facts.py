@@ -43,6 +43,9 @@ class Tally(BaseModel):
 
     model_config = FROZEN
 
+    experiment: str
+    """The experiment of the rule set in force: the run's label, or empty for what a process observed before it loaded
+    the run's rules, which a comparison leaves out."""
     service: str
     process: str
     point: str
@@ -58,22 +61,22 @@ class Tally(BaseModel):
     start: float
     end: float
 
-    def record(self, label: str) -> ObservationRecord:
-        """The tally as one observation record of the run, whose window spans all of its executions."""
-        return ObservationRecord(experiment=label, service=self.service, process=self.process, start=self.start,
+    def record(self) -> ObservationRecord:
+        """The tally as one observation record, whose window spans all of its executions."""
+        return ObservationRecord(experiment=self.experiment, service=self.service, process=self.process, start=self.start,
                                  end=self.end, point=self.point, outcome=self.outcome, scope=self.scope,
                                  rule=self.rule, count=self.count, total=self.total, elapsed=self.elapsed,
                                  detail=self.detail)
 
 
 def tallies(records: Iterable[ObservationRecord]) -> tuple[Tally, ...]:
-    """Observation records summed by point, outcome, detail, scope, rule, service and process, in the order they first
-    appear, each sum in the order of the records, so that a comparison of the tallies adds what it adds of the records
-    in the same order within a run."""
-    sums: dict[tuple[str, str, str, tuple[tuple[str, str], ...], str, str | None, str], list[float]] = {}
+    """Observation records summed by experiment, point, outcome, detail, scope, rule, service and process, in the
+    order they first appear, each sum in the order of the records, so that a comparison of the tallies adds what it
+    adds of the records in the same order within a run."""
+    sums: dict[tuple[str, str, str, str, tuple[tuple[str, str], ...], str, str | None, str], list[float]] = {}
     for record in records:
-        key = (record.service, record.process, record.point, tuple(sorted(record.detail.items())), record.outcome,
-               record.rule, record.scope)
+        key = (record.experiment, record.service, record.process, record.point,
+               tuple(sorted(record.detail.items())), record.outcome, record.rule, record.scope)
         if key not in sums:
             sums[key] = [0, 0.0, 0.0, record.start, record.end]
         tally = sums[key]
@@ -82,10 +85,11 @@ def tallies(records: Iterable[ObservationRecord]) -> tuple[Tally, ...]:
         tally[2] += record.elapsed
         tally[3] = min(tally[3], record.start)
         tally[4] = max(tally[4], record.end)
-    return tuple(Tally(service=service, process=process, point=point, outcome=outcome, detail=dict(detail),
-                       scope=scope, rule=rule, count=int(count), total=total, elapsed=elapsed, start=start, end=end)
-                 for (service, process, point, detail, outcome, rule, scope), (count, total, elapsed, start, end)
-                 in sums.items())
+    return tuple(Tally(experiment=experiment, service=service, process=process, point=point, outcome=outcome,
+                       detail=dict(detail), scope=scope, rule=rule, count=int(count), total=total, elapsed=elapsed,
+                       start=start, end=end)
+                 for (experiment, service, process, point, detail, outcome, rule, scope),
+                 (count, total, elapsed, start, end) in sums.items())
 
 
 class PathRequest(BaseModel):
@@ -139,7 +143,7 @@ class SearchRun(BaseModel):
         return f"{self.workload.name}.{self.group}.{self.index}"
 
     def records(self) -> list[ObservationRecord]:
-        return [tally.record(self.label) for tally in self.tallies]
+        return [tally.record() for tally in self.tallies]
 
 
 class PointInventory(BaseModel):

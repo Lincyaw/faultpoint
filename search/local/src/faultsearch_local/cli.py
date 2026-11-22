@@ -13,13 +13,15 @@ from faultsearch.chains import Stitcher, Stitching
 from faultsearch.counterfactual import EffectKey, NamedWorkload, Scenarios, tenant_names
 from faultsearch.edges import Acceptance, Condition, EdgeSet, EffectMap, counterpart_assignments, holds
 from faultsearch.evidence import MappingFeedback
+from faultsearch.graph import compute_graph, installed_settings
 from faultsearch.validation import (Headroom, Selection, Validations, adjudications, chosen_runs, headroom,
                                     mapping_checks, merged_workload, merged_workloads)
 from pydantic import BaseModel, TypeAdapter
 
 from faultsearch_local.budget import BUDGETS, Plan, Trajectory, budget_table, simulate
 from faultsearch_local.exploration import Exploration, extended_allocation, phased_allocation, random_allocation
-from faultsearch_local.facts_file import FACTS, experiment_facts, write_facts
+from faultsearch_local.facts_file import FACTS, experiment_facts, read_facts, write_facts
+from faultsearch_local.graph_check import graph_differences
 from faultsearch_local.refill import candidate_phase
 from faultsearch_local.report import render, summarise
 from faultsearch_local.runner import Runner, RunSettings, treatment_record
@@ -294,6 +296,19 @@ def import_facts(experiment: Experiment) -> None:
     typer.echo(f"left out: {len(imported.unreferenced)} repetitions that ran to their end but no record of the "
                f"experiment refers to, by workload {dict(Counter(label.split('.')[0] for label in imported.unreferenced))};"
                f" {len(imported.unfinished)} that never ran to their end")
+
+
+@app.command("graph-check")
+def graph_check(experiment: Experiment,
+                kept: Annotated[int, typer.Option(help="Ranked chains the experiment's stitching wrote in full.")]
+                = 2000) -> None:
+    """Compute the propagation graph from an experiment's facts.jsonl and compare it, part by part, with the records
+    the experiment's own commands wrote."""
+    store = Store(experiment)
+    settings = installed_settings().model_copy(update={"kept": kept})
+    graph = compute_graph(read_facts(store.path(FACTS)), settings)
+    for line in graph_differences(graph, store):
+        typer.echo(line)
 
 
 @app.command("chains")
