@@ -23,10 +23,12 @@ import java.util.regex.Pattern;
 import net.bytebuddy.matcher.ElementMatchers;
 import net.sf.jsqlparser.JSQLParserException;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.statement.CreateFunctionalStatement;
 import net.sf.jsqlparser.statement.SetStatement;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.UnsupportedStatement;
 import net.sf.jsqlparser.statement.create.index.CreateIndex;
+import net.sf.jsqlparser.statement.create.schema.CreateSchema;
 import net.sf.jsqlparser.statement.select.ParenthesedSelect;
 import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.select.Select;
@@ -82,6 +84,20 @@ public final class Jdbc {
         @Override
         public <S> Void visit(CreateIndex index, S context) {
             return index.getTable().accept(this, context);
+        }
+
+        @Override
+        public <S> Void visit(CreateFunctionalStatement definition, S context) {
+            // Declaring a function does not execute the SQL in its body.
+            return null;
+        }
+
+        @Override
+        public <S> Void visit(CreateSchema schema, S context) {
+            if (schema.getStatements() != null) {
+                schema.getStatements().forEach(statement -> statement.accept(this, context));
+            }
+            return null;
         }
 
         Set<String> tables(Statement statement) {
