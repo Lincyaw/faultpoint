@@ -277,7 +277,8 @@ class FactGraph:
         settings = self.settings
         return Stitcher(scenarios=self.variants.scenarios,
                         effects=EffectMap.read(self.topology.entry_service).model_copy(
-                            update={"terminal_outcomes": self.topology.terminal_outcomes}),
+                            update={"terminal_outcomes": self.topology.terminal_outcomes,
+                                    "terminal_kinds": self.topology.terminal_kinds}),
                         catalog=self.catalog, kinds=self.kinds, upstream=self.topology.upstream,
                         targets=self.topology.targets,
                         peers=RpcPeers(ports=self.topology.ports, hosts=self.topology.hosts),

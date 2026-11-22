@@ -14,7 +14,7 @@ from faultpoint.rules import Rule
 from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, field_serializer
 
 from faultsearch.allocation import Phase
-from faultsearch.catalog import FROZEN
+from faultsearch.catalog import FROZEN, RPC_SERVER
 from faultsearch.counterfactual import NamedWorkload, Scenarios, Statuses
 from faultsearch.validation import Selection
 
@@ -215,6 +215,9 @@ class SystemTopology(FactBody):
     upstream: frozenset[str]
     entry_service: str
     terminal_outcomes: tuple[str, ...]
+    terminal_kinds: tuple[str, ...] = Field(default=(RPC_SERVER,),
+                                          exclude_if=lambda kinds: kinds == (RPC_SERVER,))
+    """The entry service's boundary kinds whose failures the user sees, including an initiating client's results."""
     ports: dict[str, int]
     hosts: dict[str, str] = Field(default_factory=dict, exclude_if=lambda hosts: not hosts)
     """Explicit URL host ownership; when supplied, unknown hosts have no inferred peer."""

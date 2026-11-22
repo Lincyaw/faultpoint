@@ -132,6 +132,7 @@ class EffectMap(BaseModel):
     entry_service: str
     """The service whose responses the user sees, which the explored system names."""
     terminal_outcomes: tuple[str, ...]
+    terminal_kinds: tuple[str, ...] = (RPC_SERVER,)
     injected_errors: tuple[NamedError, ...] = ()
     """Errors only an SDK's injection gives. Recorded maps from before these names were listed list none."""
     caller_left_errors: tuple[NamedError, ...] = ()
@@ -145,8 +146,8 @@ class EffectMap(BaseModel):
         return cls.model_validate({**json.loads(path.read_text(encoding="utf-8")), "entry_service": entry_service})
 
     def terminal(self, effect: EffectKey) -> bool:
-        """Whether an effect is a failure the user sees: a non-2xx response of the entry service."""
-        return (point_service(effect.point) == self.entry_service and point_kind(effect.point) == RPC_SERVER
+        """Whether an effect is a failure at one of the entry service's user-visible boundaries."""
+        return (point_service(effect.point) == self.entry_service and point_kind(effect.point) in self.terminal_kinds
                 and effect.outcome in self.terminal_outcomes)
 
     def injected(self, effect: EffectKey) -> bool:
