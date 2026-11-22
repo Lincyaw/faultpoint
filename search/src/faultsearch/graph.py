@@ -1,4 +1,5 @@
 from collections import defaultdict
+from functools import cached_property
 from importlib.metadata import version
 
 from faultpoint.observations import ObservationRecord
@@ -214,43 +215,103 @@ def judged(stitching: Stitching, edges: list[Edge], path_runs: list[tuple[Group,
     return tuple(records), room, Validations(validations=(*requested, *decided))
 
 
+class FactGraph:
+    """The graph the facts give under the settings, each part computed when it is first read, so that planning reads
+    only what the facts so far allow; the settings must be those of the installed faultsearch and faultpoint. Edges
+    come only from the runs in load variants; the merged workloads only judge paths and measure headroom."""
+
+    def __init__(self, facts: Facts, settings: ComputeSettings) -> None:
+        installed = installed_settings()
+        if (settings.faultsearch, settings.faultpoint) != (installed.faultsearch, installed.faultpoint):
+            raise ValueError(f"the settings are for faultsearch {settings.faultsearch} and faultpoint "
+                             f"{settings.faultpoint}, but {installed.faultsearch} and {installed.faultpoint} are installed")
+        self.facts = facts
+        self.settings = settings
+        self.topology = facts.latest(SystemTopology)
+        self.variants = facts.latest(LoadVariants)
+        self.kinds = KindTable.installed()
+        self.runs = facts.standing_runs()
+        self.repetitions = FactRepetitions(self.runs, settings)
+        self.controls = control_records(self.runs)
+
+    @cached_property
+    def inventory(self) -> PointInventory:
+        return self.facts.latest(PointInventory)
+
+    @cached_property
+    def catalog(self) -> Catalog:
+        return graph_catalog(self.controls, self.inventory, self.topology, self.variants, self.repetitions,
+                             self.kinds)
+
+    @cached_property
+    def edge_groups(self) -> list[tuple[Group, list[SearchRun]]]:
+        return treatment_groups(self.runs, Purpose.EDGE, self.topology, self.kinds)
+
+    @cached_property
+    def phased_records(self) -> dict[tuple[str, str], tuple[TreatmentRecord, Phase | None]]:
+        return group_treatments(self.edge_groups, self.controls, self.repetitions)
+
+    @cached_property
+    def assignments(self) -> list[Assignment]:
+        return edge_assignments(self.edge_groups, self.phased_records)
+
+    @cached_property
+    def by_pair(self) -> dict[tuple[str, str], TreatmentRecord]:
+        """Every load variant's treatment record, by fault key and workload."""
+        return {pair: record for pair, (record, _) in self.phased_records.items()}
+
+    @cached_property
+    def allocation(self) -> Allocation:
+        strategy = Strategy.RANDOM if any(assignment.phase == Phase.RANDOM for assignment in self.assignments) \
+            else Strategy.PHASED
+        return allocation_of(strategy, self.assignments, self.by_pair, self.settings.cluster_distance)
+
+    @cached_property
+    def records(self) -> list[TreatmentRecord]:
+        """The treatment records in the order of the assignments."""
+        return [self.by_pair[(assignment.fault.key, assignment.scenario)] for assignment in self.assignments]
+
+    @cached_property
+    def stitcher(self) -> Stitcher:
+        settings = self.settings
+        return Stitcher(scenarios=self.variants.scenarios,
+                        effects=EffectMap.read(self.topology.entry_service).model_copy(
+                            update={"terminal_outcomes": self.topology.terminal_outcomes}),
+                        catalog=self.catalog, kinds=self.kinds, upstream=self.topology.upstream,
+                        targets=self.topology.targets,
+                        services={port: service for service, port in self.topology.ports.items()},
+                        manifests=point_manifests(self.inventory.manifests),
+                        min_count_increase=settings.min_count_increase, min_mean_increase=settings.min_mean_increase,
+                        acceptance=settings.acceptance, width=settings.width, max_hops=settings.max_hops,
+                        kept=settings.kept)
+
+    @cached_property
+    def edges(self) -> list[Edge]:
+        return self.stitcher.edges(self.records)
+
+    @cached_property
+    def stitching(self) -> Stitching:
+        """The chains stitched without any path judgement."""
+        return self.stitcher.chains(self.edges, self.allocation, self.records, MappingFeedback(checks=()))
+
+    @cached_property
+    def judgement(self) -> tuple[tuple[TreatmentRecord, ...], Headroom, Validations]:
+        return judged(self.stitching, self.edges, treatment_groups(self.runs, Purpose.PATH, self.topology, self.kinds),
+                      self.controls, self.repetitions, self.variants, self.settings)
+
+    @cached_property
+    def feedback(self) -> MappingFeedback:
+        return MappingFeedback(checks=()).merged(mapping_checks(self.judgement[2]))
+
+    def graph(self) -> PropagationGraph:
+        path_records, room, validations = self.judgement
+        return PropagationGraph(
+            settings=self.settings, through=self.facts.facts[-1].sequence, catalog=self.catalog,
+            controls=tuple(self.controls.values()), records=tuple(self.records), allocation=self.allocation,
+            edges=tuple(self.edges), stitching=self.stitching, path_records=path_records, headroom=room,
+            validations=validations, feedback=self.feedback,
+            judged_stitching=self.stitcher.chains(self.edges, self.allocation, self.records, self.feedback))
+
+
 def compute_graph(facts: Facts, settings: ComputeSettings) -> PropagationGraph:
-    """The graph the facts give under the settings, which must be those of the installed faultsearch and faultpoint:
-    edges only from the runs in load variants, the merged workloads only judging paths and measuring headroom."""
-    installed = installed_settings()
-    if (settings.faultsearch, settings.faultpoint) != (installed.faultsearch, installed.faultpoint):
-        raise ValueError(f"the settings are for faultsearch {settings.faultsearch} and faultpoint {settings.faultpoint}, "
-                         f"but {installed.faultsearch} and {installed.faultpoint} are installed")
-    topology = facts.latest(SystemTopology)
-    variants = facts.latest(LoadVariants)
-    inventory = facts.latest(PointInventory)
-    kinds = KindTable.installed()
-    runs = facts.standing_runs()
-    repetitions = FactRepetitions(runs, settings)
-    controls = control_records(runs)
-    catalog = graph_catalog(controls, inventory, topology, variants, repetitions, kinds)
-    edge_groups = treatment_groups(runs, Purpose.EDGE, topology, kinds)
-    records = group_treatments(edge_groups, controls, repetitions)
-    assignments = edge_assignments(edge_groups, records)
-    by_pair = {pair: record for pair, (record, _) in records.items()}
-    allocation = allocation_of(Strategy.RANDOM if any(assignment.phase == Phase.RANDOM for assignment in assignments)
-                               else Strategy.PHASED, assignments, by_pair, settings.cluster_distance)
-    ordered = [by_pair[(assignment.fault.key, assignment.scenario)] for assignment in assignments]
-    stitcher = Stitcher(scenarios=variants.scenarios,
-                        effects=EffectMap.read(topology.entry_service).model_copy(
-                            update={"terminal_outcomes": topology.terminal_outcomes}),
-                        catalog=catalog, kinds=kinds, upstream=topology.upstream, targets=topology.targets,
-                        services={port: service for service, port in topology.ports.items()},
-                        manifests=point_manifests(inventory.manifests), min_count_increase=settings.min_count_increase,
-                        min_mean_increase=settings.min_mean_increase, acceptance=settings.acceptance,
-                        width=settings.width, max_hops=settings.max_hops, kept=settings.kept)
-    edges = stitcher.edges(ordered)
-    stitching = stitcher.chains(edges, allocation, ordered, MappingFeedback(checks=()))
-    path_records, room, validations = judged(stitching, edges, treatment_groups(runs, Purpose.PATH, topology, kinds),
-                                             controls, repetitions, variants, settings)
-    feedback = MappingFeedback(checks=()).merged(mapping_checks(validations))
-    return PropagationGraph(settings=settings, through=facts.facts[-1].sequence, catalog=catalog,
-                            controls=tuple(controls.values()), records=tuple(ordered), allocation=allocation,
-                            edges=tuple(edges), stitching=stitching, path_records=path_records, headroom=room,
-                            validations=validations, feedback=feedback,
-                            judged_stitching=stitcher.chains(edges, allocation, ordered, feedback))
+    return FactGraph(facts, settings).graph()
