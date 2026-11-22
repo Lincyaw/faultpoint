@@ -1,7 +1,10 @@
+import argparse
+import json
 import random
 from collections import Counter
 from collections.abc import Callable
 from enum import StrEnum
+from pathlib import Path
 from typing import Final
 
 from pydantic import BaseModel, Field
@@ -12,8 +15,9 @@ from faultsearch.catalog import FROZEN, Fault
 from faultsearch.chains import Chain
 from faultsearch.counterfactual import NamedWorkload, pack
 from faultsearch.edges import counterpart_assignments
-from faultsearch.execution import Executor, RunRequest
-from faultsearch.facts import CONTROL_GROUP, FactList, Facts, LoadVariants, PathRequest, PointInventory, Purpose
+from faultsearch.execution import Executor, PlannedRequest, RunRequest
+from faultsearch.facts import (CONTROL_GROUP, FactList, Facts, LoadVariants, PathRequest, PointInventory, Purpose,
+                               read_facts)
 from faultsearch.graph import ComputeSettings, FactGraph
 from faultsearch.refill import candidate_batch, hypotheses
 from faultsearch.validation import Selection, chosen_runs, merged_workload, merged_workloads, run_key
@@ -115,19 +119,23 @@ class PlanState(BaseModel):
         return generator
 
 
+class Stop(StrEnum):
+    """Why a plan asks for nothing more."""
+
+    COMPLETE = "complete"
+    """Every stage asked for all that its budget and the facts allowed."""
+
+
 class PlanStep(BaseModel):
     """What a plan asks for next: the requests to run, or the point inventory its caller must write first, naming the
-    load variants' control runs, and the state after it; a step with neither ends the plan."""
+    load variants' control runs, or why it stops; and the state after it, which the next step starts from."""
 
     model_config = FROZEN
 
-    requests: tuple[RunRequest, ...] = ()
+    requests: tuple[PlannedRequest, ...] = ()
     inventory: tuple[str, ...] = ()
+    stop: Stop | None = None
     state: PlanState
-
-    @property
-    def done(self) -> bool:
-        return self.state.stage == Stage.DONE
 
 
 class Planning:
@@ -338,18 +346,18 @@ def plan(facts: Facts, state: PlanState, settings: PlanSettings) -> PlanStep:
     while stage != Stage.DONE:
         planning = Planning(facts, state.model_copy(update={"stage": stage}), settings)
         if stage not in (Stage.CONTROLS, Stage.COVERAGE, Stage.RANDOM) and (rerun := planning.leaked()):
-            return PlanStep(requests=tuple(rerun), state=planning.state)
+            return PlanStep(requests=tuple(PlannedRequest.of(request) for request in rerun), state=planning.state)
         requests = STAGES[stage](planning)
         if requests:
-            return PlanStep(requests=tuple(requests), state=planning.state.model_copy(
-                update={"random": tuple(planning.rng.getstate()[1])}))
+            return PlanStep(requests=tuple(PlannedRequest.of(request) for request in requests),
+                            state=planning.state.model_copy(update={"random": tuple(planning.rng.getstate()[1])}))
         state = planning.state.model_copy(update={"random": tuple(planning.rng.getstate()[1])})
         stage = next_stage(stage, settings)
         if stage in (Stage.COVERAGE, Stage.RANDOM) and not facts.holds(PointInventory):
             return PlanStep(inventory=tuple(sorted(run.label for run in planning.graph.runs
                                                    if run.group == CONTROL_GROUP)),
                             state=state.model_copy(update={"stage": stage}))
-    return PlanStep(state=state.model_copy(update={"stage": Stage.DONE}))
+    return PlanStep(stop=Stop.COMPLETE, state=state.model_copy(update={"stage": Stage.DONE}))
 
 
 def search(log: FactList, state: PlanState, settings: PlanSettings, executor: Executor,
@@ -361,7 +369,33 @@ def search(log: FactList, state: PlanState, settings: PlanSettings, executor: Ex
         step = plan(log.snapshot(), state, settings)
         if step.inventory:
             log.append(inventory(step.inventory, log.next_sequence()))
-        executor.run(list(step.requests))
+        executor.run([planned.request for planned in step.requests])
         state = step.state
         saved(state)
     return state
+
+
+def print_plan_step() -> None:
+    """Print, as JSON, the next step of a plan: what the facts of a fact file call for under the plan settings of a
+    JSON file, from the plan state the step before gave, or from the start."""
+    parser = argparse.ArgumentParser(description=print_plan_step.__doc__)
+    parser.add_argument("facts", type=Path, help="A fact file: one fact per line, in sequence order.")
+    parser.add_argument("settings", type=Path, help="The plan settings, a JSON object.")
+    parser.add_argument("--state", type=Path, help="The state the step before gave; the plan's start when left out.")
+    arguments = parser.parse_args()
+    settings = PlanSettings.model_validate_json(arguments.settings.read_bytes())
+    state = PlanState.model_validate_json(arguments.state.read_bytes()) if arguments.state else \
+        PlanState.start(settings)
+    print(plan(read_facts(arguments.facts), state, settings).model_dump_json(indent=2))
+
+
+def print_step_schema() -> None:
+    print(json.dumps(PlanStep.model_json_schema(mode="serialization"), indent=2))
+
+
+def print_state_schema() -> None:
+    print(json.dumps(PlanState.model_json_schema(), indent=2))
+
+
+def print_settings_schema() -> None:
+    print(json.dumps(PlanSettings.model_json_schema(), indent=2))

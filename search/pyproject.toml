@@ -16,6 +16,15 @@ faultsearch-normalize-facts = "faultsearch.facts:normalize_facts"
 faultsearch-candidate-paths = "faultsearch.candidates:print_candidate_paths"
 faultsearch-candidate-paths-schema = "faultsearch.candidates:print_schema"
 faultsearch-compute-settings-schema = "faultsearch.graph:print_settings_schema"
+faultsearch-plan = "faultsearch.plan:print_plan_step"
+faultsearch-plan-step-schema = "faultsearch.plan:print_step_schema"
+faultsearch-plan-state-schema = "faultsearch.plan:print_state_schema"
+faultsearch-plan-settings-schema = "faultsearch.plan:print_settings_schema"
+faultsearch-run-request-schema = "faultsearch.execution:print_request_schema"
+faultsearch-record-run = "faultsearch.recording:print_search_run"
+faultsearch-run-origin-schema = "faultsearch.recording:print_origin_schema"
+faultsearch-run-directory = "faultsearch.recording:print_run_directory"
+faultsearch-point-inventory = "faultsearch.recording:print_point_inventory"
 
 [tool.uv.sources]
 faultpoint = { path = "../python", editable = true }

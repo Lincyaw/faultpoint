@@ -8,19 +8,12 @@ from pydantic import BaseModel, ConfigDict, JsonValue
 
 SYSTEMS_GROUP: Final = "faultsearch.systems"
 """The entry point group a system registers itself in, so that the local executor runs it without importing it."""
-STATUSES_FILE: Final = "statuses.json"
-"""What every repetition directory holds once its load ended: each tenant's response statuses."""
-REFUSAL_FILE: Final = "refusal.txt"
-"""What a repetition directory holds when a service refused one of its rules."""
-SEED_FILE: Final = "seed.txt"
-"""The repetition's FAULTPOINT_SEED, so that the rules that act on a share of the executions draw anew in every
-repetition."""
 
 
 class System(BaseModel):
     """A system the local executor runs: its scenarios and manifests, the service whose responses the user sees, the
     port each service listens on and the upstream components it uses, how to build it, how to run one repetition of it
-    under a rule set with a seed, and how to tell that a service refused a rule."""
+    under a rule set with a seed into a run directory, and how to tell that a service refused a rule."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

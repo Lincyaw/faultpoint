@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Final
 
+from faultsearch.facts import FACT, Fact, FactList, read_facts
 from pydantic import BaseModel
 
 SEARCH_RUNS: Final = Path(__file__).resolve().parents[4] / "runs" / "search"
@@ -66,3 +67,16 @@ class Store:
 
     def repetition(self, label: str) -> Path:
         return self.path(REPETITIONS, label)
+
+
+class FactLog(FactList):
+    """An experiment's facts.jsonl, read once and then appended to, line by line."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(list(read_facts(path).facts) if path.exists() else [])
+        self.path = path
+
+    def append(self, fact: Fact) -> None:
+        super().append(fact)
+        with self.path.open("a", encoding="utf-8") as lines:
+            lines.write(f"{FACT.dump_json(fact).decode()}\n")

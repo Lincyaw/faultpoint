@@ -1,3 +1,5 @@
+import json
+from hashlib import sha256
 from typing import Protocol
 
 from faultpoint.rules import RuleSet
@@ -7,6 +9,24 @@ from faultsearch.allocation import Phase
 from faultsearch.catalog import FROZEN, Fault
 from faultsearch.counterfactual import Group, NamedWorkload, control_labels
 from faultsearch.facts import CONTROL_GROUP, FactList, Facts, PathRequest, Purpose, SearchRun
+
+
+def repetition_seed(label: str) -> int:
+    """The FAULTPOINT_SEED of a repetition, from its label, so that the repetitions of one group draw their rules'
+    chances anew and a repetition run again draws the same."""
+    return int(sha256(label.encode()).hexdigest()[:15], 16)
+
+
+class RepetitionRequest(BaseModel):
+    """One repetition an executor runs for a request: its index and label, the seed its services' rules draw with,
+    and the rule set they load, whose experiment is the label."""
+
+    model_config = FROZEN
+
+    index: int
+    label: str
+    seed: int
+    rules: RuleSet
 
 
 class RunRequest(BaseModel):
@@ -37,6 +57,22 @@ class RunRequest(BaseModel):
         if not self.faults:
             return RuleSet(experiment=label)
         return Group(workload=self.workload, faults=self.faults).ruleset(label)
+
+
+class PlannedRequest(BaseModel):
+    """A request with every repetition spelled out, so that an executor runs it without computing labels, rules or
+    seeds."""
+
+    model_config = FROZEN
+
+    request: RunRequest
+    repetitions: tuple[RepetitionRequest, ...]
+
+    @classmethod
+    def of(cls, request: RunRequest) -> "PlannedRequest":
+        return cls(request=request, repetitions=tuple(
+            RepetitionRequest(index=index, label=label, seed=repetition_seed(label), rules=request.ruleset(label))
+            for index, label in enumerate(request.labels())))
 
 
 class Executor(Protocol):
@@ -72,3 +108,8 @@ class RecordedExecutor:
                         "requests": request.requests}))
                 found.append(self.log.runs[(recorded.source, recorded.label)])
         return found
+
+
+def print_request_schema() -> None:
+    """Print the JSON Schema of a run request, which the plan gives and the recording of a repetition reads."""
+    print(json.dumps(RunRequest.model_json_schema(), indent=2))

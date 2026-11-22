@@ -10,15 +10,15 @@ from faultsearch.evidence import MappingFeedback
 from faultsearch.facts import (CONTROL_GROUP, Fact, Facts, LoadVariants, PathRequest, PointInventory, Purpose,
                                SystemTopology)
 from faultsearch.graph import PropagationGraph
+from faultsearch.recording import RULES_FILE, STATUSES_FILE
 from faultsearch.validation import VALIDATION_PREFIX, Headroom, Selection, Validation, Validations
 from pydantic import BaseModel
 
-from faultsearch_local.executor import RunSettings
-from faultsearch_local.facts_file import RULES_FILE, RunOrigin
+from faultsearch_local.executor import RunSettings, local_origin
 from faultsearch_local.store import (CATALOG, CONTROLS, EFFECTS_INPUT, HEADROOM, INPUTS, MAPPING_FEEDBACK, REPETITIONS,
                                      RUN_SETTINGS, SCENARIOS_INPUT, TREATMENTS, VALIDATIONS, Store, allocation_file,
                                      chains_file, edges_file)
-from faultsearch_local.systems import STATUSES_FILE, System
+from faultsearch_local.systems import System
 
 
 class Imported(BaseModel):
@@ -38,7 +38,7 @@ class RunImport:
 
     def __init__(self, store: Store, system: System, settings: RunSettings) -> None:
         self.store = store
-        self.origin = RunOrigin(store, system.name, settings.commit)
+        self.origin = local_origin(store, system.name, settings.commit)
         self.facts: list[Fact] = []
         self.taken: set[str] = set()
 
@@ -47,8 +47,9 @@ class RunImport:
         """One repetition directory as a search run, unless taken before."""
         if label not in self.taken:
             self.taken.add(label)
-            self.facts.append(self.origin.search_run(label, len(self.facts) + 1, workload, group, index, purpose,
-                                                     phases, requests))
+            self.facts.append(self.origin.search_run(self.store.repetition(label), self.store.root,
+                                                     len(self.facts) + 1, workload, group, index, purpose, phases,
+                                                     requests))
 
     def controls(self, control: ControlRecord, purpose: Purpose) -> None:
         for index, label in enumerate(control.labels):

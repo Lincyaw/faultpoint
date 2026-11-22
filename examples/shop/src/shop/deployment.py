@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any, Final
 
 from faultsearch.counterfactual import SCOPE_KEY, Statuses
-from faultsearch_local.systems import REFUSAL_FILE, SEED_FILE, STATUSES_FILE, System
+from faultsearch.recording import (INSTRUMENTATION_FILE, REFUSAL_FILE, RULES_FILE, SEED_FILE, STATUSES_FILE,
+                                   WORKLOAD_FILE)
+from faultsearch_local.systems import System
 from pydantic import BaseModel, JsonValue
 
 from shop.upstream import (HOST_FROM_NAMESPACE, PACKET_POINTS, UNSCOPED_TARGETS, UPSTREAM_FILE, UPSTREAM_SERVICES,
@@ -46,10 +48,7 @@ ORDERS_PLUGINS: Final = ["points", "import-hook", "httpx", "asgi", "dbapi", "red
 PORTS: Final = {"gateway": 27180, "orders": 27181, "inventory": 27182, "pricing": 27183, "ledger": 27184}
 LEDGER_CLASS_PATH: Final = f"{SHOP / 'ledger' / 'target' / 'classes'}:{SHOP / 'ledger' / 'target' / 'lib' / '*'}"
 """The class path ledger runs with, which its scan reads too, so that the scan lists the calls into its libraries."""
-WORKLOAD_FILE: Final = "workload.json"
-RULES_FILE: Final = "rules.json"
 RESPONSES_FILE: Final = "responses.json"
-INSTRUMENTATION_FILE: Final = "instrumentation.json"
 FAULTPOINT_VARIABLES: Final = "FAULTPOINT_"
 """The prefix of the environment variables every SDK reads, none of which a service without faultpoint gets."""
 NETWORK_NAMESPACE: Final = ("unshare", "--user", "--map-root-user", "--net", "--")

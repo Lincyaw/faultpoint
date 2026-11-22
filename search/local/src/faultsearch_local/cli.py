@@ -7,23 +7,23 @@ import typer
 from faultpoint.rules import Action
 from faultpoint.tools.kinds import KindTable
 from faultsearch.allocation import AllocationSettings, Strategy
-from faultsearch.catalog import FROZEN, Fault, point_layer, point_scoped, read_manifests
+from faultsearch.catalog import FROZEN, Fault, point_layer, point_scoped
 from faultsearch.counterfactual import EffectKey, Group, Scenarios
 from faultsearch.edges import Condition, EffectMap, holds
 from faultsearch.execution import RunRequest
-from faultsearch.facts import (FACTS_FILE, LoadVariants, PointInventory, Purpose, SystemTopology, read_facts,
-                               write_facts)
+from faultsearch.facts import FACTS_FILE, LoadVariants, Purpose, SystemTopology, read_facts, write_facts
 from faultsearch.graph import ComputeSettings, FactGraph, FactRepetitions, compute_graph
 from faultsearch.plan import PlanSettings, PlanState, Refill, ValidationSettings, search
+from faultsearch.recording import point_inventory
 from faultsearch.validation import merged_workload
 from pydantic import BaseModel, TypeAdapter
 
 from faultsearch_local.budget import BUDGETS, Comparison, Plan, Trajectory, budget_table
 from faultsearch_local.executor import LocalExecutor, RunSettings
-from faultsearch_local.facts_file import FactLog
 from faultsearch_local.report import render, summarise
 from faultsearch_local.run_directories import experiment_facts, graph_differences
-from faultsearch_local.store import (ALLOCATION_SETTINGS, INPUTS, REPORT, RUN_SETTINGS, SCENARIOS_INPUT, Store)
+from faultsearch_local.store import (ALLOCATION_SETTINGS, INPUTS, REPORT, RUN_SETTINGS, SCENARIOS_INPUT, FactLog,
+                                     Store)
 from faultsearch_local.systems import System, installed_systems
 
 app = typer.Typer(no_args_is_help=True, help=(
@@ -69,14 +69,6 @@ def started_log(store: Store, system: System) -> FactLog:
                                   ports=system.ports, targets=system.targets))
         log.append(LoadVariants(sequence=2, system=system.name, scenarios=recorded_scenarios(store, system)))
     return log
-
-
-def system_inventory(system: System, settings: RunSettings) -> PointInventory:
-    """The point inventory of the system's build: its manifests and configured points, the control runs added when the
-    plan asks for it."""
-    return PointInventory(sequence=0, system=system.name, revision=None, sdk_build=settings.commit,
-                          deployment=settings.instrumentation, controls=(), manifests=read_manifests(system.manifests),
-                          configured=system.configured)
 
 
 @app.command("search")
@@ -125,7 +117,6 @@ def search_command(
                                       single_scenario_cross_layer=single_scenario_cross_layer, chains=tuple(chain)),
         compute=recorded_settings(store)), PLAN_SETTINGS)
     log = started_log(store, explored)
-    inventory = system_inventory(explored, run_settings)
 
     def saved(state: PlanState) -> None:
         store.save(state, PLAN_STATE)
@@ -134,7 +125,8 @@ def search_command(
 
     state = search(log, store.load(PlanState, PLAN_STATE) if store.has(PLAN_STATE) else PlanState.start(settings),
                    settings, LocalExecutor(store, run_settings, explored, log, max_load),
-                   lambda labels, sequence: inventory.model_copy(update={"sequence": sequence, "controls": labels}),
+                   lambda labels, sequence: point_inventory(log.snapshot(), labels, explored.manifests,
+                                                            explored.configured, sequence),
                    saved)
     typer.echo(f"search done: {state.spent} exploring and {state.refilled} refill injections asked for, "
                f"{len(log.facts)} facts")

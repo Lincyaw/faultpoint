@@ -2,23 +2,24 @@ import os
 import subprocess
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from hashlib import sha256
 from pathlib import Path
 from typing import Final
 
 from faultpoint.tools.kinds import KindTable
 from faultsearch.catalog import FROZEN
 from faultsearch.counterfactual import Statuses
-from faultsearch.execution import RunRequest
+from faultsearch.execution import RunRequest, repetition_seed
 from faultsearch.facts import SearchRun
+from faultsearch.recording import REFUSAL_FILE, STATUSES_FILE, RunOrigin
 from pydantic import BaseModel, Field, JsonValue
 
-from faultsearch_local.facts_file import FactLog, RunOrigin
-from faultsearch_local.store import Store
-from faultsearch_local.systems import REFUSAL_FILE, STATUSES_FILE, System
+from faultsearch_local.store import FactLog, Store
+from faultsearch_local.systems import System
 
 LOAD_POLL_S: Final = 2.0
 """How often a repetition held back by the host's load checks it again."""
+LOCAL_ENVIRONMENT: Final = "local-docker"
+"""Where the local executor runs repetitions: its own containers and network namespaces on this host."""
 
 type Running = list[tuple[str, Future[Statuses]]]
 """Repetitions submitted, by label."""
@@ -47,10 +48,11 @@ class RunSettings(BaseModel):
     deployment reads it."""
 
 
-def repetition_seed(label: str) -> int:
-    """The FAULTPOINT_SEED of a repetition, from its label, so that the repetitions of one group draw their rules'
-    chances anew and a repetition run again draws the same."""
-    return int(sha256(label.encode()).hexdigest()[:15], 16)
+def local_origin(store: Store, system: str, sdk_build: str) -> RunOrigin:
+    """The origin of an experiment's search runs on this host: the experiment, the system, which records no
+    revision, and the SDK commit its services were built with."""
+    return RunOrigin(source=store.root.name, system=system, revision=None, sdk_build=sdk_build,
+                     build={"system": system}, environment=LOCAL_ENVIRONMENT)
 
 
 class LocalExecutor:
@@ -63,7 +65,7 @@ class LocalExecutor:
         self.settings = settings
         self.system = system
         self.log = log
-        self.origin = RunOrigin(store, system.name, settings.commit)
+        self.origin = local_origin(store, system.name, settings.commit)
         self.max_load = max_load
         """The host's 1-minute load above which no new repetition starts while others still run."""
         self.kinds = KindTable.installed()
@@ -115,9 +117,9 @@ class LocalExecutor:
             print(label, future.result().tenants, flush=True)
         for index, label in enumerate(request.labels()):
             if (self.store.root.name, label) not in self.log.runs:
-                self.log.append(self.origin.search_run(label, self.log.next_sequence(), request.workload,
-                                                       request.group, index, request.purpose, request.phases,
-                                                       request.requests))
+                self.log.append(self.origin.search_run(self.store.repetition(label), self.store.root,
+                                                       self.log.next_sequence(), request.workload, request.group,
+                                                       index, request.purpose, request.phases, request.requests))
 
     def run(self, requests: list[RunRequest]) -> list[SearchRun]:
         """The requests' search runs; a rule the kind table refuses stops the run before any repetition starts."""

@@ -11,10 +11,11 @@ from string import ascii_lowercase
 from typing import Any, Final
 
 from faultsearch.counterfactual import Statuses
+from faultsearch.recording import INSTRUMENTATION_FILE, WORKLOAD_FILE
 from faultsearch_local.systems import System
 from pydantic import BaseModel, Field, JsonValue, PositiveInt
-from shop.deployment import (FLUSH_SECONDS, HOOKS_DIRECTORY, IDENTIFIER_SEGMENT, INSTRUMENTATION_FILE, LOAD_DEADLINE_S,
-                             REDIS_KEY_IDENTIFIER, WORKLOAD_FILE, Instrumentation, Response, Service, answered,
+from shop.deployment import (FLUSH_SECONDS, HOOKS_DIRECTORY, IDENTIFIER_SEGMENT, LOAD_DEADLINE_S,
+                             REDIS_KEY_IDENTIFIER, Instrumentation, Response, Service, answered,
                              built_commit, isolated_repetition, record_responses, refusal, run, sdk_commit,
                              service_environment, start, tenant_request, wait_for_host_route, wait_for_port,
                              write_config)
