@@ -60,9 +60,33 @@ func failureCode(rule *faultpoint.Rule) (codes.Code, error) {
 // NewServer keeps the application's options and adds one point around each unary call and stream.
 func NewServer(options ...grpc.ServerOption) *grpc.Server {
 	if enabled {
-		options = append(options, grpc.ChainUnaryInterceptor(serveUnary), grpc.ChainStreamInterceptor(serveStream))
+		options = append([]grpc.ServerOption{grpc.ChainUnaryInterceptor(serveUnary), grpc.ChainStreamInterceptor(serveStream)}, options...)
 	}
 	return grpc.NewServer(options...)
+}
+
+// UnaryInterceptor keeps the point outside an application's single interceptor, which grpc-go runs before chains.
+func UnaryInterceptor(next grpc.UnaryServerInterceptor) grpc.ServerOption {
+	if !enabled || next == nil {
+		return grpc.UnaryInterceptor(next)
+	}
+	return grpc.UnaryInterceptor(func(ctx context.Context, request any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		return serveUnary(ctx, request, info, func(inner context.Context, request any) (any, error) {
+			return next(inner, request, info, handler)
+		})
+	})
+}
+
+// StreamInterceptor keeps the point outside an application's single stream interceptor as well.
+func StreamInterceptor(next grpc.StreamServerInterceptor) grpc.ServerOption {
+	if !enabled || next == nil {
+		return grpc.StreamInterceptor(next)
+	}
+	return grpc.StreamInterceptor(func(service any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		return serveStream(service, stream, info, func(service any, inner grpc.ServerStream) error {
+			return next(service, inner, info, handler)
+		})
+	})
 }
 
 type metadataCarrier struct{ metadata.MD }
@@ -91,13 +115,15 @@ type serverCall struct {
 	started time.Time
 }
 
+type serverCallKey struct{}
+
 // take restores propagation metadata and applies the call's wait or pre-handler failure.
 func take(ctx context.Context, method string) *serverCall {
 	defer faultpoint.Guard()
 	if incoming, found := metadata.FromIncomingContext(ctx); found {
 		ctx = propagator.Extract(ctx, metadataCarrier{MD: incoming})
 	}
-	call := &serverCall{ctx: ctx, point: faultpoint.PointID(faultpoint.Service(), "rpc_server", locatorPrefix+method),
+	call := &serverCall{ctx: context.WithValue(ctx, serverCallKey{}, true), point: faultpoint.PointID(faultpoint.Service(), "rpc_server", locatorPrefix+method),
 		started: time.Now()}
 	call.rule = faultpoint.Decide(ctx, call.point, action.Before...)
 	if call.rule != nil {
@@ -142,9 +168,13 @@ func (c *serverCall) finish(err error) error {
 
 func serveUnary(ctx context.Context, request any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	defer faultpoint.Guard()
-	call := take(ctx, info.FullMethod)
 	var response any
 	var err error
+	if ctx.Value(serverCallKey{}) != nil {
+		faultpoint.Outside(func() { response, err = handler(ctx, request) })
+		return response, err
+	}
+	call := take(ctx, info.FullMethod)
 	if call.rule != nil && call.rule.Action.Kind == "fail" {
 		err = call.failure()
 	} else {
@@ -162,8 +192,12 @@ func (s serverStream) Context() context.Context { return s.ctx }
 
 func serveStream(service any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	defer faultpoint.Guard()
-	call := take(stream.Context(), info.FullMethod)
 	var err error
+	if stream.Context().Value(serverCallKey{}) != nil {
+		faultpoint.Outside(func() { err = handler(service, stream) })
+		return err
+	}
+	call := take(stream.Context(), info.FullMethod)
 	if call.rule != nil && call.rule.Action.Kind == "fail" {
 		err = call.failure()
 	} else {

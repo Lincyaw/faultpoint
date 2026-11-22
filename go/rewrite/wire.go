@@ -47,7 +47,9 @@ var pluginPackages = map[string]string{pointsPlugin: pointsPackage, httpPlugin: 
 
 // constructorWrappers replace constructors whose interceptors must be installed before the library builds them.
 var constructorWrappers = map[string]wrapper{
-	"google.golang.org/grpc.NewServer": {plugin: grpcPlugin, pkg: grpcPackage, function: "NewServer"},
+	"google.golang.org/grpc.NewServer":         {plugin: grpcPlugin, pkg: grpcPackage, function: "NewServer"},
+	"google.golang.org/grpc.UnaryInterceptor":  {plugin: grpcPlugin, pkg: grpcPackage, function: "UnaryInterceptor"},
+	"google.golang.org/grpc.StreamInterceptor": {plugin: grpcPlugin, pkg: grpcPackage, function: "StreamInterceptor"},
 }
 
 // wrapper is the adapter function the copy applies to a value it hands to a library, or to a value a library returns.
