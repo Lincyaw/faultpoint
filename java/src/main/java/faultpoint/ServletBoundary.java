@@ -223,6 +223,7 @@ public final class ServletBoundary {
 
         @Override
         public void install(Installation installation, Map<String, Object> options) {
+            installation.core().check(HttpClients::checkRule);
             if (options.get("identifier_segment") instanceof String pattern) {
                 identifierSegment = Pattern.compile(pattern);
             }

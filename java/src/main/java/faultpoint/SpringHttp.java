@@ -183,6 +183,7 @@ public final class SpringHttp {
 
         @Override
         public void install(Installation installation, Map<String, Object> options) {
+            installation.core().check(HttpClients::checkRule);
             installation.core().declare(Map.of("rpc_client", List.of("fail", "fail_after", "delay", "crash")), Core.EVERY_LOCATOR);
             installation.advise(
                     ElementMatchers.hasSuperType(ElementMatchers.named("org.springframework.http.client.ClientHttpRequest"))

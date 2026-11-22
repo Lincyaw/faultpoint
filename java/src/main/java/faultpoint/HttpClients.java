@@ -35,6 +35,14 @@ public final class HttpClients {
 
     private HttpClients() {}
 
+    /** The failure parameters of the HTTP client and servlet adapters, checked before rules run. */
+    static String checkRule(Rule rule) {
+        return (rule.kind().equals("fail") || rule.kind().equals("fail_after"))
+                && (rule.pointKind().equals("rpc_client") || rule.pointKind().equals("rpc_server"))
+                && !rule.locator().startsWith("gRPC ") && rule.action().containsKey("code")
+                ? "HTTP failures use status, not code" : null;
+    }
+
     /** A response answered without a peer; its body is null. */
     record SyntheticResponse<T>(int statusCode, HttpRequest request) implements HttpResponse<T> {
         @Override
@@ -397,6 +405,7 @@ public final class HttpClients {
 
         @Override
         public void install(Installation installation, Map<String, Object> options) {
+            installation.core().check(HttpClients::checkRule);
             installation.core().declare(Map.of("rpc_client", List.of("fail", "fail_after", "duplicate", "delay", "crash")),
                     Core.EVERY_LOCATOR);
             Placement placement = installation.placement();
