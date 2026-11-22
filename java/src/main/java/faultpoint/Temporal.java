@@ -187,7 +187,9 @@ public final class Temporal {
                 Points.hold(core, rule);
                 if (rule.kind().equals("fail")) {
                     Throwable injected = failure(loader, rule, kind);
-                    core.observe(point, "error", 0, Points.since(started), rule, failureDetail(loader, injected, kind, false));
+                    Map<String, String> detail = failureDetail(loader, injected, kind);
+                    detail.put("sent", "false");
+                    core.observe(point, "error", 0, Points.since(started), rule, detail);
                     throw injected;
                 }
             }
@@ -198,13 +200,15 @@ public final class Temporal {
                     result = invoke(method, next, arguments);
                 }
             } catch (Throwable failure) {
-                core.observe(point, "error", 0, Points.since(started), rule, failureDetail(loader, failure, kind, true));
+                core.observe(point, "error", 0, Points.since(started), rule, failureDetail(loader, failure, kind));
                 throw failure;
             }
             Rule after = core.decide(point, Core.ACTS_AFTER);
             if (after != null) {
                 Throwable injected = failure(loader, after, kind);
-                core.observe(point, "error", 0, Points.since(started), after, failureDetail(loader, injected, kind, true));
+                Map<String, String> detail = failureDetail(loader, injected, kind);
+                detail.put("sent", "true");
+                core.observe(point, "error", 0, Points.since(started), after, detail);
                 throw injected;
             }
             core.observe(point, kind.equals("consume") ? "rows" : "ok", kind.equals("consume") ? 1 : 0,
@@ -213,9 +217,9 @@ public final class Temporal {
         }
     }
 
-    public static Map<String, String> failureDetail(ClassLoader loader, Throwable failure, String kind, boolean sent)
+    public static Map<String, String> failureDetail(ClassLoader loader, Throwable failure, String kind)
             throws ReflectiveOperationException {
-        var detail = new HashMap<>(Map.of("error", failure.getClass().getName(), "sent", String.valueOf(sent)));
+        var detail = new HashMap<>(Map.of("error", failure.getClass().getName()));
         if (kind.equals("consume")) {
             Class<?> applicationFailure = Class.forName("io.temporal.failure.ApplicationFailure", false, loader);
             if (applicationFailure.isInstance(failure)) {
@@ -223,8 +227,15 @@ public final class Temporal {
             }
         } else {
             Class<?> statusType = Class.forName("io.grpc.Status", false, loader);
-            Object status = statusType.getMethod("fromThrowable", Throwable.class).invoke(null, failure);
-            detail.put("code", statusType.getMethod("getCode").invoke(status).toString());
+            Class<?> checked = Class.forName("io.grpc.StatusException", false, loader);
+            Class<?> unchecked = Class.forName("io.grpc.StatusRuntimeException", false, loader);
+            for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+                if (checked.isInstance(cause) || unchecked.isInstance(cause)) {
+                    Object status = statusType.getMethod("fromThrowable", Throwable.class).invoke(null, failure);
+                    detail.put("code", statusType.getMethod("getCode").invoke(status).toString());
+                    break;
+                }
+            }
         }
         return detail;
     }
