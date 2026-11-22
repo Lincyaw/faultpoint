@@ -126,7 +126,7 @@ def print_candidate_paths() -> None:
     parser = argparse.ArgumentParser(description=print_candidate_paths.__doc__)
     parser.add_argument("facts", type=Path, help="A fact file: one fact per line, in sequence order.")
     parser.add_argument("settings", type=Path, help="The compute settings, a JSON object.")
-    parser.add_argument("--limit", type=int, help="The most paths to print.")
+    parser.add_argument("--limit", type=int, default=20, help="The most paths to print, best first.")
     arguments = parser.parse_args()
     found = candidate_paths(FactGraph(read_facts(arguments.facts),
                                       ComputeSettings.model_validate_json(arguments.settings.read_bytes())))

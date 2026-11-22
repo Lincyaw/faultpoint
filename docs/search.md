@@ -34,7 +34,7 @@
 - **核心包 `faultsearch`**（`search/`）：只依赖 `faultpoint[tools]` 和数值库，可以按 git 子目录安装。它定义只追加的事实（搜索运行、故障点表、系统拓扑、负载变体，以及评议、等价、作废），由事实算出图的 `compute_graph`，规划 `plan`，以及执行器接口。图是事实的函数：处理记录、边、链和路径判定都由事实重新算出，不另存。计算设置只含比较、束和簇的参数，faultsearch 的 commit 固定其余的一切。
   - 每个事实有身份，同一身份只写一次；内容是去掉序号、集合排好序的 JSON，两个同一身份的事实内容必须相同。作废按身份列出被作废的事实，所以它是幂等的。
   - 候选路径供构造使用：取带判定反馈的拼接中保留下来、终止于用户的链，只靠拼接得到的跨层路径在前，其余按原排名在后；有“不成立”评议的路径排到最后，所以新增这样的评议不会让它的名次上升。路径的身份是起点故障和各跳的偏离，与替代注入无关；几条链是同一条路径时取排名最好的一条。
-  - 命令：`faultsearch-facts-schema` 输出事实的 JSON Schema；`faultsearch-normalize-facts` 从文件或标准输入读事实，逐行输出 `{kind, identity, content}`，事实无效或同一身份内容不同时以非零退出；`faultsearch-candidate-paths` 由事实文件和计算设置输出候选路径；`faultsearch-candidate-paths-schema` 和 `faultsearch-compute-settings-schema` 输出这两者的 JSON Schema。
+  - 命令：`faultsearch-facts-schema` 输出事实的 JSON Schema；`faultsearch-normalize-facts` 从文件或标准输入读事实，逐行输出 `{kind, identity, content}`，事实无效或同一身份内容不同时以非零退出；`faultsearch-candidate-paths` 由事实文件和计算设置输出候选路径，缺省前 20 条；`faultsearch-candidate-paths-schema` 和 `faultsearch-compute-settings-schema` 输出这两者的 JSON Schema。
 - **本地包 `faultsearch-local`**（`search/local/`）：在本机容器中运行示例系统的执行器和命令行。示例系统以入口点 `faultsearch.systems` 注册。
 
 `faultsearch search EXPERIMENT` 按阶段规划并运行，直到规划结束：
