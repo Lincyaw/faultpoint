@@ -138,6 +138,7 @@ impl Placer<'_> {
             "check" => self.placement.check,
             "loop" => self.placement.loops,
             "call" => self.placement.call,
+            "rpc_server" => true,
             _ => !self.placement.clock.is_empty(),
         };
         switched && self.kinds.is_none_or(|kinds| kinds.iter().any(|allowed| allowed == kind))
@@ -325,16 +326,16 @@ impl VisitMut for Placer<'_> {
             return;
         }
         visit_mut::visit_expr_mut(self, node);
-        if !self.prefix.is_empty() {
-            return;
-        }
-        if let Expr::Call(call) = node
+        if self.allows("rpc_server") && let Expr::Call(call) = node
             && let Expr::Path(path) = call.func.as_ref()
             && last_segments(&path.path, 2) == "axum::serve"
             && call.args.len() == 2
         {
             layered(call.args.iter_mut().nth(1).expect("two arguments"));
             self.serves = true;
+        }
+        if !self.prefix.is_empty() {
+            return;
         }
         if let Some(store) = sqlx_store(node) {
             *node = store;
@@ -562,8 +563,37 @@ fn place_files(files: &[PathBuf], root: &Path, prefix: &str, kinds: Option<&[Str
     (points, serves, stores)
 }
 
-/// Copies each dependency crate the placement scope names into the copy, places points in its library sources under
-/// "<crate>@<version>/", and patches the copy's crates.io dependency onto that copy.
+/// Rebase local dependency paths onto their build copies, keeping unselected dependencies at their original paths.
+fn relocate_paths(package: &cargo_metadata::Package, manifest_path: &Path, target: &Path,
+                  copies: &HashMap<PathBuf, PathBuf>) {
+    let mut manifest: toml_edit::DocumentMut = std::fs::read_to_string(manifest_path).expect("cannot read Cargo.toml")
+        .parse().expect("Cargo.toml is not valid TOML");
+    for dependency in &package.dependencies {
+        let Some(original) = &dependency.path else { continue };
+        let path = copies.get(original.as_std_path()).map_or_else(|| original.as_std_path().to_path_buf(), |copy| {
+            if manifest_path.parent() == Some(target) {
+                copy.strip_prefix(target).expect("a dependency copy is under the build copy").to_path_buf()
+            } else {
+                Path::new("..").join(copy.file_name().expect("a dependency copy has a name"))
+            }
+        });
+        let table = match dependency.kind {
+            cargo_metadata::DependencyKind::Development => "dev-dependencies",
+            cargo_metadata::DependencyKind::Build => "build-dependencies",
+            _ => "dependencies",
+        };
+        let owner = match &dependency.target {
+            Some(platform) => &mut manifest["target"][platform.to_string()],
+            None => manifest.as_item_mut(),
+        };
+        let name = dependency.rename.as_ref().unwrap_or(&dependency.name);
+        owner[table][name]["path"] = toml_edit::value(path.display().to_string());
+    }
+    std::fs::write(manifest_path, manifest.to_string()).expect("cannot write Cargo.toml");
+}
+
+/// Copies scoped libraries and local dependency server boundaries into the build, with registry patches or paths
+/// pointing to their copies.
 fn place_scope(target: &Path, sdk: &Path, service: &str, placement: &Placement) -> Vec<PointEntry> {
     let metadata = cargo_metadata::MetadataCommand::new().manifest_path(target.join("Cargo.toml")).exec()
         .expect("cargo metadata failed on the copy");
@@ -573,12 +603,21 @@ fn place_scope(target: &Path, sdk: &Path, service: &str, placement: &Placement) 
     let mut points = Vec::new();
     let excluded: Vec<&str> = ALWAYS_EXCLUDED.iter().copied().chain(placement.exclude.iter().map(String::as_str)).collect();
     let mut scope = placement.scope.clone();
+    let root = metadata.root_package().expect("the rewritten crate is a package");
+    let copies: HashMap<PathBuf, PathBuf> = metadata.packages.iter()
+        .filter(|package| package.source.is_none() && package.id != root.id && !excluded.contains(&package.name.as_str()))
+        .map(|package| (package.manifest_path.parent().expect("a manifest is in a directory").as_std_path().to_path_buf(),
+                       target.join(SCOPE_DIRECTORY).join(format!("{}-{}", package.name, package.version)))).collect();
     for package in &metadata.packages {
-        if ["reqwest", "tonic"].contains(&package.name.as_str()) && package.version.major == 0 && package.version.minor == 12
+        let client = ["reqwest", "tonic"].contains(&package.name.as_str())
+            && package.version.major == 0 && package.version.minor == 12;
+        let local = copies.contains_key(package.manifest_path.parent().expect("a manifest is in a directory").as_std_path());
+        if (client || local)
             && !excluded.contains(&package.name.as_str())
             && !scope.iter().any(|entry| entry.include == package.name || entry.include == format!("{}@{}", package.name, package.version)) {
             scope.push(faultpoint::config::ScopeEntry {
-                include: format!("{}@{}", package.name, package.version), kinds: Some(vec!["rpc_client".into()]),
+                include: format!("{}@{}", package.name, package.version),
+                kinds: Some(vec![if client { "rpc_client" } else { "rpc_server" }.into()]),
             });
         }
     }
@@ -599,15 +638,19 @@ fn place_scope(target: &Path, sdk: &Path, service: &str, placement: &Placement) 
         files.retain(|file| file.starts_with(&sources));
         files.sort();
         let prefix = format!("{}@{}/", package.name, package.version);
-        points.extend(place_files(&files, &copy, &prefix, entry.kinds.as_deref(), service, placement).0);
+        let (placed, serves, stores) = place_files(&files, &copy, &prefix, entry.kinds.as_deref(), service, placement);
+        points.extend(placed);
         let client = package.version.major == 0 && package.version.minor == 12;
         match package.name.as_str() {
             "reqwest" if client => clients::rewrite_reqwest(&copy),
             "tonic" if client => clients::rewrite_tonic(&copy),
             _ => {}
         }
-        let client_features = if client && ["reqwest", "tonic"].contains(&package.name.as_str()) { &["client"][..] } else { &[] };
-        require_sdk(&copy, sdk, client_features);
+        let client = client && ["reqwest", "tonic"].contains(&package.name.as_str());
+        let features: Vec<&str> = [(client, "client"), (serves, "tower"), (stores, "store")].into_iter()
+            .filter_map(|(wired, feature)| wired.then_some(feature)).collect();
+        relocate_paths(package, &copy.join("Cargo.toml"), target, &copies);
+        require_sdk(&copy, sdk, &features);
         let mut patch = toml_edit::InlineTable::new();
         patch.insert("path", format!("{SCOPE_DIRECTORY}/{name}").into());
         let patches = manifest["patch"].or_insert(toml_edit::table()).as_table_mut().expect("[patch] is a table");
@@ -615,6 +658,7 @@ fn place_scope(target: &Path, sdk: &Path, service: &str, placement: &Placement) 
         patches["crates-io"].or_insert(toml_edit::table())[package.name.as_str()] = toml_edit::value(patch);
     }
     std::fs::write(&manifest_path, manifest.to_string()).expect("cannot write Cargo.toml");
+    relocate_paths(root, &manifest_path, target, &copies);
     points
 }
 
