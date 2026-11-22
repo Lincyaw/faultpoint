@@ -10,18 +10,21 @@ from faultsearch.allocation import Allocation, AllocationSettings, Strategy
 from faultsearch.catalog import (FROZEN, ActionTable, Catalog, Fault, build_catalog, control_executions, point_layer,
                                  point_manifests, point_scoped, read_manifests)
 from faultsearch.chains import Stitcher, Stitching
-from faultsearch.counterfactual import EffectKey, NamedWorkload, Scenarios, tenant_names
+from faultsearch.counterfactual import EffectKey, Group, NamedWorkload, Scenarios, tenant_names
 from faultsearch.edges import Acceptance, Condition, EdgeSet, EffectMap, counterpart_assignments, holds
 from faultsearch.evidence import MappingFeedback
-from faultsearch.graph import compute_graph, installed_settings
+from faultsearch.execution import RunRequest
+from faultsearch.facts import Purpose
+from faultsearch.graph import FactRepetitions, compute_graph, installed_settings
 from faultsearch.validation import (Headroom, Selection, Validations, adjudications, chosen_runs, headroom,
                                     mapping_checks, merged_workload, merged_workloads)
 from pydantic import BaseModel, TypeAdapter
 
 from faultsearch_local.budget import BUDGETS, Plan, Trajectory, budget_table, simulate
 from faultsearch_local.exploration import Exploration, extended_allocation, phased_allocation, random_allocation
-from faultsearch_local.facts_file import FACTS, experiment_facts, read_facts, write_facts
-from faultsearch_local.graph_check import graph_differences
+from faultsearch_local.executor import LocalExecutor
+from faultsearch_local.facts_file import FACTS, FactLog, read_facts, write_facts
+from faultsearch_local.run_directories import experiment_facts, graph_differences
 from faultsearch_local.refill import candidate_phase
 from faultsearch_local.report import render, summarise
 from faultsearch_local.runner import Runner, RunSettings, treatment_record
@@ -430,19 +433,30 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
     statuses and every effect: a check of what a constructed system does, before a search explores it."""
     store = Store(experiment)
     explored = SYSTEMS[system]
-    runner = Runner(store, store.record_input(RunSettings(
+    settings = store.record_input(RunSettings(
         sdk=sdk_root.resolve(), commit=explored.verified_build(sdk_root.resolve()), repetitions=repetitions,
         alpha=alpha, min_mean_increase=min_mean_increase, workers=workers, pack_tenants=False, system=system,
-        instrumentation=explored.instrumentation), RUN_SETTINGS), explored, max_load)
+        instrumentation=explored.instrumentation), RUN_SETTINGS)
+    log = FactLog(store.path(FACTS))
+    executor = LocalExecutor(store, settings, explored, log, max_load)
     scenarios = recorded_scenarios(store, explored)
-    pairs = [(Fault(point=item.point, action=item.action, layer=point_layer(item.point, explored.upstream),
-                    scoped=point_scoped(item.point, point_layer(item.point, explored.upstream), runner.kinds),
-                    probability=item.probability),
-              merged_workload(item.condition, scenarios))
-             for item in TypeAdapter(list[Trial]).validate_json(trials.read_bytes())]
-    for (fault, workload), record in zip(pairs, runner.isolated_treatments(pairs), strict=True):
-        typer.echo(f"== {fault.key} in {workload.name}: statuses {record.statuses[0]}, injected {record.injected}"
-                   + (f", refused: {record.refusal}" if record.refusal else ""))
+    kinds = KindTable.installed()
+    requests = [RunRequest(workload=merged_workload(item.condition, scenarios), faults=(Fault(
+        point=item.point, action=item.action, layer=point_layer(item.point, explored.upstream),
+        scoped=point_scoped(item.point, point_layer(item.point, explored.upstream), kinds),
+        probability=item.probability),), purpose=Purpose.PATH, repetitions=repetitions)
+        for item in TypeAdapter(list[Trial]).validate_json(trials.read_bytes())]
+    controls = [RunRequest(workload=workload, purpose=Purpose.PATH, repetitions=repetitions)
+                for workload in {request.workload.name: request.workload for request in requests}.values()]
+    executor.run(controls + requests)
+    repetitions_read = FactRepetitions(log.snapshot().standing_runs(), installed_settings().model_copy(
+        update={"alpha": alpha, "min_mean_increase": min_mean_increase}))
+    labels = {control.workload.name: tuple(control.labels()) for control in controls}
+    for request in requests:
+        record = repetitions_read.group_records(Group(workload=request.workload, faults=request.faults),
+                                                labels[request.workload.name], request.labels())[0]
+        typer.echo(f"== {record.fault.key} in {request.workload.name}: statuses {record.statuses[0]}, injected "
+                   f"{record.injected}, seeds {record.seeds}" + (f", refused: {record.refusal}" if record.refusal else ""))
         for effect in record.effects:
             if holds(effect, min_count_increase):
                 typer.echo(f"   {EffectKey.of(effect).key} {effect.verdict} {effect.control} -> {effect.treatment}")
