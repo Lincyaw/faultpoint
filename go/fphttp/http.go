@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"faultpoint/internal/action"
 
 	"github.com/felixge/httpsnoop"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 )
 
@@ -35,12 +37,14 @@ const (
 var (
 	enabled           bool
 	identifierSegment *regexp.Regexp
+	clientBaggage     []baggage.Member
 	propagator        = propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
 )
 
 func init() {
 	options := struct {
-		IdentifierSegment string `json:"identifier_segment"`
+		IdentifierSegment string            `json:"identifier_segment"`
+		ClientBaggage     map[string]string `json:"client_baggage"`
 	}{IdentifierSegment: defaultIdentifierSegment}
 	enabled = faultpoint.Register(faultpoint.Plugin{Name: "http", Options: &options, Actions: map[string][]string{
 		"rpc_server": {"fail", "fail_after", "delay", "crash"},
@@ -52,6 +56,13 @@ func init() {
 		faultpoint.Abort("option identifier_segment of http: %v", err)
 	}
 	identifierSegment = pattern
+	for key, value := range options.ClientBaggage {
+		member, err := baggage.NewMember(key, url.PathEscape(value))
+		if err != nil {
+			faultpoint.Abort("option client_baggage of http: %v", err)
+		}
+		clientBaggage = append(clientBaggage, member)
+	}
 }
 
 // ValidateRule rejects native protocol codes at HTTP points before a rule enters force.
@@ -394,6 +405,21 @@ func (c client) RoundTrip(request *http.Request) (*http.Response, error) {
 		base = http.DefaultTransport
 	}
 	ctx := request.Context()
+	if len(clientBaggage) > 0 {
+		bag := baggage.FromContext(ctx)
+		wire := baggage.FromContext((propagation.Baggage{}).Extract(context.Background(), propagation.HeaderCarrier(request.Header)))
+		for _, member := range append(wire.Members(), clientBaggage...) {
+			if bag.Member(member.Key()).Key() != "" {
+				continue
+			}
+			var err error
+			bag, err = bag.SetMember(member)
+			if err != nil {
+				faultpoint.Abort("option client_baggage of http: %v", err)
+			}
+		}
+		ctx = baggage.ContextWithBaggage(ctx, bag)
+	}
 	var wrote atomic.Bool
 	request = request.Clone(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		WroteRequest: func(info httptrace.WroteRequestInfo) { wrote.Store(info.Err == nil) },
