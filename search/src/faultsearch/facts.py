@@ -169,8 +169,8 @@ class SearchRun(FactBody):
     statuses: Statuses
     refusal: str | None = None
     """What a service said when it refused one of the rules, which then ended the run."""
-    observations: tuple[str, ...]
-    """The observation files the tallies come from."""
+    observations: tuple[str, ...] = Field(min_length=1)
+    """The observation files the tallies come from; every run leaves at least one."""
 
     @property
     def label(self) -> str:
