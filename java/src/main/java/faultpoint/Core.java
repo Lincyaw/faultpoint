@@ -119,6 +119,10 @@ public final class Core {
         this.context = context;
     }
 
+    public ContextProvider contextProvider() {
+        return context;
+    }
+
     void start() {
         for (RuleSource source : sources) {
             source.start(this::apply, reason -> abort("unusable rules: " + reason));

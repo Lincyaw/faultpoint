@@ -4,3 +4,4 @@ faultpoint.HttpClients$HttpClientPlugin
 faultpoint.Jdbc$JdbcPlugin
 faultpoint.SpringHttp$SpringHttpPlugin
 faultpoint.Lettuce$LettucePlugin
+faultpoint.Temporal$TemporalPlugin
