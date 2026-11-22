@@ -20,12 +20,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const locatorPrefix = "gRPC "
-
 var (
 	enabled = faultpoint.Register(faultpoint.Plugin{Name: "grpc", Actions: map[string][]string{
 		"rpc_server": {"fail", "fail_after", "delay", "crash"},
-	}, Serves: func(locator string) bool { return strings.HasPrefix(locator, locatorPrefix) },
+	}, Serves: func(locator string) bool { return strings.HasPrefix(locator, faultpoint.GRPCLocatorPrefix) },
 		Refuse: func(rule *faultpoint.Rule) error {
 			if rule.Action.Kind != "fail" && rule.Action.Kind != "fail_after" {
 				return nil
@@ -123,7 +121,7 @@ func take(ctx context.Context, method string) *serverCall {
 	if incoming, found := metadata.FromIncomingContext(ctx); found {
 		ctx = propagator.Extract(ctx, metadataCarrier{MD: incoming})
 	}
-	call := &serverCall{ctx: context.WithValue(ctx, serverCallKey{}, true), point: faultpoint.PointID(faultpoint.Service(), "rpc_server", locatorPrefix+method),
+	call := &serverCall{ctx: context.WithValue(ctx, serverCallKey{}, true), point: faultpoint.PointID(faultpoint.Service(), "rpc_server", faultpoint.GRPCLocatorPrefix+method),
 		started: time.Now()}
 	call.rule = faultpoint.Decide(ctx, call.point, action.Before...)
 	if call.rule != nil {

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -44,12 +45,28 @@ func init() {
 	enabled = faultpoint.Register(faultpoint.Plugin{Name: "http", Options: &options, Actions: map[string][]string{
 		"rpc_server": {"fail", "fail_after", "delay", "crash"},
 		"rpc_client": {"fail", "fail_after", "duplicate", "delay", "crash"},
-	}})
+	}, Serves: func(locator string) bool { return !strings.HasPrefix(locator, faultpoint.GRPCLocatorPrefix) },
+		Refuse: ValidateRule})
 	pattern, err := regexp.Compile(options.IdentifierSegment)
 	if err != nil {
 		faultpoint.Abort("option identifier_segment of http: %v", err)
 	}
 	identifierSegment = pattern
+}
+
+// ValidateRule rejects native protocol codes at HTTP points before a rule enters force.
+func ValidateRule(rule *faultpoint.Rule) error {
+	if rule.Action.Kind != "fail" && rule.Action.Kind != "fail_after" {
+		return nil
+	}
+	var params map[string]json.RawMessage
+	if err := json.Unmarshal(rule.Action.Params, &params); err != nil {
+		return err
+	}
+	if _, supplied := params["code"]; supplied {
+		return errors.New("HTTP failures accept status or error, not code")
+	}
+	return nil
 }
 
 // pathTemplate replaces the identifier segments of a path, so that one route is one point.

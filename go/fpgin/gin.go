@@ -3,6 +3,8 @@
 package fpgin
 
 import (
+	"strings"
+
 	"faultpoint"
 	"faultpoint/fphttp"
 
@@ -11,7 +13,8 @@ import (
 
 var enabled = faultpoint.Register(faultpoint.Plugin{Name: "gin", Actions: map[string][]string{
 	"rpc_server": {"fail", "fail_after", "delay", "crash"},
-}})
+}, Serves: func(locator string) bool { return !strings.HasPrefix(locator, faultpoint.GRPCLocatorPrefix) },
+	Refuse: fphttp.ValidateRule})
 
 // Instrument adds the rpc_server middleware to an engine where it is created, before any route, and returns the
 // engine; the engine of a plugin that is not enabled is returned as it is.

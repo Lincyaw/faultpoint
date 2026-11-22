@@ -13,6 +13,9 @@ import (
 
 const ruleFilePollInterval = 500 * time.Millisecond
 
+// GRPCLocatorPrefix distinguishes native gRPC points from HTTP points sharing the RPC kinds.
+const GRPCLocatorPrefix = "gRPC "
+
 // RuleSet is one experiment, as spec/rules.schema.json defines it.
 type RuleSet struct {
 	Experiment string `json:"experiment"`
