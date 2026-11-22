@@ -16,7 +16,7 @@ from faultsearch.graph import ComputeSettings, FactGraph, FactRepetitions, compu
 from faultsearch.plan import PlanSettings, PlanState, Refill, ValidationSettings, search
 from faultsearch.recording import point_inventory
 from faultsearch.validation import merged_workload
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from faultsearch_local.budget import BUDGETS, Comparison, Plan, Trajectory, budget_table
 from faultsearch_local.executor import LocalExecutor, RunSettings
@@ -94,6 +94,8 @@ def search_command(
         single_scenario_cross_layer: Annotated[int, typer.Option(
             help="Best chains across layers one scenario showed, judged as controls.")] = 3,
         chain: Annotated[list[str], typer.Option(help="A chain to judge besides, by its key.")] = [],
+        instrumentation: Annotated[Path | None, typer.Option(
+            help="The system's instrumentation JSON; omitted uses the registered system's configuration.")] = None,
         rebuild: Annotated[bool, typer.Option(help="Build the SDK and the system first.")] = False,
         max_load: MaxLoad = math.inf) -> None:
     """Plan and run a search until its plan ends: the controls of every scenario, the exploring stages, the refill,
@@ -105,7 +107,9 @@ def search_command(
     commit = explored.build(sdk) if rebuild else explored.verified_build(sdk)
     run_settings = store.record_input(RunSettings(
         sdk=sdk, commit=commit, repetitions=repetitions, alpha=alpha, min_mean_increase=min_mean_increase,
-        workers=workers, pack_tenants=pack_tenants, system=system, instrumentation=explored.instrumentation),
+        workers=workers, pack_tenants=pack_tenants, system=system,
+        instrumentation=explored.instrumentation if instrumentation is None
+        else TypeAdapter(dict[str, JsonValue]).validate_json(instrumentation.read_bytes())),
         RUN_SETTINGS)
     allocation = store.record_input(AllocationSettings(budget=budget, seed=seed, round_robin_share=round_robin_share,
                                                        cluster_distance=cluster_distance, epsilon=epsilon, batch=batch),

@@ -100,14 +100,12 @@ class Responses(BaseModel):
 
 
 class Instrumentation(BaseModel):
-    """Whether faultpoint runs in a repetition and what its kernel agent observes. With faultpoint, every service gets
-    its SDK and the FAULTPOINT_ variables and the agent watches the upstream containers; without it, no service gets
-    either, so that a rewritten build stays inactive, and no agent runs."""
+    """Whether services load their SDK, and what the optional kernel agent observes."""
 
     model_config = FROZEN
 
     attached: bool = True
-    agent: AgentObservation = AgentObservation()
+    agent: AgentObservation | None = AgentObservation()
 
 
 def run(command: list[str], directory: Path, environment: dict[str, str] | None = None) -> None:
@@ -426,7 +424,8 @@ def isolated_repetition(directory: Path, workload: BaseModel, rules: dict[str, A
         upstream = start_upstream(prefix, sql, redis_commands)
         (directory / UPSTREAM_FILE).write_text(upstream.model_dump_json())
         agent = start_agent(directory, directory / RULES_FILE, upstream, sdk, prefix, FLUSH_SECONDS,
-                            instrumentation.agent, build / HOOKS_DIRECTORY) if instrumentation.attached else None
+                            instrumentation.agent, build / HOOKS_DIRECTORY) \
+            if instrumentation.attached and instrumentation.agent is not None else None
         namespaced_run(directory, sdk, module, build)
         if agent is not None:
             stop_agent(agent, directory)
