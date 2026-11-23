@@ -106,11 +106,11 @@ class Placer {
     let locator = `${this.path}:${name}`;
     if (anchor !== null) {
       const text = this.printer.printNode(ts.EmitHint.Unspecified, anchor, this.source);
-      const base = `${locator}#${createHash("sha256").update(text).digest("hex").slice(0, 8)}`;
-      const ordinal = this.ordinals.get(base) ?? 0;
-      this.ordinals.set(base, ordinal + 1);
-      locator = ordinal === 0 ? base : `${base}.${ordinal}`;
+      locator = `${locator}#${createHash("sha256").update(text).digest("hex").slice(0, 8)}`;
     }
+    const ordinal = this.ordinals.get(locator) ?? 0;
+    this.ordinals.set(locator, ordinal + 1);
+    locator = ordinal === 0 ? locator : `${locator}.${ordinal}`;
     const id = pointId(this.service, kind, locator);
     const line = this.source.getLineAndCharacterOfPosition(node.getStart(this.source)).line + 1;
     const code = node.getText(this.source).split("\n")[0].slice(0, CODE_WIDTH);

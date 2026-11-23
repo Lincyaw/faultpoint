@@ -246,11 +246,12 @@ def read_manifests(directory: Path) -> tuple[Manifest, ...]:
 
 def point_manifests(manifests: tuple[Manifest, ...]) -> dict[str, Manifest]:
     """The manifest that lists each point, with its language and the errors its build registers: a service can have
-    several, such as its SDK's and that of its native hook points; a point no manifest lists has none."""
+    several, such as its SDK's and that of its native hook points. All placements within that manifest retain their
+    entries; a point no manifest lists has none."""
     listed: dict[str, Manifest] = {}
     for manifest in manifests:
         for entry in manifest.points:
-            if entry.id in listed:
+            if entry.id in listed and listed[entry.id] is not manifest:
                 raise ValueError(f"{entry.id} is listed in the manifests of {listed[entry.id].service} and of "
                                  f"{manifest.service}")
             listed[entry.id] = manifest
