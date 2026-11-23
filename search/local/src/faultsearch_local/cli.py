@@ -185,7 +185,10 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
           min_mean_increase: float = 0.5,
           min_count_increase: Annotated[float, typer.Option(
               help="The smallest relative increase of a count that counts as an effect.")] = 0.2,
-          max_load: MaxLoad = math.inf, revision: Revision = None) -> None:
+          max_load: MaxLoad = math.inf, revision: Revision = None,
+          instrumentation: Annotated[Path | None, typer.Option(
+              help="The system's instrumentation JSON; omitted uses the registered system's configuration.")] = None,
+          ) -> None:
     """Inject given faults alone in given workloads, against controls of those workloads, and show every tenant's
     statuses and every effect: a check of what a constructed system does, before a search explores it."""
     store = Store(experiment)
@@ -194,7 +197,8 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
         sdk=sdk_root.resolve(), commit=explored.verified_build(sdk_root.resolve()), revision=revision,
         repetitions=repetitions,
         alpha=alpha, min_mean_increase=min_mean_increase, workers=workers, pack_tenants=False, system=system,
-        instrumentation=explored.instrumentation), RUN_SETTINGS)
+        instrumentation=explored.instrumentation if instrumentation is None
+        else TypeAdapter(dict[str, JsonValue]).validate_json(instrumentation.read_bytes())), RUN_SETTINGS)
     log = FactLog(store.path(FACTS_FILE))
     scenarios = recorded_scenarios(store, explored)
     kinds = KindTable.installed()
