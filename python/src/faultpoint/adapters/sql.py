@@ -58,7 +58,7 @@ def quiet_classification() -> None:
 @functools.lru_cache(maxsize=STATEMENT_CACHE_SIZE)
 def statement_point(sql: str, dialect: str | None) -> tuple[StoreKind, str]:
     """The kind and locator of a statement or script: the tables it touches, not the names of its CTEs, and the
-    hash of its shape without literals; it reads only when every statement is a query that writes nowhere in its
+    hash of its shape without literals or comments; it reads only when every statement is a query that writes nowhere in its
     tree."""
     token = CLASSIFYING.set(True)
     try:
@@ -71,7 +71,7 @@ def statement_point(sql: str, dialect: str | None) -> tuple[StoreKind, str]:
         tables = sorted({table.name for statement in statements for table in statement.find_all(exp.Table)
                          if table.name not in {cte.alias for cte in statement.find_all(exp.CTE)}})
         shape = ";".join(statement.transform(
-            lambda node: exp.Placeholder() if isinstance(node, exp.Literal) else node).sql(dialect=dialect)
+            lambda node: exp.Placeholder() if isinstance(node, exp.Literal) else node).sql(dialect=dialect, comments=False)
             for statement in statements)
     finally:
         CLASSIFYING.reset(token)
