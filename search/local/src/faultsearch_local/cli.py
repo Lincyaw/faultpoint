@@ -11,7 +11,8 @@ from faultsearch.catalog import FROZEN, Fault, point_layer, point_scoped
 from faultsearch.counterfactual import EffectKey, Group, Scenarios
 from faultsearch.edges import Condition, EffectMap, holds
 from faultsearch.execution import RunRequest
-from faultsearch.facts import FACTS_FILE, LoadVariants, PointInventory, Purpose, SystemTopology, read_facts, write_facts
+from faultsearch.facts import (FACTS_FILE, GitRevision, LoadVariants, PointInventory, Purpose, SystemTopology,
+                               read_facts, write_facts)
 from faultsearch.graph import ComputeSettings, FactGraph, FactRepetitions, compute_graph
 from faultsearch.plan import PlanSettings, PlanState, Refill, ValidationSettings, search
 from faultsearch.recording import point_inventory
@@ -32,6 +33,7 @@ app = typer.Typer(no_args_is_help=True, help=(
     "workloads and their judgement end to end."))
 Experiment = Annotated[str, typer.Argument(help="The experiment's name, its directory under runs/search.")]
 SdkRoot = Annotated[Path, typer.Option(help="A clean checkout of the SDK commit the system runs with.")]
+Revision = Annotated[GitRevision | None, typer.Option(help="The Git revision of the business source actually built.")]
 SYSTEMS: Final = installed_systems()
 SHOP: Final = "shop"
 Explored = Annotated[str, typer.Option(help=f"The system to explore, one of {', '.join(SYSTEMS)}.")]
@@ -97,7 +99,7 @@ def search_command(
         instrumentation: Annotated[Path | None, typer.Option(
             help="The system's instrumentation JSON; omitted uses the registered system's configuration.")] = None,
         rebuild: Annotated[bool, typer.Option(help="Build the SDK and the system first.")] = False,
-        max_load: MaxLoad = math.inf) -> None:
+        max_load: MaxLoad = math.inf, revision: Revision = None) -> None:
     """Plan and run a search until its plan ends: the controls of every scenario, the exploring stages, the refill,
     the merged workloads' controls and the validation batches, every request's search runs appended to the
     experiment's facts. The settings are recorded the first time; a search resumes from its saved plan state."""
@@ -106,7 +108,7 @@ def search_command(
     explored = SYSTEMS[system]
     commit = explored.build(sdk) if rebuild else explored.verified_build(sdk)
     run_settings = store.record_input(RunSettings(
-        sdk=sdk, commit=commit, repetitions=repetitions, alpha=alpha, min_mean_increase=min_mean_increase,
+        sdk=sdk, commit=commit, revision=revision, repetitions=repetitions, alpha=alpha, min_mean_increase=min_mean_increase,
         workers=workers, pack_tenants=pack_tenants, system=system,
         instrumentation=explored.instrumentation if instrumentation is None
         else TypeAdapter(dict[str, JsonValue]).validate_json(instrumentation.read_bytes())),
@@ -183,13 +185,14 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
           min_mean_increase: float = 0.5,
           min_count_increase: Annotated[float, typer.Option(
               help="The smallest relative increase of a count that counts as an effect.")] = 0.2,
-          max_load: MaxLoad = math.inf) -> None:
+          max_load: MaxLoad = math.inf, revision: Revision = None) -> None:
     """Inject given faults alone in given workloads, against controls of those workloads, and show every tenant's
     statuses and every effect: a check of what a constructed system does, before a search explores it."""
     store = Store(experiment)
     explored = SYSTEMS[system]
     settings = store.record_input(RunSettings(
-        sdk=sdk_root.resolve(), commit=explored.verified_build(sdk_root.resolve()), repetitions=repetitions,
+        sdk=sdk_root.resolve(), commit=explored.verified_build(sdk_root.resolve()), revision=revision,
+        repetitions=repetitions,
         alpha=alpha, min_mean_increase=min_mean_increase, workers=workers, pack_tenants=False, system=system,
         instrumentation=explored.instrumentation), RUN_SETTINGS)
     log = FactLog(store.path(FACTS_FILE))

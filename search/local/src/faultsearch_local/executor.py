@@ -9,7 +9,7 @@ from faultpoint.tools.kinds import KindTable
 from faultsearch.catalog import FROZEN
 from faultsearch.counterfactual import Statuses
 from faultsearch.execution import RunRequest, repetition_seed
-from faultsearch.facts import SearchRun
+from faultsearch.facts import GitRevision, SearchRun
 from faultsearch.recording import REFUSAL_FILE, STATUSES_FILE, RunOrigin
 from pydantic import BaseModel, Field, JsonValue
 
@@ -34,6 +34,8 @@ class RunSettings(BaseModel):
 
     sdk: Path
     commit: str
+    revision: GitRevision | None = None
+    """The actual business source revision, independently of the SDK commit."""
     repetitions: int = Field(ge=2)
     alpha: float
     min_mean_increase: float
@@ -48,10 +50,9 @@ class RunSettings(BaseModel):
     deployment reads it."""
 
 
-def local_origin(store: Store, system: str, sdk_build: str) -> RunOrigin:
-    """The origin of an experiment's search runs on this host: the experiment, the system, which records no
-    revision, and the SDK commit its services were built with."""
-    return RunOrigin(source=store.root.name, system=system, revision=None, sdk_build=sdk_build,
+def local_origin(store: Store, system: str, sdk_build: str, revision: GitRevision | None) -> RunOrigin:
+    """The origin of an experiment's runs: its business revision and the SDK commit its services were built with."""
+    return RunOrigin(source=store.root.name, system=system, revision=revision, sdk_build=sdk_build,
                      build={"system": system}, environment=LOCAL_ENVIRONMENT)
 
 
@@ -65,7 +66,7 @@ class LocalExecutor:
         self.settings = settings
         self.system = system
         self.log = log
-        self.origin = local_origin(store, system.name, settings.commit)
+        self.origin = local_origin(store, system.name, settings.commit, settings.revision)
         self.max_load = max_load
         """The host's 1-minute load above which no new repetition starts while others still run."""
         self.kinds = KindTable.installed()

@@ -38,7 +38,7 @@ class RunImport:
 
     def __init__(self, store: Store, system: System, settings: RunSettings) -> None:
         self.store = store
-        self.origin = local_origin(store, system.name, settings.commit)
+        self.origin = local_origin(store, system.name, settings.commit, settings.revision)
         self.facts: list[Fact] = []
         self.taken: set[str] = set()
 
@@ -83,7 +83,7 @@ def experiment_facts(store: Store, system: System) -> Imported:
     variants = [scenario.name for scenario in scenarios.scenarios]
     for name in variants:
         taking.controls(controls[name], Purpose.EDGE)
-    taking.facts.append(PointInventory(sequence=len(taking.facts) + 1, system=system.name, revision=None,
+    taking.facts.append(PointInventory(sequence=len(taking.facts) + 1, system=system.name, revision=settings.revision,
                                        sdk_build=settings.commit, deployment=settings.instrumentation,
                                        controls=tuple(label for name in variants for label in controls[name].labels),
                                        manifests=read_manifests(system.manifests), configured=system.configured))
