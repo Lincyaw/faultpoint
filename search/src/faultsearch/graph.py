@@ -3,16 +3,23 @@ import json
 from collections import defaultdict
 from functools import cached_property
 from pathlib import Path
+from typing import Final
 
+import numpy as np
 from faultpoint.observations import ObservationRecord
+from faultpoint.points import PointKind
 from faultpoint.rules import Rule
-from faultpoint.tools.kinds import KindTable
+from faultpoint.tools.kinds import KindTable, manifest_violations
 from pydantic import BaseModel, Field
+from scipy.sparse import coo_array
+from scipy.sparse.csgraph import connected_components
 
 from faultsearch.allocation import Allocation, Assignment, Phase, Strategy, allocation_of
 from faultsearch.catalog import (
+    BOUNDARY_KINDS,
     FOLLOWING_SEPARATOR,
     FROZEN,
+    GRPC_METHOD,
     ActionTable,
     Catalog,
     Fault,
@@ -20,11 +27,13 @@ from faultsearch.catalog import (
     RpcPeers,
     build_catalog,
     control_executions,
+    point_kind,
     point_layer,
     point_manifests,
     point_scoped,
 )
-from faultsearch.chains import Stitcher, Stitching
+from faultsearch.chains import (CROSS_LAYER_KEPT, Chain, ChainWitness, Stitcher, Stitching, StitchSource, StitchSources,
+                                Witnesses, beam_search, ranked_chains)
 from faultsearch.counterfactual import (
     ControlRecord,
     Group,
@@ -33,19 +42,21 @@ from faultsearch.counterfactual import (
     TreatmentRecord,
     tenant_names,
 )
-from faultsearch.edges import Acceptance, Edge, EffectMap
+from faultsearch.edges import ERROR, Acceptance, Edge, EffectMap
 from faultsearch.evidence import MappingFeedback
 from faultsearch.facts import (
     CONTROL_GROUP,
     Facts,
+    Equivalence,
     LoadVariants,
     PointInventory,
+    PathIdentity,
     Purpose,
     SearchRun,
     SystemTopology,
     read_facts,
 )
-from faultsearch.natural import NaturalJudgement, natural_judgements
+from faultsearch.natural import NaturalJudgement, natural_comparisons, natural_judgements
 from faultsearch.validation import (
     Headroom,
     Validation,
@@ -57,6 +68,8 @@ from faultsearch.validation import (
     merged_workload,
     merged_workloads,
 )
+
+GO_LANGUAGE: Final = "go"
 
 
 class ComputeSettings(BaseModel):
@@ -112,6 +125,25 @@ class InventoryGraph(BaseModel):
     graph: PropagationGraph
 
 
+class EquivalenceGraph(BaseModel):
+    """Cross-inventory chains over original measured edges and explicit standing equivalences."""
+
+    model_config = FROZEN
+
+    equivalences: tuple[str, ...]
+    edges: tuple[Edge, ...]
+    chains: tuple[Chain, ...]
+    cycles: tuple[Chain, ...]
+
+
+class PathTarget(BaseModel):
+    """Native executable points at one actual inventory, retaining the chain's original source groups and key."""
+    model_config = FROZEN
+
+    inventory: str
+    chain: Chain
+
+
 class PropagationGraphs(BaseModel):
     """The independently measured graphs of every standing inventory, without implicit cross-inventory identity."""
 
@@ -120,6 +152,8 @@ class PropagationGraphs(BaseModel):
     settings: ComputeSettings
     through: int
     inventories: tuple[InventoryGraph, ...]
+    equivalence: EquivalenceGraph | None = Field(default=None, exclude_if=lambda graph: graph is None)
+    natural: tuple[NaturalJudgement, ...] = Field(default=(), exclude_if=lambda runs: not runs)
 
 
 class FactRepetitions(Repetitions):
@@ -403,10 +437,230 @@ class FactGraph:
             natural=self.natural)
 
 
+class EquivalentGraphs:
+    """Measured inventory graphs and the explicit point identities that can connect their edges."""
+
+    def __init__(self, facts: Facts, settings: ComputeSettings) -> None:
+        self.facts = facts
+        self.settings = settings
+        self.graphs = {inventory.identity: FactGraph(facts, settings, inventory)
+                       for inventory in facts.inventories()}
+
+    @cached_property
+    def equivalences(self) -> tuple[Equivalence, ...]:
+        voided = self.facts.voided()
+        return tuple(fact for fact in self.facts.facts if isinstance(fact, Equivalence)
+                     and fact.identity not in voided
+                     and fact.left.inventory in self.graphs and fact.right.inventory in self.graphs)
+
+    @cached_property
+    def known_points(self) -> dict[str, frozenset[str]]:
+        return {identity: frozenset({*graph.catalog.executions, *(fault.point for fault in graph.catalog.faults),
+                                    *point_manifests(graph.inventory.manifests), *graph.inventory.configured})
+                for identity, graph in self.graphs.items()}
+
+    @cached_property
+    def points(self) -> dict[tuple[str, str], tuple[str, str]]:
+        references = sorted({(reference.inventory, reference.point) for fact in self.equivalences
+                             for reference in (fact.left, fact.right)})
+        if not references:
+            return {}
+        for inventory, point in references:
+            if point not in self.known_points[inventory]:
+                raise ValueError(f"equivalence references absent point {point} in inventory {inventory}")
+        indexes = {reference: index for index, reference in enumerate(references)}
+        pairs = [(indexes[(fact.left.inventory, fact.left.point)], indexes[(fact.right.inventory, fact.right.point)])
+                 for fact in self.equivalences]
+        adjacency = coo_array((np.ones(len(pairs)), tuple(zip(*pairs, strict=True))),
+                              shape=(len(references), len(references)))
+        _, components = connected_components(adjacency, directed=False)
+        canonical = {int(component): min(reference for reference, group in zip(references, components, strict=True)
+                                         if group == component) for component in set(components)}
+        return {reference: canonical[int(component)] for reference, component in zip(references, components, strict=True)}
+
+    @cached_property
+    def sources(self) -> StitchSources:
+        return StitchSources(points=self.points, sources={identity: StitchSource(
+            allocation=graph.allocation, feedback=graph.feedback)
+            for identity, graph in self.graphs.items()})
+
+    @cached_property
+    def equivalence_graph(self) -> EquivalenceGraph | None:
+        if not self.equivalences:
+            return None
+        edges = [edge.model_copy(update={"inventory": identity}) for identity, graph in self.graphs.items()
+                 for edge in graph.edges]
+        trails, cycles = beam_search(edges, self.sources, self.settings.width, self.settings.max_hops, frozenset())
+        crossing = [trail for trail in trails if len({edge.inventory for edge in trail.edges}) > 1]
+        circular = [trail for trail in cycles if len({edge.inventory for edge in trail.edges}) > 1]
+        if not crossing and not circular:
+            return None
+        ranked = sorted((self.witnessed_chain(chain) for chain in ranked_chains(
+            crossing, self.sources, [], self.settings.min_count_increase, {})), key=Chain.rank, reverse=True)
+        cross_layer = [chain for chain in ranked if chain.crosses_layers and chain.terminal]
+        kept = {chain.key: chain for chain in (*ranked[:self.settings.kept], *cross_layer[:CROSS_LAYER_KEPT])}
+        return EquivalenceGraph(equivalences=tuple(fact.identity for fact in self.equivalences), edges=tuple(edges),
+            chains=tuple(sorted(kept.values(), key=Chain.rank, reverse=True)),
+            cycles=tuple(self.witnessed_chain(chain) for chain in ranked_chains(
+                circular, self.sources, [], self.settings.min_count_increase, {})))
+
+    @cached_property
+    def chains(self) -> dict[PathIdentity, Chain]:
+        found: dict[PathIdentity, Chain] = {}
+        for identity, graph in self.graphs.items():
+            for chain in (*graph.judged_stitching.top, *graph.judged_stitching.top_cross_layer):
+                found.setdefault(PathIdentity.from_chain(chain, identity), chain)
+        joined = self.equivalence_graph
+        if joined is not None:
+            for chain in joined.chains:
+                found.setdefault(PathIdentity.from_chain(chain, ""), chain)
+        return found
+
+    def path_chain(self, path: PathIdentity) -> Chain:
+        if path not in self.chains:
+            raise ValueError("the path has no standing measured chain under these compute settings")
+        return self.chains[path]
+
+    def targets(self, chain: Chain) -> tuple[PathTarget, ...]:
+        """Actual inventories where every source intervention and deviation has an explicit point mapping."""
+        targets = []
+        for identity, graph in self.graphs.items():
+            known = self.known_points[identity]
+            workload = merged_workload(chain.condition, graph.variants.scenarios).workload
+            if any(merged_workload(chain.condition, self.graphs[hop.inventory].variants.scenarios).workload != workload
+                   for hop in chain.hops if hop.inventory):
+                continue
+            hops = []
+            for hop in chain.hops:
+                if hop.inventory is None:
+                    raise ValueError("a cross-inventory path requires the inventory of every hop")
+                matched = []
+                for point in (hop.cause.point, hop.effect.point):
+                    canonical = self.points.get((hop.inventory, point), (hop.inventory, point))
+                    matches = [candidate for candidate in known
+                               if self.points.get((identity, candidate), (identity, candidate)) == canonical]
+                    if len(matches) != 1:
+                        break
+                    mapped = matches[0]
+                    if point_kind(point) in BOUNDARY_KINDS or point_kind(mapped) in BOUNDARY_KINDS:
+                        source_grpc = point.split(":", 2)[2].partition(" ")[0] == GRPC_METHOD
+                        target_grpc = mapped.split(":", 2)[2].partition(" ")[0] == GRPC_METHOD
+                        if point_kind(point) != point_kind(mapped) or source_grpc != target_grpc:
+                            break
+                    matched.append(mapped)
+                if len(matched) != 2:
+                    break
+                cause_point, effect_point = matched
+                layer = point_layer(cause_point, graph.topology.upstream)
+                cause = hop.cause.model_copy(update={"point": cause_point, "layer": layer,
+                                                    "scoped": point_scoped(cause_point, layer, graph.kinds)})
+                group = Group(workload=merged_workload(chain.condition, graph.variants.scenarios), faults=(cause,))
+                rules = group.ruleset(group.labels(2)[0])
+                if graph.kinds.violations(rules) or manifest_violations(rules, graph.inventory.manifests):
+                    break
+                manifest = point_manifests(graph.inventory.manifests).get(cause_point)
+                if (manifest is not None and manifest.language == GO_LANGUAGE
+                        and any(rule.kind == PointKind.CALL and rule.action.model_dump().get(ERROR) is not None
+                                and rule.action.model_dump()[ERROR] not in manifest.errors for rule in rules.rules)):
+                    break
+                hops.append(hop.model_copy(update={"cause": cause,
+                    "effect": hop.effect.model_copy(update={"point": effect_point}),
+                    "effect_layer": point_layer(effect_point, graph.topology.upstream)}))
+            if len(hops) == len(chain.hops):
+                targets.append(PathTarget(inventory=identity, chain=chain.model_copy(
+                    update={"hops": tuple(hops), "origin": chain.key})))
+        return tuple(targets)
+
+    def headroom(self, chain: Chain, target: PathTarget) -> Headroom:
+        """Compare the original edges' measured levels with actual controls at an executable target."""
+        graph = self.graphs[target.inventory]
+        workload = merged_workload(chain.condition, graph.variants.scenarios)
+        if workload.name not in graph.controls:
+            return Headroom(chains=())
+        return headroom([target.chain], list(self.target_edges(chain, target)), graph.variants.scenarios,
+                        self.settings.min_count_increase, [graph.controls[workload.name]], graph.repetitions)
+
+    def target_edges(self, chain: Chain, target: PathTarget) -> tuple[Edge, ...]:
+        """Project measured edge endpoints onto their unique executable target, retaining original sightings."""
+        edges = []
+        for source_hop, target_hop in zip(chain.hops, target.chain.hops, strict=True):
+            if source_hop.inventory is None:
+                raise ValueError("a cross-inventory path requires the inventory of every hop")
+            edge = next(edge for edge in self.graphs[source_hop.inventory].edges
+                        if edge.cause == source_hop.cause and edge.effect == source_hop.effect)
+            edges.append(edge.model_copy(update={"cause": target_hop.cause, "effect": target_hop.effect,
+                                                 "effect_layer": target_hop.effect_layer}))
+        return tuple(edges)
+
+    @cached_property
+    def witnesses(self) -> dict[str, Witnesses]:
+        return {identity: Witnesses.of([record for record in graph.records if any(record.injected)],
+                                      self.settings.min_count_increase) for identity, graph in self.graphs.items()}
+
+    def witnessed_chain(self, chain: Chain) -> Chain:
+        """Judge visibility in each actual target's native EDGE records, without pooling contexts."""
+        witnesses: list[ChainWitness] = []
+        comparable = []
+        shared_scenario = False
+        for target in self.targets(chain):
+            graph = self.graphs[target.inventory]
+            actual = {(edge.cause.key, edge.effect.key): edge for edge in graph.edges}
+            projected = self.target_edges(chain, target)
+            native = tuple(edge.model_copy(update={"held": actual[(edge.cause.key, edge.effect.key)].held
+                if (edge.cause.key, edge.effect.key) in actual else ()}) for edge in projected)
+            witness = self.witnesses[target.inventory].chain(native).model_copy(update={"inventory": target.inventory})
+            witnesses.append(witness)
+            if self.witnesses[target.inventory].shown.get(native[0].cause.key):
+                comparable.append(witness)
+            shared_scenario |= bool(frozenset.intersection(*(edge.held_in for edge in native)))
+        end_to_end = tuple(sorted({scenario for witness in comparable for scenario in witness.end_to_end}))
+        undetermined = {scenario for witness in comparable for scenario in witness.undetermined}
+        if not comparable:
+            first = chain.hops[0]
+            if first.inventory is None:
+                raise ValueError("a cross-inventory path requires the inventory of every hop")
+            undetermined.update(scenario for scenario, _ in self.witnesses[first.inventory].shown.get(first.cause.key, ()))
+        contradicted = set.intersection(*(set(witness.contradicted) for witness in comparable)) if comparable else set()
+        return chain.model_copy(update={"witnesses": tuple(witnesses), "end_to_end": end_to_end,
+            "undetermined": tuple(sorted(undetermined - set(end_to_end))),
+            "contradicted": tuple(sorted(contradicted)) if not end_to_end else (),
+            "several_scenarios": not (shared_scenario or end_to_end)})
+
+    @cached_property
+    def natural(self) -> tuple[NaturalJudgement, ...]:
+        requested = {(run.natural.path, run.natural.inventory) for run in self.facts.standing_runs()
+                     if run.natural is not None and run.natural.inventory is not None
+                     and ({deviation.inventory for deviation in run.natural.path.deviations}
+                          != {run.natural.inventory})}
+        if not requested:
+            return ()
+        judgements: list[NaturalJudgement] = []
+        for identity, inventory in sorted(requested, key=lambda request: repr(request)):
+            if identity not in self.chains:
+                continue
+            chain = self.chains[identity]
+            source = identity.deviations[0].inventory
+            scoped = chain.model_copy(update={"hops": tuple(hop.model_copy(
+                update={"inventory": hop.inventory or source}) for hop in chain.hops)})
+            for target in self.targets(scoped):
+                if target.inventory != inventory:
+                    continue
+                graph = self.graphs[target.inventory]
+                found = natural_comparisons(self.facts, {identity: target.chain}, graph.inventory,
+                    self.settings.alpha, self.settings.min_mean_increase, self.settings.min_count_increase)
+                judgements.extend(judgement.model_copy(update={"hops": tuple(hop.model_copy(
+                    update={"effect": chain.hops[index].effect}) for index, hop in enumerate(judgement.hops))})
+                    for judgement in found)
+        return tuple(sorted(judgements, key=lambda judgement: max(
+            fact.sequence for fact in self.facts.standing_runs() if fact.identity in judgement.runs)))
+
+
 def compute_graph(facts: Facts, settings: ComputeSettings) -> PropagationGraphs:
+    measured = EquivalentGraphs(facts, settings)
     return PropagationGraphs(settings=settings, through=facts.facts[-1].sequence if facts.facts else 0,
-        inventories=tuple(InventoryGraph(inventory=inventory.identity,
-            graph=FactGraph(facts, settings, inventory).graph()) for inventory in facts.inventories()))
+        inventories=tuple(InventoryGraph(inventory=identity, graph=graph.graph())
+                          for identity, graph in measured.graphs.items()),
+        equivalence=measured.equivalence_graph, natural=measured.natural)
 
 
 def print_graph() -> None:

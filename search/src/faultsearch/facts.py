@@ -188,7 +188,7 @@ class PathIdentity(BaseModel):
     @classmethod
     def from_chain(cls, chain: Chain, inventory: str) -> "PathIdentity":
         return cls(head=chain.hops[0].cause.key,
-                   deviations=tuple(DeviationReference(inventory=inventory, point=hop.effect.point,
+                   deviations=tuple(DeviationReference(inventory=hop.inventory or inventory, point=hop.effect.point,
                                                        effect=hop.effect.key) for hop in chain.hops))
 
 
@@ -201,6 +201,7 @@ class NaturalPath(BaseModel):
     revision: GitRevision
     controls: frozenset[str] = Field(min_length=2)
     repetitions: RepetitionCount
+    inventory: str | None = Field(default=None, exclude_if=lambda inventory: inventory is None)
 
     @field_serializer("controls")
     def sorted_controls(self, controls: frozenset[str]) -> list[str]:

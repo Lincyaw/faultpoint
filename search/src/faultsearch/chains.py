@@ -8,9 +8,9 @@ from typing import Final
 
 from faultpoint.placement import Manifest
 from faultpoint.tools.kinds import KindTable
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from faultsearch.allocation import Allocation, Strategy
+from faultsearch.allocation import Allocation, Cluster, Strategy
 from faultsearch.catalog import FROZEN, Catalog, Fault, Layer, RpcPeers, point_service
 from faultsearch.counterfactual import EffectKey, Scenarios, TreatmentRecord
 from faultsearch.edges import Acceptance, Condition, Edge, EffectMap, build_edges, holds
@@ -21,7 +21,7 @@ CROSS_LAYER_KEPT: Final = 300
 
 type Step = tuple[EffectKey, Fault, EffectKey]
 """An effect, the counterpart a chain continues it with, and the consequence the chain expects of the counterpart."""
-type Group = tuple[tuple[int, ...], str]
+type Group = tuple[tuple[int | tuple[str, int], ...], str]
 """The sequence of the clusters of a chain's faults and its path through the layers."""
 
 
@@ -52,16 +52,59 @@ def similarity_order(several_scenarios: bool, similarity: float) -> float:
 
 class Visibility(StrEnum):
     """What the scenarios tested tell of a chain: one of them showed it end to end, none did, or one that did not
-    show it injected the first fault in only some repetitions."""
+    show it could not judge every hop, through incomplete injection or unmapped inventory points."""
 
     SINGLE_SCENARIO = "single-scenario"
     STITCHED_ONLY = "stitched-only"
     UNDETERMINED = "undetermined"
 
 
+class ChainWitness(BaseModel):
+    model_config = FROZEN
+
+    inventory: str | None = Field(default=None, exclude_if=lambda inventory: inventory is None)
+    end_to_end: tuple[str, ...]
+    undetermined: tuple[str, ...]
+    contradicted: tuple[int, ...]
+
+
+class Witnesses(BaseModel):
+    """The effects of actual head runs within one measured execution context."""
+
+    model_config = FROZEN
+
+    shown: dict[str, list[tuple[str, set[str]]]]
+    witnessed: dict[str, dict[str, set[str]]]
+    unfinished: dict[str, set[str]]
+
+    @classmethod
+    def of(cls, records: list[TreatmentRecord], min_count_increase: float) -> "Witnesses":
+        shown: dict[str, list[tuple[str, set[str]]]] = defaultdict(list)
+        witnessed: dict[str, dict[str, set[str]]] = defaultdict(dict)
+        unfinished: dict[str, set[str]] = defaultdict(set)
+        for record in records:
+            effects = {EffectKey.of(effect).key for effect in record.effects if holds(effect, min_count_increase)}
+            shown[record.fault.key].append((record.workload, effects))
+            if record.exercised:
+                witnessed[record.fault.key][record.workload] = effects
+            if any(record.injected) and not record.exercised:
+                unfinished[record.fault.key].add(record.workload)
+        return cls(shown=dict(shown), witnessed=dict(witnessed), unfinished=dict(unfinished))
+
+    def chain(self, edges: tuple[Edge, ...]) -> ChainWitness:
+        first = edges[0].cause.key
+        effects = {edge.effect.key for edge in edges}
+        end_to_end = tuple(sorted(scenario for scenario, shown_effects in self.shown.get(first, ())
+                                  if effects <= shown_effects))
+        return ChainWitness(end_to_end=end_to_end, undetermined=tuple(sorted(
+            scenario for scenario in self.unfinished.get(first, ()) if scenario not in end_to_end)),
+            contradicted=contradicted_hops(edges, self.witnessed))
+
+
 class Hop(BaseModel):
     model_config = FROZEN
 
+    inventory: str | None = Field(default=None, exclude_if=lambda inventory: inventory is None)
     cause: Fault
     effect: EffectKey
     held: tuple[str, ...]
@@ -80,7 +123,8 @@ def group_of(hops: tuple[Hop, ...]) -> Group:
     """What chains share when they are the same causal path: the clusters of their faults and the layers they cross;
     novelty only groups chains and no longer ranks them."""
     layers = (*(hop.cause.layer for hop in hops), hops[-1].effect_layer)
-    return tuple(hop.cluster for hop in hops), LAYER_PATH_SEPARATOR.join(layers)
+    clusters = tuple((hop.inventory, hop.cluster) if hop.inventory else hop.cluster for hop in hops)
+    return clusters, LAYER_PATH_SEPARATOR.join(layers)
 
 
 class Chain(BaseModel):
@@ -88,6 +132,7 @@ class Chain(BaseModel):
 
     model_config = FROZEN
 
+    origin: str | None = Field(default=None, exclude_if=lambda origin: origin is None)
     hops: tuple[Hop, ...]
     condition: Condition
     """The parameter values that, merged onto the baseline, should activate every hop."""
@@ -103,13 +148,13 @@ class Chain(BaseModel):
     end_to_end: tuple[str, ...]
     """The scenarios where injecting the first fault alone showed every hop's effect."""
     undetermined: tuple[str, ...] = ()
-    """The scenarios that did not show the chain but injected the first fault in only some repetitions, an unfinished
-    test that tells neither whether they show it nor whether they do not."""
+    """The scenarios that could not judge the whole path, through incomplete injection or unmapped inventory points."""
     confidence: float = 1.0
     """The estimated chance that validation confirms every step after the first hop, from the checks recorded when it
     was stitched; stitchings from before it was estimated give 1."""
     contradicted: tuple[int, ...] = ()
     """The hops a natural witness contradicts."""
+    witnesses: tuple[ChainWitness, ...] = Field(default=(), exclude_if=lambda witnesses: not witnesses)
 
     def steps(self) -> list[Step]:
         return [(before.effect, after.cause, after.effect) for before, after in pairwise(self.hops)]
@@ -136,7 +181,10 @@ class Chain(BaseModel):
 
     @property
     def key(self) -> str:
-        return " -> ".join(f"[{hop.cause.key}] {hop.effect.key}" for hop in self.hops)
+        if self.origin is not None:
+            return self.origin
+        return " -> ".join(f"{hop.inventory + ': ' if hop.inventory else ''}[{hop.cause.key}] {hop.effect.key}"
+                           for hop in self.hops)
 
     @property
     def layers(self) -> tuple[Layer, ...]:
@@ -172,25 +220,71 @@ class Trail(BaseModel):
         return tuple(sorted({point_service(point) for point, layer in layered if layer != Layer.UPSTREAM}))
 
     def several_scenarios(self) -> bool:
-        return not frozenset.intersection(*(edge.held_in for edge in self.edges))
+        return len({edge.inventory for edge in self.edges}) > 1 or not frozenset.intersection(
+            *(edge.held_in for edge in self.edges))
 
-    def similarity(self, allocation: Allocation) -> float:
-        return fmean(allocation.cluster_of[edge.cause.key].similarity for edge in self.edges)
+    def similarity(self, allocation: "Allocation | StitchSources") -> float:
+        return fmean((allocation.cluster(edge) if isinstance(allocation, StitchSources)
+                      else allocation.cluster_of[edge.cause.key]).similarity for edge in self.edges)
 
     def steps(self) -> list[Step]:
         return [(before.effect, after.cause, after.effect) for before, after in pairwise(self.edges)]
 
-    def rank(self, allocation: Allocation, checked: dict[str, ClassChecks]) -> tuple[bool, int, bool, float, float]:
+    def rank(self, allocation: "Allocation | StitchSources",
+             checked: dict[str, ClassChecks]) -> tuple[bool, int, bool, float, float]:
         """The rank of the chain it becomes: needing several scenarios, services crossed, ending in a failure the user
         sees, the chance validation confirms it, and the order of its clusters' similarity to break ties."""
         several = self.several_scenarios()
         order = similarity_order(several, self.similarity(allocation))
-        return several, len(self.services()), self.edges[-1].terminal, confidence(self.steps(), checked), order
+        chance = allocation.confidence(self.edges) if isinstance(allocation, StitchSources) else confidence(
+            self.steps(), checked)
+        return several, len(self.services()), self.edges[-1].terminal, chance, order
 
-    def promise(self, allocation: Allocation) -> tuple[bool, int, float]:
+    def promise(self, allocation: "Allocation | StitchSources") -> tuple[bool, int, float]:
         """The rank without ending at the user, which extending a chain still open can only reach later."""
         several = self.several_scenarios()
         return several, len(self.services()), similarity_order(several, self.similarity(allocation))
+
+
+class StitchSource(BaseModel):
+    model_config = FROZEN
+
+    allocation: Allocation
+    feedback: MappingFeedback
+
+
+class StitchSources(BaseModel):
+    """Independent measured sources connected only by declared point equivalence."""
+
+    model_config = FROZEN
+
+    sources: dict[str, StitchSource]
+    points: dict[tuple[str, str], tuple[str, str]]
+
+    def fault_key(self, inventory: str, fault: Fault) -> tuple[str, str]:
+        owner, point = self.points.get((inventory, fault.point), (inventory, fault.point))
+        return owner, fault.model_copy(update={"point": point}).key
+
+    def cluster(self, edge: Edge) -> Cluster:
+        if edge.inventory is None:
+            raise ValueError("an edge stitched between inventories requires its source inventory")
+        return self.sources[edge.inventory].allocation.cluster_of[edge.cause.key]
+
+    def confidence(self, edges: tuple[Edge, ...]) -> float:
+        probabilities = []
+        for before, after in pairwise(edges):
+            if before.inventory is None:
+                raise ValueError("an edge stitched between inventories requires its source inventory")
+            checked = (self.sources[before.inventory].feedback.class_checks()
+                       if before.inventory == after.inventory else {})
+            probabilities.append(confidence(((before.effect, after.cause, after.effect),), checked))
+        return prod(probabilities)
+
+    def refuted(self, before: Edge, after: Edge) -> bool:
+        if before.inventory is None:
+            raise ValueError("an edge stitched between inventories requires its source inventory")
+        return before.inventory == after.inventory and (before.effect.key, after.cause.key, after.effect.key) in \
+            self.sources[before.inventory].feedback.refuted()
 
 
 class Stitching(BaseModel):
@@ -234,15 +328,17 @@ def merge_conditions(left: tuple[Condition, ...], right: tuple[Condition, ...]) 
     return tuple(merged)
 
 
-def beam_search(edges: list[Edge], allocation: Allocation, width: int, max_hops: int,
+def beam_search(edges: list[Edge], allocation: Allocation | StitchSources, width: int, max_hops: int,
                 refuted: frozenset[tuple[str, str, str]]) -> tuple[list[Trail], list[Trail]]:
     """Chains of two or more compatible edges, extending at every length the most promising chains that do not yet
     end at the user, and the cycles whose last effect corresponds to the first fault; no chain takes a step from an
     effect through a counterpart to a consequence that validations refuted."""
-    by_cause: dict[str, list[Edge]] = defaultdict(list)
+    by_cause: dict[tuple[str, str], list[Edge]] = defaultdict(list)
     for edge in edges:
         if not edge.injected:
-            by_cause[edge.cause.key].append(edge)
+            key = allocation.fault_key(edge.inventory or "", edge.cause) if isinstance(
+                allocation, StitchSources) else ("", edge.cause.key)
+            by_cause[key].append(edge)
     beam = [Trail(edges=(edge,), conditions=edge.conditions) for edge in edges
             if edge.counterparts and not edge.terminal]
     chains: list[Trail] = []
@@ -250,14 +346,22 @@ def beam_search(edges: list[Edge], allocation: Allocation, width: int, max_hops:
     for _ in range(max_hops):
         extended = []
         for trail in beam:
-            causes = [edge.cause.key for edge in trail.edges]
-            for following in sorted({fault.key for fault in trail.edges[-1].counterparts}
-                                    - set(trail.edges[-1].mismatched)):
+            last = trail.edges[-1]
+            causes = [allocation.fault_key(edge.inventory or "", edge.cause) if isinstance(
+                allocation, StitchSources) else ("", edge.cause.key) for edge in trail.edges]
+            counterparts = {fault.key: fault for fault in last.counterparts}
+            for native in sorted(set(counterparts) - set(last.mismatched)):
+                following = allocation.fault_key(last.inventory or "", counterparts[native]) if isinstance(
+                    allocation, StitchSources) else ("", native)
                 if following == causes[0] and len(causes) > 1:
                     cycles.append(trail)
                 extended += [Trail(edges=(*trail.edges, edge), conditions=conditions) for edge in by_cause[following]
                              if following not in causes
-                             and (trail.edges[-1].effect.key, following, edge.effect.key) not in refuted
+                             and (not allocation.refuted(last, edge) if isinstance(allocation, StitchSources)
+                                  else (last.effect.key, native, edge.effect.key) not in refuted)
+                             and (counterparts[native].model_dump(exclude={"point"})
+                                  == edge.cause.model_dump(exclude={"point"})
+                                  if isinstance(allocation, StitchSources) else True)
                              and (conditions := merge_conditions(trail.conditions, edge.conditions))]
         chains += [trail for trail in extended if len(trail.edges) <= max_hops]
         beam = sorted((trail for trail in extended if not trail.edges[-1].terminal),
@@ -265,36 +369,30 @@ def beam_search(edges: list[Edge], allocation: Allocation, width: int, max_hops:
     return chains, cycles
 
 
-def ranked_chains(trails: list[Trail], allocation: Allocation, records: list[TreatmentRecord],
+def ranked_chains(trails: list[Trail], allocation: Allocation | StitchSources, records: list[TreatmentRecord],
                   min_count_increase: float, checked: dict[str, ClassChecks]) -> list[Chain]:
     """Chains ranked by needing several scenarios, services crossed, ending in a failure the user sees, the chance
     validation confirms them and the order of their cluster similarity, each marked as the first of its group or not
     and with the hops a natural witness contradicts."""
-    shown: dict[str, list[tuple[str, set[str]]]] = defaultdict(list)
-    witnessed: dict[str, dict[str, set[str]]] = defaultdict(dict)
-    unfinished: dict[str, set[str]] = defaultdict(set)
-    for record in records:
-        effects = {EffectKey.of(effect).key for effect in record.effects if holds(effect, min_count_increase)}
-        shown[record.fault.key].append((record.workload, effects))
-        if record.exercised:
-            witnessed[record.fault.key][record.workload] = effects
-        if any(record.injected) and not record.exercised:
-            unfinished[record.fault.key].add(record.workload)
+    witnesses = Witnesses.of(records, min_count_increase)
     seen: set[Group] = set()
     chains = []
     for trail in sorted(trails, key=lambda trail: trail.rank(allocation, checked), reverse=True):
         hops = tuple(Hop(cause=edge.cause, effect=edge.effect, held=tuple(sorted(edge.held_in)),
-                         cluster=allocation.cluster_of[edge.cause.key].number, effect_layer=edge.effect_layer,
+                         inventory=edge.inventory,
+                         cluster=(allocation.cluster(edge) if isinstance(allocation, StitchSources)
+                                  else allocation.cluster_of[edge.cause.key]).number, effect_layer=edge.effect_layer,
                          acts_on=edge.acts_on) for edge in trail.edges)
-        effects = {edge.effect.key for edge in trail.edges}
-        first = trail.edges[0].cause.key
-        end_to_end = tuple(sorted(scenario for scenario, shown_effects in shown[first] if effects <= shown_effects))
+        across = len({edge.inventory for edge in trail.edges}) > 1
+        witness = witnesses.chain(trail.edges)
         chains.append(Chain(
             hops=hops, condition=trail.conditions[0], several_scenarios=trail.several_scenarios(),
             services=trail.services(), terminal=trail.edges[-1].terminal, novel=group_of(hops) not in seen,
-            similarity=trail.similarity(allocation), end_to_end=end_to_end,
-            undetermined=tuple(sorted(scenario for scenario in unfinished[first] if scenario not in end_to_end)),
-            confidence=confidence(trail.steps(), checked), contradicted=contradicted_hops(trail.edges, witnessed)))
+            similarity=trail.similarity(allocation), end_to_end=() if across else witness.end_to_end,
+            undetermined=witness.undetermined,
+            confidence=allocation.confidence(trail.edges) if isinstance(allocation, StitchSources)
+                else confidence(trail.steps(), checked),
+            contradicted=() if across else witness.contradicted))
         seen.add(group_of(hops))
     return chains
 

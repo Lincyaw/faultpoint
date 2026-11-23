@@ -39,7 +39,7 @@ from faultsearch.facts import (
     canonical,
     read_facts,
 )
-from faultsearch.graph import ComputeSettings, FactGraph
+from faultsearch.graph import ComputeSettings, EquivalentGraphs, FactGraph, PathTarget
 from faultsearch.natural import NaturalPlan, NaturalPlanning
 from faultsearch.recording import PARAMETERS, RunOrigin
 from faultsearch.refill import candidate_batch, hypotheses
@@ -335,8 +335,21 @@ class Planning:
     def kept(self) -> list[Chain]:
         stitching = self.graph.stitching
         order = {key: rank for rank, key in enumerate(stitching.keys)}
-        return sorted({chain.key: chain for chain in (*stitching.top, *stitching.top_cross_layer)}.values(),
-                      key=lambda chain: order[chain.key])
+        local = sorted({chain.key: chain for chain in (*stitching.top, *stitching.top_cross_layer)}.values(),
+                       key=lambda chain: order[chain.key])
+        return [*local, *(target.chain for _, target in self.equivalent_targets)]
+
+    @cached_property
+    def equivalent_graphs(self) -> EquivalentGraphs:
+        return EquivalentGraphs(self.facts, self.settings.compute)
+
+    @cached_property
+    def equivalent_targets(self) -> tuple[tuple[Chain, PathTarget], ...]:
+        joined = self.equivalent_graphs.equivalence_graph
+        if joined is None:
+            return ()
+        return tuple((chain, target) for chain in joined.chains for target in self.equivalent_graphs.targets(chain)
+                     if target.inventory == self.graph.inventory.identity)
 
     def path_controls(self) -> list[RunRequest]:
         """The controls of the merged workloads the kept chains' conditions give, which headroom compares with."""
@@ -350,7 +363,9 @@ class Planning:
         kept = self.kept()
         by_key = {chain.key: chain for chain in kept}
         _, room, _ = self.graph.judgement
-        roomy = {chain_room.chain for chain_room in room.chains if chain_room.room}
+        joined_rooms = [room for chain, target in self.equivalent_targets
+                        for room in self.equivalent_graphs.headroom(chain, target).chains]
+        roomy = {chain_room.chain for chain_room in (*room.chains, *joined_rooms) if chain_room.room}
         across = [chain for chain in kept if chain.crosses_layers and chain.terminal and chain.key in roomy]
         candidates = [chain for chain in across if chain.stitched_only and not chain.contradicted]
         asked: list[tuple[Chain, Selection]] = []
@@ -451,13 +466,26 @@ def print_plan_step() -> None:
 
 def plan_natural_run(facts: Facts, settings: ComputeSettings, planning: NaturalPlanning) -> NaturalPlan:
     inventories = {deviation.inventory for deviation in planning.path.deviations}
-    if len(inventories) != 1:
-        raise ValueError("natural planning requires one measured inventory; cross-inventory stitching is not implemented")
-    inventory = next(inventory for inventory in facts.inventories() if inventory.identity in inventories)
-    graph = FactGraph(facts, settings, inventory)
-    inventory = graph.inventory
-    chain = next(chain for chain in (*graph.judged_stitching.top, *graph.judged_stitching.top_cross_layer)
-                 if PathIdentity.from_chain(chain, inventory.identity) == planning.path)
+    target_inventory = None
+    if len(inventories) == 1 and planning.inventory is None:
+        inventory = next(inventory for inventory in facts.inventories() if inventory.identity in inventories)
+        graph = FactGraph(facts, settings, inventory)
+        chain = next(chain for chain in (*graph.judged_stitching.top, *graph.judged_stitching.top_cross_layer)
+                     if PathIdentity.from_chain(chain, inventory.identity) == planning.path)
+    else:
+        measured = EquivalentGraphs(facts, settings)
+        chain = measured.path_chain(planning.path)
+        source = chain.hops[0].inventory or planning.path.deviations[0].inventory
+        chain = chain.model_copy(update={"hops": tuple(hop.model_copy(update={"inventory": hop.inventory or source})
+                                                      for hop in chain.hops)})
+        target_inventory = planning.inventory or source
+        targets = [target for target in measured.targets(chain) if target.inventory == target_inventory]
+        if not targets:
+            raise ValueError("the requested healthy inventory has no unique executable mapping of every path hop "
+                             "with compatible workload parameters")
+        graph = measured.graphs[target_inventory]
+        inventory = graph.inventory
+        chain = targets[0].chain
     workload = merged_workload(chain.condition, graph.variants.scenarios)
     cohorts: dict[tuple[str, str], list[SearchRun]] = defaultdict(list)
     for run in facts.standing_runs():
@@ -479,7 +507,7 @@ def plan_natural_run(facts: Facts, settings: ComputeSettings, planning: NaturalP
         planned=PlannedRequest.of(RunRequest(
             workload=workload, purpose=Purpose.NATURAL, repetitions=planning.repetitions,
             natural=NaturalPath(path=planning.path, revision=planning.revision, repetitions=planning.repetitions,
-                                controls=frozenset(run.identity for run in controls)))))
+                                controls=frozenset(run.identity for run in controls), inventory=target_inventory))))
 
 
 def print_natural_request() -> None:
@@ -495,11 +523,13 @@ def print_natural_request() -> None:
     parser.add_argument("path", type=Path)
     parser.add_argument("revision", help="The rewritten Git commit.")
     parser.add_argument("--repetitions", type=int, default=2)
+    parser.add_argument("--inventory", help="The actual healthy inventory where every path point must be executable.")
     arguments = parser.parse_args()
     print(plan_natural_run(read_facts(arguments.facts),
         ComputeSettings.model_validate_json(arguments.settings.read_bytes()),
         NaturalPlanning(path=PathIdentity.model_validate_json(arguments.path.read_bytes()),
-                        revision=arguments.revision, repetitions=arguments.repetitions)).model_dump_json(indent=2))
+                        revision=arguments.revision, repetitions=arguments.repetitions,
+                        inventory=arguments.inventory)).model_dump_json(indent=2))
 
 
 def print_step_schema() -> None:

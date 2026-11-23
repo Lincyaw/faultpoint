@@ -19,7 +19,7 @@ from faultsearch.facts import (
     SystemTopology,
     read_facts,
 )
-from faultsearch.graph import ComputeSettings, FactGraph
+from faultsearch.graph import ComputeSettings, EquivalentGraphs, FactGraph
 from faultsearch.natural import NaturalJudgement
 from faultsearch.validation import HopCheck, RunKey, RunVerdict, hop_checks, run_key, run_verdict
 
@@ -130,12 +130,68 @@ def candidate_paths(facts: Facts, settings: ComputeSettings) -> CandidatePaths:
     """All standing inventories' paths, ranked without treating their bare point strings as equivalent."""
     if not all(facts.holds(kind) for kind in (SystemTopology, LoadVariants, PointInventory)):
         return CandidatePaths(through=facts.facts[-1].sequence if facts.facts else 0, paths=())
-    paths = [path for inventory in facts.inventories()
-             for path in inventory_candidates(FactGraph(facts, settings, inventory))]
+    measured = EquivalentGraphs(facts, settings)
+    paths = [path for graph in measured.graphs.values() for path in inventory_candidates(graph)]
+    paths.extend(equivalence_candidates(measured))
+    sequences = {run.identity: run.sequence for run in facts.standing_runs()}
+    for index, path in enumerate(paths):
+        additional = tuple(run for run in measured.natural if run.path == path.path and run not in path.natural)
+        if additional:
+            natural = tuple(sorted((*path.natural, *additional),
+                                   key=lambda judgement: max(sequences[run] for run in judgement.runs)))
+            completed = [run for run in natural if run.judgement != RunVerdict.NEEDS_RUN]
+            paths[index] = path.model_copy(update={"natural": natural,
+                "judgement": completed[-1].judgement if completed else path.judgement,
+                "hops": tuple(hop.model_copy(update={"run": completed[-1].hops[number]})
+                              for number, hop in enumerate(path.hops)) if completed else path.hops})
     paths.sort(key=lambda path: (any(appraisal.conclusion == Conclusion.FAILS for appraisal in path.appraisals),
                                  not (path.stitched_only and path.crosses_layers)))
     return CandidatePaths(through=facts.facts[-1].sequence,
         paths=tuple(path.model_copy(update={"rank": rank}) for rank, path in enumerate(paths, 1)))
+
+
+def equivalence_candidates(measured: EquivalentGraphs) -> tuple[CandidatePath, ...]:
+    joined = measured.equivalence_graph
+    if joined is None:
+        return ()
+    edges = {(edge.inventory, edge.cause.key, edge.effect.key): edge for edge in joined.edges}
+    best: dict[PathIdentity, Chain] = {}
+    for chain in joined.chains:
+        if chain.terminal:
+            best.setdefault(PathIdentity.from_chain(chain, ""), chain)
+    candidates: list[CandidatePath] = []
+    sequences = {run.identity: run.sequence for run in measured.facts.standing_runs()}
+    for identity, chain in best.items():
+        judgement = RunVerdict.NEEDS_RUN
+        checks = None
+        last_sequence = 0
+        for target in measured.targets(chain):
+            graph = measured.graphs[target.inventory]
+            records = {(record.fault.key, record.workload): record for record in graph.judgement[0]}
+            verdict = run_verdict(target.chain, records, graph.variants.scenarios,
+                                  measured.settings.min_count_increase)
+            if verdict != RunVerdict.NEEDS_RUN:
+                record = records[run_key(target.chain, graph.variants.scenarios)]
+                sequence = max(sequences[label] for label in record.labels)
+                if sequence > last_sequence:
+                    last_sequence, judgement = sequence, verdict
+                    checks = tuple(hop.model_copy(update={"effect": chain.hops[index].effect}) for index, hop in
+                        enumerate(hop_checks(target.chain, record, measured.settings.min_count_increase)))
+        natural = tuple(run for run in measured.natural if run.path == identity)
+        completed = [run for run in natural if run.judgement != RunVerdict.NEEDS_RUN]
+        if completed:
+            judgement, checks = completed[-1].judgement, completed[-1].hops
+        candidates.append(CandidatePath(rank=len(candidates) + 1, path=identity,
+            head_service=point_service(chain.hops[0].cause.point), chain=chain.key,
+            hops=tuple(CandidateHop(injection=hop.cause.key, deviation=deviation,
+                service=point_service(hop.effect.point), sightings=edges[(hop.inventory, hop.cause.key, hop.effect.key)].held,
+                run=checks[index] if checks else None)
+                for index, (hop, deviation) in enumerate(zip(chain.hops, identity.deviations, strict=True))),
+            judgement=judgement, stitched_only=chain.stitched_only, crosses_layers=chain.crosses_layers,
+            appraisals=tuple(PathAppraisal(identity=appraisal.identity, conclusion=appraisal.conclusion,
+                                          category=appraisal.category)
+                             for appraisal in measured.facts.appraisals() if appraisal.path == identity), natural=natural))
+    return tuple(candidates)
 
 
 def print_candidate_paths() -> None:

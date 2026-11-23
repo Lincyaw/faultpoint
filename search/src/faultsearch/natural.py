@@ -20,6 +20,7 @@ class NaturalPlanning(BaseModel):
     path: PathIdentity
     revision: GitRevision
     repetitions: RepetitionCount
+    inventory: str | None = None
 
 
 class NaturalPlan(BaseModel):
@@ -47,6 +48,12 @@ def natural_judgements(facts: Facts, stitching: Stitching, inventory: PointInven
                        min_mean_increase: float, min_count_increase: float) -> tuple[NaturalJudgement, ...]:
     chains = {PathIdentity.from_chain(chain, inventory.identity): chain
               for chain in (*stitching.top, *stitching.top_cross_layer)}
+    return natural_comparisons(facts, chains, inventory, alpha, min_mean_increase, min_count_increase)
+
+
+def natural_comparisons(facts: Facts, chains: dict[PathIdentity, Chain], inventory: PointInventory, alpha: float,
+                        min_mean_increase: float, min_count_increase: float) -> tuple[NaturalJudgement, ...]:
+    """Compare actual no-injection runs against controls from the inventory they were planned to execute."""
     recorded = {run.identity: run for run in facts.facts if isinstance(run, SearchRun)}
     standing = {run.identity: run for run in facts.standing_runs()}
     groups: dict[tuple[str, str, str], list[SearchRun]] = defaultdict(list)
@@ -61,8 +68,17 @@ def natural_judgements(facts: Facts, stitching: Stitching, inventory: PointInven
             raise ValueError("a natural run has no path")
         if target.path not in chains:
             continue
+        if target.inventory is not None and target.inventory != inventory.identity:
+            continue
         controls = [recorded[identity] for identity in sorted(target.controls)]
         supported = all(control.identity in standing for control in controls)
+        if supported and target.inventory is not None:
+            context = facts.inventory_controls(inventory)[0].context.model_dump(exclude={"source"})
+            if any(control.context.model_dump(exclude={"source"}) != context for control in controls):
+                raise ValueError("natural controls must match the complete healthy inventory execution context")
+            if (len({(control.source, control.workload.name) for control in controls}) != 1
+                    or {control.index for control in controls} != set(range(target.repetitions))):
+                raise ValueError("natural controls must be one complete named healthy cohort")
         if supported and inventory.revision is None:
             raise ValueError("natural verification requires the recorded healthy revision")
         if supported and any(control.group != CONTROL_GROUP or control.rules or control.purpose == Purpose.NATURAL

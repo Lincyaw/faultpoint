@@ -10,7 +10,7 @@ from faultpoint.placement import Manifest
 from faultpoint.rules import Action
 from faultpoint.tools.analysis import Effect, Metric, Verdict
 from faultpoint.tools.kinds import KindTable
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel, Field, JsonValue
 
 from faultsearch.allocation import Assignment, Phase, Strategy
 from faultsearch.catalog import (DATA, FROZEN, RPC_CLIENT, RPC_SERVER, Catalog, Fault, Following, Layer, RpcPeers, implements,
@@ -186,6 +186,8 @@ class Edge(BaseModel):
     and the conditions learned from them."""
 
     model_config = FROZEN
+
+    inventory: str | None = Field(default=None, exclude_if=lambda inventory: inventory is None)
 
     cause: Fault
     effect: EffectKey
