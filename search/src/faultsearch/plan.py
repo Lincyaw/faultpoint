@@ -459,12 +459,12 @@ def plan_natural_run(facts: Facts, settings: ComputeSettings, planning: NaturalP
     chain = next(chain for chain in (*graph.judged_stitching.top, *graph.judged_stitching.top_cross_layer)
                  if PathIdentity.from_chain(chain, inventory.identity) == planning.path)
     workload = merged_workload(chain.condition, graph.variants.scenarios)
-    cohorts: dict[str, list[SearchRun]] = defaultdict(list)
+    cohorts: dict[tuple[str, str], list[SearchRun]] = defaultdict(list)
     for run in facts.standing_runs():
         if (run.group == CONTROL_GROUP and run.purpose != Purpose.NATURAL and run.refusal is None
                 and run.workload.workload == workload.workload
                 and run.context.model_dump(exclude={"source"}) == graph.context.model_dump(exclude={"source"})):
-            cohorts[run.source].append(run)
+            cohorts[(run.source, run.workload.name)].append(run)
     complete = [runs for runs in cohorts.values()
                 if set(range(planning.repetitions)) <= {run.index for run in runs}]
     if inventory.revision is None:
@@ -473,12 +473,13 @@ def plan_natural_run(facts: Facts, settings: ComputeSettings, planning: NaturalP
         request = RunRequest(workload=workload, purpose=Purpose.PATH, repetitions=planning.repetitions)
         return NaturalPlan(revision=inventory.revision, sdk_build=inventory.sdk_build,
                            planned=PlannedRequest.of(request))
-    controls = sorted(min(complete, key=lambda runs: min(run.sequence for run in runs)), key=lambda run: run.index)
+    cohort = min(complete, key=lambda runs: min(run.sequence for run in runs))
+    controls = [next(run for run in cohort if run.index == index) for index in range(planning.repetitions)]
     return NaturalPlan(revision=planning.revision, sdk_build=inventory.sdk_build,
         planned=PlannedRequest.of(RunRequest(
             workload=workload, purpose=Purpose.NATURAL, repetitions=planning.repetitions,
             natural=NaturalPath(path=planning.path, revision=planning.revision, repetitions=planning.repetitions,
-                                controls=frozenset(run.identity for run in controls[:planning.repetitions])))))
+                                controls=frozenset(run.identity for run in controls)))))
 
 
 def print_natural_request() -> None:
