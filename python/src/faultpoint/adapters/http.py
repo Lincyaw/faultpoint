@@ -26,7 +26,7 @@ COMPLETED_STATUSES: Final = range(200, 400)
 RESPONSE_START: Final = "http.response.start"
 HTTP_DISCONNECT: Final = "http.disconnect"
 IDENTIFIER_SEGMENT: Final = re.compile(
-    r"^(\d+|([A-Za-z][A-Za-z0-9_]*-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,})$")
+    r"^(\d+|([A-Za-z][A-Za-z0-9_]*-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|([A-Za-z][A-Za-z0-9_]*[_-])?[0-9a-fA-F]{16,})$")
 
 type Message = MutableMapping[str, Any]
 type Scope = MutableMapping[str, Any]

@@ -24,7 +24,7 @@ public final class ServletBoundary {
             W3CTraceContextPropagator.getInstance(), W3CBaggagePropagator.getInstance());
     static final int DEFAULT_FAILURE_STATUS = 503;
     static final String DEFAULT_IDENTIFIER_SEGMENT =
-            "^(\\d+|([A-Za-z][A-Za-z0-9_]*-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,})$";
+            "^(\\d+|([A-Za-z][A-Za-z0-9_]*-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|([A-Za-z][A-Za-z0-9_]*[_-])?[0-9a-fA-F]{16,})$";
     static volatile Pattern identifierSegment = Pattern.compile(DEFAULT_IDENTIFIER_SEGMENT);
     /** Forwards and includes enter service again; only the outermost entry is the request. */
     static final ThreadLocal<Integer> DEPTH = ThreadLocal.withInitial(() -> 0);

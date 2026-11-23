@@ -23,7 +23,7 @@ const REQUEST_EXCHANGES = new WeakMap<object, { sent: boolean }>();
 
 export const HttpOptions = z.strictObject({
   identifier_segment: z.string().default(
-    "^(\\d+|([A-Za-z][A-Za-z0-9_]*-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,})$"),
+    "^(\\d+|([A-Za-z][A-Za-z0-9_]*-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|([A-Za-z][A-Za-z0-9_]*[_-])?[0-9a-fA-F]{16,})$"),
 });
 
 type Handler = (request: IncomingMessage, response: ServerResponse) => unknown;

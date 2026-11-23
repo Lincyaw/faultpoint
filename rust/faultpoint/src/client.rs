@@ -32,7 +32,7 @@ pub struct ClientOptions {
 impl Default for ClientOptions {
     fn default() -> Self {
         ClientOptions {
-            identifier_segment: r"^(\d+|([A-Za-z][A-Za-z0-9_]*-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,})$".into(),
+            identifier_segment: r"^(\d+|([A-Za-z][A-Za-z0-9_]*-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|([A-Za-z][A-Za-z0-9_]*[_-])?[0-9a-fA-F]{16,})$".into(),
         }
     }
 }
