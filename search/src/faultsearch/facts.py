@@ -11,7 +11,15 @@ from typing import Annotated, Final, Literal
 from faultpoint.observations import ObservationRecord
 from faultpoint.placement import Manifest
 from faultpoint.rules import Rule
-from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    JsonValue,
+    TypeAdapter,
+    ValidationError,
+    field_serializer,
+    model_validator,
+)
 
 from faultsearch.allocation import Phase
 from faultsearch.catalog import FROZEN, RPC_SERVER
@@ -50,6 +58,20 @@ class Purpose(StrEnum):
     """A run in a merged workload, which judges paths and measures their headroom."""
     NATURAL = "natural"
     """A run at a rewritten revision, with no intervention, checking a named path against healthy runs."""
+
+
+class RunContext(BaseModel):
+    """The actual source, system, build, deployment and environment of comparable repetitions."""
+
+    model_config = FROZEN
+
+    source: str
+    system: str
+    revision: str | None
+    sdk_build: str
+    build: dict[str, JsonValue]
+    deployment: dict[str, JsonValue]
+    environment: str
 
 
 class Tally(BaseModel):
@@ -247,6 +269,12 @@ class SearchRun(FactBody):
     def records(self) -> list[ObservationRecord]:
         return [tally.record() for tally in self.tallies]
 
+    @property
+    def context(self) -> RunContext:
+        return RunContext(source=self.source, system=self.system, revision=self.revision,
+                          sdk_build=self.sdk_build, build=self.build, deployment=self.deployment,
+                          environment=self.environment)
+
 
 class PointInventory(FactBody):
     """Every point of a system at one revision, SDK build and deployment: those its rewriters' manifests list, with
@@ -259,7 +287,7 @@ class PointInventory(FactBody):
     sdk_build: str
     deployment: dict[str, JsonValue]
     controls: tuple[str, ...]
-    """The labels of the control runs whose observations add points."""
+    """The identities of the control runs whose observations add points; legacy facts name their labels."""
     manifests: tuple[Manifest, ...]
     configured: tuple[str, ...]
 
@@ -404,6 +432,30 @@ class Facts(BaseModel):
         """The search runs no voiding names, in sequence order."""
         voided = self.voided()
         return [fact for fact in self.facts if isinstance(fact, SearchRun) and fact.identity not in voided]
+
+    def inventories(self) -> list[PointInventory]:
+        voided = self.voided()
+        return [fact for fact in self.facts if isinstance(fact, PointInventory) and fact.identity not in voided]
+
+    def inventory_controls(self, inventory: PointInventory) -> tuple[SearchRun, ...]:
+        """Resolve an inventory's original controls without interpreting a legacy label in a later build."""
+        runs = [fact for fact in self.facts if isinstance(fact, SearchRun)
+                and fact.sequence < inventory.sequence and fact.group == CONTROL_GROUP]
+        named = []
+        for reference in inventory.controls:
+            exact = [run for run in runs if run.identity == reference]
+            matches = exact or [run for run in runs if run.label == reference
+                and (run.system, run.revision, run.sdk_build, run.deployment)
+                == (inventory.system, inventory.revision, inventory.sdk_build, inventory.deployment)]
+            if len(matches) != 1:
+                raise ValueError(f"inventory {inventory.identity} control {reference} resolves to {len(matches)} runs")
+            named.append(matches[0])
+        if not named or any(run.context != named[0].context for run in named):
+            raise ValueError(f"inventory {inventory.identity} controls must share one execution context")
+        if any((run.system, run.revision, run.sdk_build, run.deployment)
+               != (inventory.system, inventory.revision, inventory.sdk_build, inventory.deployment) for run in named):
+            raise ValueError(f"inventory {inventory.identity} does not describe its controls' build and deployment")
+        return tuple(named)
 
     def appraisals(self) -> list[Appraisal]:
         voided = self.voided()

@@ -1,27 +1,55 @@
 import argparse
 import json
-import random
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from enum import StrEnum
+from functools import cached_property
 from pathlib import Path
+from random import Random
 from typing import Final
 
 from pydantic import BaseModel, Field
 
-from faultsearch.allocation import AllocationSettings, Assignment, Phase, Strategy, cluster_members, \
-    cluster_similarities, first_runs
+from faultsearch.allocation import (
+    AllocationSettings,
+    Assignment,
+    Phase,
+    Strategy,
+    cluster_members,
+    cluster_similarities,
+    first_runs,
+)
 from faultsearch.catalog import FROZEN, Fault
 from faultsearch.chains import Chain
 from faultsearch.counterfactual import Group, NamedWorkload, pack
 from faultsearch.edges import counterpart_assignments
 from faultsearch.execution import Executor, PlannedRequest, RunRequest
-from faultsearch.facts import (CONTROL_GROUP, FactList, Facts, LoadVariants, NaturalPath, PathIdentity, PathRequest, PointInventory, Purpose,
-                               read_facts)
+from faultsearch.facts import (
+    CONTROL_GROUP,
+    FactList,
+    Facts,
+    LoadVariants,
+    NaturalPath,
+    PathIdentity,
+    PathRequest,
+    PointInventory,
+    Purpose,
+    RunContext,
+    SearchRun,
+    canonical,
+    read_facts,
+)
 from faultsearch.graph import ComputeSettings, FactGraph
 from faultsearch.natural import NaturalPlan, NaturalPlanning
+from faultsearch.recording import PARAMETERS, RunOrigin
 from faultsearch.refill import candidate_batch, hypotheses
-from faultsearch.validation import Selection, chosen_runs, merged_workload, merged_workloads, run_key
+from faultsearch.validation import (
+    Selection,
+    chosen_runs,
+    merged_workload,
+    merged_workloads,
+    run_key,
+)
 
 RANDOM_VERSION: Final = 3
 """The version of the state of Python's random generator, which a plan state keeps the numbers of."""
@@ -112,10 +140,10 @@ class PlanState(BaseModel):
 
     @classmethod
     def start(cls, settings: PlanSettings) -> "PlanState":
-        return cls(random=tuple(random.Random(settings.allocation.seed).getstate()[1]))
+        return cls(random=tuple(Random(settings.allocation.seed).getstate()[1]))
 
-    def generator(self) -> random.Random:
-        generator = random.Random()
+    def generator(self) -> Random:
+        generator = Random()
         generator.setstate((RANDOM_VERSION, self.random, None))
         return generator
 
@@ -142,16 +170,39 @@ class PlanStep(BaseModel):
 class Planning:
     """One call of the plan: the facts so far, their graph and the generator, and the requests and state it builds."""
 
-    def __init__(self, facts: Facts, state: PlanState, settings: PlanSettings) -> None:
+    def __init__(self, facts: Facts, state: PlanState, settings: PlanSettings, context: RunContext | None) -> None:
         self.facts = facts
         self.state = state
         self.settings = settings
-        self.graph = FactGraph(facts, settings.compute)
+        self.context = context
+        if context is None:
+            contexts = {canonical(run.context.model_dump(mode="json")): run.context for run in facts.standing_runs()
+                        if run.purpose != Purpose.NATURAL}
+            if len(contexts) > 1:
+                raise ValueError("planning multiple execution contexts requires --origin and --deployment")
+            if contexts:
+                self.context = next(iter(contexts.values()))
         self.scenarios = facts.latest(LoadVariants).scenarios
         self.order = [scenario.name for scenario in self.scenarios.scenarios]
         self.workloads = {name: NamedWorkload(name=name, workload=self.scenarios.workload(name)) for name in self.order}
         self.rng = state.generator()
         self.tried = set(state.tried)
+
+    @property
+    def runs(self) -> list[SearchRun]:
+        return [run for run in self.facts.standing_runs() if run.purpose != Purpose.NATURAL
+                and (self.context is None or run.context == self.context)]
+
+    @property
+    def inventories(self) -> list[PointInventory]:
+        return [inventory for inventory in self.facts.inventories()
+                if self.context is None or self.facts.inventory_controls(inventory)[0].context == self.context]
+
+    @cached_property
+    def graph(self) -> FactGraph:
+        if not self.inventories:
+            raise ValueError("planning requires an inventory of its actual execution context")
+        return FactGraph(self.facts, self.settings.compute, self.inventories[-1])
 
     def assigned(self, assignments: list[Assignment]) -> list[RunRequest]:
         """Assignments as requests, packed into groups when the settings allow it, and recorded as tried."""
@@ -181,10 +232,11 @@ class Planning:
 
     def controls(self, workloads: list[NamedWorkload], purpose: Purpose) -> list[RunRequest]:
         """The controls of the workloads the facts lack any control run of."""
-        present = {(run.workload.name, run.index) for run in self.graph.runs if run.group == CONTROL_GROUP}
+        present = [run for run in self.runs if run.group == CONTROL_GROUP]
         return [RunRequest(workload=workload, purpose=purpose, repetitions=self.settings.repetitions)
                 for workload in workloads
-                if any((workload.name, index) not in present for index in range(self.settings.repetitions))]
+                if any(not any(run.workload == workload and run.index == index for run in present)
+                       for index in range(self.settings.repetitions))]
 
     def leaked(self) -> list[RunRequest]:
         """The faults of packed groups that leaked into an untreated tenant and that never ran alone since."""
@@ -272,7 +324,8 @@ class Planning:
             self.rng.shuffle(needed)
             batch = needed[:budget]
         else:
-            graph = FactGraph(self.facts, self.settings.compute.model_copy(update={"kept": EVERY_CHAIN}))
+            graph = FactGraph(self.facts, self.settings.compute.model_copy(update={"kept": EVERY_CHAIN}),
+                              self.graph.inventory)
             found = hypotheses(graph.allocation, graph.edges, graph.stitching, graph.by_pair, graph.catalog,
                                self.order, self.tried, graph.stitcher)
             batch = candidate_batch(found, graph.stitching, min(self.settings.allocation.batch, budget))
@@ -339,13 +392,13 @@ STAGES: Final[dict[Stage, Callable[[Planning], list[RunRequest]]]] = {
     Stage.REFILL: Planning.refill, Stage.PATH_CONTROLS: Planning.path_controls, Stage.VALIDATION: Planning.validation}
 
 
-def plan(facts: Facts, state: PlanState, settings: PlanSettings) -> PlanStep:
+def plan(facts: Facts, state: PlanState, settings: PlanSettings, context: RunContext | None = None) -> PlanStep:
     """The next requests the facts so far call for, moving on through the stages that have nothing more to ask; a
     packed group that leaked has its faults run alone first, and the load variants' controls are followed by the
     point inventory the caller writes."""
     stage = state.stage
     while stage != Stage.DONE:
-        planning = Planning(facts, state.model_copy(update={"stage": stage}), settings)
+        planning = Planning(facts, state.model_copy(update={"stage": stage}), settings, context)
         if stage not in (Stage.CONTROLS, Stage.COVERAGE, Stage.RANDOM) and (rerun := planning.leaked()):
             return PlanStep(requests=tuple(PlannedRequest.of(request) for request in rerun), state=planning.state)
         requests = STAGES[stage](planning)
@@ -354,8 +407,8 @@ def plan(facts: Facts, state: PlanState, settings: PlanSettings) -> PlanStep:
                             state=planning.state.model_copy(update={"random": tuple(planning.rng.getstate()[1])}))
         state = planning.state.model_copy(update={"random": tuple(planning.rng.getstate()[1])})
         stage = next_stage(stage, settings)
-        if stage in (Stage.COVERAGE, Stage.RANDOM) and not facts.holds(PointInventory):
-            return PlanStep(inventory=tuple(sorted(run.label for run in planning.graph.runs
+        if stage in (Stage.COVERAGE, Stage.RANDOM) and not planning.inventories:
+            return PlanStep(inventory=tuple(sorted(run.identity for run in planning.runs
                                                    if run.group == CONTROL_GROUP)),
                             state=state.model_copy(update={"stage": stage}))
     return PlanStep(stop=Stop.COMPLETE, state=state.model_copy(update={"stage": Stage.DONE}))
@@ -383,31 +436,44 @@ def print_plan_step() -> None:
     parser.add_argument("facts", type=Path, help="A fact file: one fact per line, in sequence order.")
     parser.add_argument("settings", type=Path, help="The plan settings, a JSON object.")
     parser.add_argument("--state", type=Path, help="The state the step before gave; the plan's start when left out.")
+    parser.add_argument("--origin", type=Path, help="The actual run origin, matching the executor's recorded identity.")
+    parser.add_argument("--deployment", type=Path, help="The actual instrumentation/deployment, supplied with --origin.")
     arguments = parser.parse_args()
     settings = PlanSettings.model_validate_json(arguments.settings.read_bytes())
     state = PlanState.model_validate_json(arguments.state.read_bytes()) if arguments.state else \
         PlanState.start(settings)
-    print(plan(read_facts(arguments.facts), state, settings).model_dump_json(indent=2))
+    if (arguments.origin is None) != (arguments.deployment is None):
+        parser.error("--origin and --deployment must be supplied together")
+    context = None if arguments.origin is None else RunOrigin.model_validate_json(
+        arguments.origin.read_bytes()).context(PARAMETERS.validate_json(arguments.deployment.read_bytes()))
+    print(plan(read_facts(arguments.facts), state, settings, context).model_dump_json(indent=2))
 
 
 def plan_natural_run(facts: Facts, settings: ComputeSettings, planning: NaturalPlanning) -> NaturalPlan:
-    graph = FactGraph(facts, settings)
+    inventories = {deviation.inventory for deviation in planning.path.deviations}
+    if len(inventories) != 1:
+        raise ValueError("natural planning requires one measured inventory; cross-inventory stitching is not implemented")
+    inventory = next(inventory for inventory in facts.inventories() if inventory.identity in inventories)
+    graph = FactGraph(facts, settings, inventory)
     inventory = graph.inventory
     chain = next(chain for chain in (*graph.judged_stitching.top, *graph.judged_stitching.top_cross_layer)
                  if PathIdentity.from_chain(chain, inventory.identity) == planning.path)
     workload = merged_workload(chain.condition, graph.variants.scenarios)
-    controls = [run for run in graph.runs if run.group == CONTROL_GROUP and run.refusal is None
-                and run.workload.workload == workload.workload and run.revision == inventory.revision
-                and run.sdk_build == inventory.sdk_build and run.deployment == inventory.deployment]
+    cohorts: dict[str, list[SearchRun]] = defaultdict(list)
+    for run in facts.standing_runs():
+        if (run.group == CONTROL_GROUP and run.purpose != Purpose.NATURAL and run.refusal is None
+                and run.workload.workload == workload.workload
+                and run.context.model_dump(exclude={"source"}) == graph.context.model_dump(exclude={"source"})):
+            cohorts[run.source].append(run)
+    complete = [runs for runs in cohorts.values()
+                if set(range(planning.repetitions)) <= {run.index for run in runs}]
     if inventory.revision is None:
         raise ValueError("natural verification requires the recorded healthy revision")
-    if len(controls) < planning.repetitions:
+    if not complete:
         request = RunRequest(workload=workload, purpose=Purpose.PATH, repetitions=planning.repetitions)
-        held = {run.label for run in controls}
-        planned = PlannedRequest.of(request)
         return NaturalPlan(revision=inventory.revision, sdk_build=inventory.sdk_build,
-            planned=planned.model_copy(update={"repetitions": tuple(
-                repetition for repetition in planned.repetitions if repetition.label not in held)}))
+                           planned=PlannedRequest.of(request))
+    controls = sorted(min(complete, key=lambda runs: min(run.sequence for run in runs)), key=lambda run: run.index)
     return NaturalPlan(revision=planning.revision, sdk_build=inventory.sdk_build,
         planned=PlannedRequest.of(RunRequest(
             workload=workload, purpose=Purpose.NATURAL, repetitions=planning.repetitions,

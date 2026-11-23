@@ -86,7 +86,7 @@ class Comparison:
         self.allocation = allocation
         self.repetitions = repetitions
         self.pack_tenants = pack_tenants
-        graph = FactGraph(recorded, compute)
+        graph = FactGraph(recorded, compute, recorded.latest(PointInventory))
         self.full = len(graph.assignments)
         self.path_records: dict[RunKey, TreatmentRecord] = {
             (record.fault.key, record.workload): record for record in graph.judgement[0]}
@@ -108,7 +108,7 @@ class Comparison:
         validating = settings.model_copy(update={"validation": OFFLINE_VALIDATION})
         done = search(copy, state.model_copy(update={"stage": Stage.PATH_CONTROLS}), validating,
                       RecordedExecutor(self.recorded, copy), self.inventory, lambda saved: None)
-        graph = FactGraph(copy.snapshot(), self.compute)
+        graph = FactGraph(copy.snapshot(), self.compute, copy.snapshot().latest(PointInventory))
         verdicts = {validation.chain.key: validation.confirmed for validation in graph.judgement[2].validations
                     if validation.selection == Selection.CROSS_LAYER}
         scenarios = graph.variants.scenarios
@@ -119,7 +119,7 @@ class Comparison:
                      for key in done.picked)
 
     def snapshot(self, log: FactList, state: PlanState, settings: PlanSettings, unavailable: int) -> Snapshot:
-        graph = FactGraph(log.snapshot(), self.compute)
+        graph = FactGraph(log.snapshot(), self.compute, log.snapshot().latest(PointInventory))
         scenarios = graph.variants.scenarios
         across = [chain for chain in graph.stitching.top_cross_layer if chain.stitched_only]
         return Snapshot(refill=settings.refill_budget, explored=state.spent, refilled=state.refilled,

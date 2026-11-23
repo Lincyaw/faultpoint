@@ -105,9 +105,9 @@ def effects_elapsed(records: list[ObservationRecord], labels: list[str], scopes:
             totals[1] += record.count
     elapsed = {}
     for effect in effects:
-        totals = sums.get((effect.point, effect.outcome, tuple(sorted(effect.detail.items()))))
-        if effect.metric == Metric.COUNT and totals is not None and totals[1]:
-            elapsed[EffectKey.of(effect).key] = totals[0] / totals[1]
+        effect_totals = sums.get((effect.point, effect.outcome, tuple(sorted(effect.detail.items()))))
+        if effect.metric == Metric.COUNT and effect_totals is not None and effect_totals[1]:
+            elapsed[EffectKey.of(effect).key] = effect_totals[0] / effect_totals[1]
     return elapsed
 
 
@@ -285,10 +285,14 @@ class Repetitions(ABC):
     def refusal(self, label: str) -> str | None:
         """What a service said when it refused a rule of the repetition, which then ended."""
 
+    def experiment(self, label: str) -> str:
+        """The experiment carried by observations of this repetition reference."""
+        return label
+
     def comparison(self, control: tuple[str, ...], treatment: list[str], tenant: str) -> Comparison:
         records = [record for label in (*control, *treatment) for record in self.observations(label)]
-        return compare(records, [Selection(experiment=label, scope=tenant) for label in control],
-                       [Selection(experiment=label, scope=tenant) for label in treatment],
+        return compare(records, [Selection(experiment=self.experiment(label), scope=tenant) for label in control],
+                       [Selection(experiment=self.experiment(label), scope=tenant) for label in treatment],
                        self.alpha, self.min_mean_increase)
 
     def group_records(self, group: Group, control: tuple[str, ...], labels: list[str]) -> list[TreatmentRecord]:
@@ -305,6 +309,7 @@ class Repetitions(ABC):
                    if (effects := self.comparison(control, labels, tenant).effects)}
         unscoped = self.comparison(control, labels, UNSCOPED)
         observed = [record for label in labels for record in self.observations(label)]
+        experiments = [self.experiment(label) for label in labels]
         records = []
         for fault, tenant in zip(group.faults, group.tenants(), strict=True):
             comparison = self.comparison(control, labels, tenant)
@@ -316,8 +321,8 @@ class Repetitions(ABC):
                 fault=fault, workload=group.workload.name, tenant=tenant, labels=tuple(labels),
                 packed_with=tuple(other.key for other in group.faults if other != fault), injected=tuple(injected),
                 statuses=tuple(self.statuses(label).tenants[tenant] for label in labels), effects=effects,
-                leakage=leakage, elapsed=effects_elapsed(observed, labels, {tenant, UNSCOPED}, effects),
-                boundary=boundary_loads(observed, labels, tenant),
-                rates=effects_rates(observed, labels, {tenant, UNSCOPED}, effects),
+                leakage=leakage, elapsed=effects_elapsed(observed, experiments, {tenant, UNSCOPED}, effects),
+                boundary=boundary_loads(observed, experiments, tenant),
+                rates=effects_rates(observed, experiments, {tenant, UNSCOPED}, effects),
                 seeds=tuple(self.seed(label) for label in labels)))
         return records

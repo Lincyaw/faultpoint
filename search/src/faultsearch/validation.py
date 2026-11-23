@@ -10,8 +10,16 @@ from pydantic import BaseModel
 
 from faultsearch.catalog import FROZEN, Layer, point_service
 from faultsearch.chains import Chain, Group, confidence
-from faultsearch.counterfactual import (UNSCOPED, ControlRecord, EffectKey, NamedWorkload, Repetitions, Scenarios,
-                                        TreatmentRecord, tenant_names)
+from faultsearch.counterfactual import (
+    UNSCOPED,
+    ControlRecord,
+    EffectKey,
+    NamedWorkload,
+    Repetitions,
+    Scenarios,
+    TreatmentRecord,
+    tenant_names,
+)
 from faultsearch.edges import Condition, Edge, holds
 from faultsearch.evidence import ClassChecks, MappingCheck, step_classes
 
@@ -152,7 +160,7 @@ def headroom(chains: list[Chain], edges: list[Edge], scenarios: Scenarios, min_c
     """The headroom of every chain's count hops in its merged workload, given the controls of those workloads."""
     tallies: dict[str, dict[str, list[ObservationTallies]]] = {
         control.workload.name: {scope: [natural_tallies(repetitions.observations(label),
-                                                        Repetition(experiment=label, scope=scope))
+                                                        Repetition(experiment=repetitions.experiment(label), scope=scope))
                                         for label in control.labels]
                                 for scope in (UNSCOPED, tenant_names(control.workload.workload)[0])}
         for control in controls}

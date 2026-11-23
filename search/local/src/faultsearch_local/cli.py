@@ -11,7 +11,7 @@ from faultsearch.catalog import FROZEN, Fault, point_layer, point_scoped
 from faultsearch.counterfactual import EffectKey, Group, Scenarios
 from faultsearch.edges import Condition, EffectMap, holds
 from faultsearch.execution import RunRequest
-from faultsearch.facts import FACTS_FILE, LoadVariants, Purpose, SystemTopology, read_facts, write_facts
+from faultsearch.facts import FACTS_FILE, LoadVariants, PointInventory, Purpose, SystemTopology, read_facts, write_facts
 from faultsearch.graph import ComputeSettings, FactGraph, FactRepetitions, compute_graph
 from faultsearch.plan import PlanSettings, PlanState, Refill, ValidationSettings, search
 from faultsearch.recording import point_inventory
@@ -137,7 +137,8 @@ def search_command(
 
 
 def experiment_graph(store: Store) -> FactGraph:
-    return FactGraph(read_facts(store.path(FACTS_FILE)), recorded_settings(store))
+    facts = read_facts(store.path(FACTS_FILE))
+    return FactGraph(facts, recorded_settings(store), facts.latest(PointInventory))
 
 
 @app.command("chains")
@@ -204,10 +205,15 @@ def trial(experiment: Experiment, sdk_root: SdkRoot,
     LocalExecutor(store, settings, explored, log, max_load).run(controls + requests)
     read = FactRepetitions(log.snapshot().standing_runs(),
                            ComputeSettings(alpha=alpha, min_mean_increase=min_mean_increase))
-    labels = {control.workload.name: tuple(control.labels()) for control in controls}
+    identities: dict[str, str] = {}
+    for run in read.runs.values():
+        if run.label in identities:
+            raise ValueError(f"the local probe holds more than one source for {run.label}")
+        identities[run.label] = run.identity
+    labels = {control.workload.name: tuple(identities[label] for label in control.labels()) for control in controls}
     for request in requests:
         record = read.group_records(Group(workload=request.workload, faults=request.faults),
-                                    labels[request.workload.name], request.labels())[0]
+                                    labels[request.workload.name], [identities[label] for label in request.labels()])[0]
         typer.echo(f"== {record.fault.key} in {request.workload.name}: statuses {record.statuses[0]}, injected "
                    f"{record.injected}, seeds {record.seeds}" + (f", refused: {record.refusal}" if record.refusal else ""))
         for effect in record.effects:
@@ -285,7 +291,10 @@ def graph_check(experiment: Experiment,
     """Compute the propagation graph from the facts.jsonl of an experiment directory written before facts and
     compare it, part by part, with the records that experiment's own commands wrote."""
     store = Store(experiment)
-    graph = compute_graph(read_facts(store.path(FACTS_FILE)),
+    facts = read_facts(store.path(FACTS_FILE))
+    graph = compute_graph(facts,
                           recorded_settings(store).model_copy(update={"kept": kept}))
-    for line in graph_differences(graph, store):
-        typer.echo(line)
+    for inventory in graph.inventories:
+        typer.echo(f"inventory {inventory.inventory}")
+        for line in graph_differences(inventory.graph, store, facts):
+            typer.echo(line)

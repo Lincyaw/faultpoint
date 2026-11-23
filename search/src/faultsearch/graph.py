@@ -1,6 +1,8 @@
+import argparse
 import json
 from collections import defaultdict
 from functools import cached_property
+from pathlib import Path
 
 from faultpoint.observations import ObservationRecord
 from faultpoint.rules import Rule
@@ -8,16 +10,53 @@ from faultpoint.tools.kinds import KindTable
 from pydantic import BaseModel, Field
 
 from faultsearch.allocation import Allocation, Assignment, Phase, Strategy, allocation_of
-from faultsearch.catalog import (FOLLOWING_SEPARATOR, FROZEN, ActionTable, Catalog, Fault, Following, RpcPeers, build_catalog,
-                                 control_executions, point_layer, point_manifests, point_scoped)
+from faultsearch.catalog import (
+    FOLLOWING_SEPARATOR,
+    FROZEN,
+    ActionTable,
+    Catalog,
+    Fault,
+    Following,
+    RpcPeers,
+    build_catalog,
+    control_executions,
+    point_layer,
+    point_manifests,
+    point_scoped,
+)
 from faultsearch.chains import Stitcher, Stitching
-from faultsearch.counterfactual import ControlRecord, Group, Repetitions, Statuses, TreatmentRecord, tenant_names
+from faultsearch.counterfactual import (
+    ControlRecord,
+    Group,
+    Repetitions,
+    Statuses,
+    TreatmentRecord,
+    tenant_names,
+)
 from faultsearch.edges import Acceptance, Edge, EffectMap
 from faultsearch.evidence import MappingFeedback
-from faultsearch.facts import CONTROL_GROUP, Facts, LoadVariants, PointInventory, Purpose, SearchRun, SystemTopology
+from faultsearch.facts import (
+    CONTROL_GROUP,
+    Facts,
+    LoadVariants,
+    PointInventory,
+    Purpose,
+    SearchRun,
+    SystemTopology,
+    read_facts,
+)
 from faultsearch.natural import NaturalJudgement, natural_judgements
-from faultsearch.validation import (Headroom, Validation, Validations, adjudications, headroom, hop_checks,
-                                    mapping_checks, merged_workload, merged_workloads)
+from faultsearch.validation import (
+    Headroom,
+    Validation,
+    Validations,
+    adjudications,
+    headroom,
+    hop_checks,
+    mapping_checks,
+    merged_workload,
+    merged_workloads,
+)
 
 
 class ComputeSettings(BaseModel):
@@ -66,16 +105,33 @@ class PropagationGraph(BaseModel):
     natural: tuple[NaturalJudgement, ...] = Field(default=(), exclude_if=lambda runs: not runs)
 
 
+class InventoryGraph(BaseModel):
+    model_config = FROZEN
+
+    inventory: str
+    graph: PropagationGraph
+
+
+class PropagationGraphs(BaseModel):
+    """The independently measured graphs of every standing inventory, without implicit cross-inventory identity."""
+
+    model_config = FROZEN
+
+    settings: ComputeSettings
+    through: int
+    inventories: tuple[InventoryGraph, ...]
+
+
 class FactRepetitions(Repetitions):
-    """The search runs of the facts as the repetitions a comparison reads, by label."""
+    """The search runs a comparison reads, by recorded identity, retaining their original experiments."""
 
     def __init__(self, runs: list[SearchRun], settings: ComputeSettings) -> None:
         super().__init__(settings.alpha, settings.min_mean_increase)
         self.runs: dict[str, SearchRun] = {}
         for run in runs:
-            if run.label in self.runs:
-                raise ValueError(f"two search runs have the label {run.label}")
-            self.runs[run.label] = run
+            if run.identity in self.runs:
+                raise ValueError(f"two search runs have the identity {run.identity}")
+            self.runs[run.identity] = run
         self.cache: dict[str, list[ObservationRecord]] = {}
 
     def observations(self, label: str) -> list[ObservationRecord]:
@@ -92,6 +148,9 @@ class FactRepetitions(Repetitions):
     def refusal(self, label: str) -> str | None:
         return self.runs[label].refusal
 
+    def experiment(self, label: str) -> str:
+        return self.runs[label].label
+
 
 def control_records(runs: list[SearchRun]) -> dict[str, ControlRecord]:
     """The control runs of every workload, by its name, in the order of their indexes."""
@@ -99,8 +158,11 @@ def control_records(runs: list[SearchRun]) -> dict[str, ControlRecord]:
     for run in runs:
         if run.group == CONTROL_GROUP:
             by_workload[run.workload.name].append(run)
+    for name, controls in by_workload.items():
+        if any(run.context != controls[0].context or run.workload != controls[0].workload for run in controls):
+            raise ValueError(f"controls of {name} must share an execution context and workload")
     return {name: ControlRecord(workload=controls[0].workload,
-                                labels=tuple(run.label for run in sorted(controls, key=lambda run: run.index)),
+                                labels=tuple(run.identity for run in sorted(controls, key=lambda run: run.index)),
                                 statuses=tuple(run.statuses for run in sorted(controls, key=lambda run: run.index)))
             for name, controls in by_workload.items()}
 
@@ -135,6 +197,8 @@ def treatment_groups(runs: list[SearchRun], purpose: Purpose, topology: SystemTo
     groups = []
     for (_, _, digest), members in by_group.items():
         first = members[0]
+        if any(run.context != first.context or run.workload != first.workload for run in members):
+            raise ValueError(f"treatment group {digest} must share an execution context and workload")
         group = Group(workload=first.workload, faults=intervention_faults(first.rules, topology, kinds))
         if group.digest != digest:
             raise ValueError(f"the runs of group {digest} in {first.workload.name} inject a group whose digest is "
@@ -150,10 +214,16 @@ def group_treatments(groups: list[tuple[Group, list[SearchRun]]], controls: dict
     where it was alone."""
     records: dict[tuple[str, str], tuple[TreatmentRecord, Phase | None]] = {}
     for group, members in groups:
-        found = repetitions.group_records(group, controls[group.workload.name].labels, [run.label for run in members])
+        if group.workload.name not in controls:
+            continue
+        control = controls[group.workload.name]
+        if control.workload != group.workload or any(
+                repetitions.runs[identity].context != members[0].context for identity in control.labels):
+            raise ValueError(f"treatment group {group.digest} does not match its controls' execution context and workload")
+        found = repetitions.group_records(group, control.labels, [run.identity for run in members])
         if len(group.faults) > 1 and found[0].leakage:
             continue
-        phases = members[0].phases or tuple(None for _ in group.faults)
+        phases: tuple[Phase | None, ...] = members[0].phases or tuple(None for _ in group.faults)
         for record, phase in zip(found, phases, strict=True):
             records.setdefault((record.fault.key, group.workload.name), (record, phase))
     return records
@@ -181,8 +251,10 @@ def graph_catalog(controls: dict[str, ControlRecord], inventory: PointInventory,
     listed = set(inventory.controls)
     executions = {}
     for scenario in variants.scenarios.scenarios:
+        if scenario.name not in controls:
+            continue
         control = controls[scenario.name]
-        labels = [label for label in control.labels if label in listed]
+        labels = [label for label in control.labels if label in listed or repetitions.experiment(label) in listed]
         executions[scenario.name] = control_executions(
             [record for label in labels for record in repetitions.observations(label)], len(labels),
             len(tenant_names(control.workload.workload)), kinds, topology.upstream)
@@ -211,8 +283,10 @@ def judged(stitching: Stitching, edges: list[Edge], path_runs: list[tuple[Group,
     for group, members in path_runs:
         if group.workload.name not in controls:
             continue
+        if controls[group.workload.name].workload != group.workload:
+            raise ValueError(f"path group {group.digest} does not match its controls' workload")
         record = repetitions.group_records(group, controls[group.workload.name].labels,
-                                           [run.label for run in members])[0]
+                                           [run.identity for run in members])[0]
         records.append(record)
         requested += [Validation(chain=by_key[request.chain], selection=request.selection,
                                  workload=merged_workload(by_key[request.chain].condition, scenarios), record=record,
@@ -227,19 +301,20 @@ class FactGraph:
     only what the facts so far allow. Edges come only from the runs in load variants; the merged workloads only judge
     paths and measure headroom."""
 
-    def __init__(self, facts: Facts, settings: ComputeSettings) -> None:
+    def __init__(self, facts: Facts, settings: ComputeSettings, inventory: PointInventory) -> None:
         self.facts = facts
         self.settings = settings
-        self.topology = facts.latest(SystemTopology)
-        self.variants = facts.latest(LoadVariants)
+        declared = Facts(facts=tuple(fact for fact in facts.facts if fact.sequence <= inventory.sequence))
+        self.topology = declared.latest(SystemTopology)
+        self.variants = declared.latest(LoadVariants)
         self.kinds = KindTable.installed()
-        self.runs = [run for run in facts.standing_runs() if run.purpose != Purpose.NATURAL]
+        self.inventory = inventory
+        named = facts.inventory_controls(inventory)
+        self.context = named[0].context
+        self.runs = [run for run in facts.standing_runs() if run.purpose != Purpose.NATURAL
+                     and run.context == self.context]
         self.repetitions = FactRepetitions(self.runs, settings)
         self.controls = control_records(self.runs)
-
-    @cached_property
-    def inventory(self) -> PointInventory:
-        return self.facts.latest(PointInventory)
 
     @cached_property
     def catalog(self) -> Catalog:
@@ -328,5 +403,20 @@ class FactGraph:
             natural=self.natural)
 
 
-def compute_graph(facts: Facts, settings: ComputeSettings) -> PropagationGraph:
-    return FactGraph(facts, settings).graph()
+def compute_graph(facts: Facts, settings: ComputeSettings) -> PropagationGraphs:
+    return PropagationGraphs(settings=settings, through=facts.facts[-1].sequence if facts.facts else 0,
+        inventories=tuple(InventoryGraph(inventory=inventory.identity,
+            graph=FactGraph(facts, settings, inventory).graph()) for inventory in facts.inventories()))
+
+
+def print_graph() -> None:
+    parser = argparse.ArgumentParser(description="Compute every standing inventory's graph from its recorded evidence.")
+    parser.add_argument("facts", type=Path)
+    parser.add_argument("settings", type=Path)
+    arguments = parser.parse_args()
+    print(compute_graph(read_facts(arguments.facts), ComputeSettings.model_validate_json(
+        arguments.settings.read_bytes())).model_dump_json())
+
+
+def print_graph_schema() -> None:
+    print(json.dumps(PropagationGraphs.model_json_schema(), indent=2))

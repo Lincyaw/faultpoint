@@ -150,7 +150,7 @@ def validation_key(validation: Validation) -> tuple[str, str, str, bool, tuple[b
             tuple(hop.confirmed for hop in validation.hops))
 
 
-def graph_differences(graph: PropagationGraph, store: Store) -> list[str]:
+def graph_differences(graph: PropagationGraph, store: Store, facts: Facts) -> list[str]:
     """Every comparison of a computed graph with an experiment directory's records, one line each."""
     lines = []
 
@@ -158,12 +158,17 @@ def graph_differences(graph: PropagationGraph, store: Store) -> list[str]:
         lines.append(f"{'same' if same else 'DIFFERENT'}: {name}{f' ({detail})' if detail else ''}")
 
     compared("catalog", graph.catalog == store.load(Catalog, CATALOG))
-    controls = {control.workload.name: control for control in graph.controls}
+    experiments = {run.identity: run.label for run in facts.standing_runs()}
+    # Legacy directory records name experiments; graph evidence names immutable runs.
+    controls = {control.workload.name: control.model_copy(update={
+        "labels": tuple(experiments[identity] for identity in control.labels)}) for control in graph.controls}
     recorded_controls = {path.stem: store.load(ControlRecord, CONTROLS, path.name)
                          for path in sorted(store.path(CONTROLS).glob("*.json"))}
     compared("control records", controls == recorded_controls, f"{len(controls)} computed, {len(recorded_controls)} recorded")
     for name, records in (("treatment records", graph.records), ("path records", graph.path_records)):
-        differences = [record_difference(record, store.load(TreatmentRecord, TREATMENTS, record.workload,
+        differences = [record_difference(record.model_copy(update={
+            "labels": tuple(experiments[identity] for identity in record.labels)}),
+            store.load(TreatmentRecord, TREATMENTS, record.workload,
                                                             f"{record.fault.digest}.json")) for record in records]
         differing = [difference for difference in differences if difference.fields]
         fields = Counter(field for difference in differing for field in difference.fields)

@@ -11,8 +11,20 @@ from faultsearch.allocation import Phase
 from faultsearch.catalog import FROZEN, read_manifests
 from faultsearch.counterfactual import DEFAULT_SEED, NamedWorkload, Statuses
 from faultsearch.execution import RunRequest, repetition_seed
-from faultsearch.facts import (CONTROL_GROUP, FACT, Facts, NaturalPath, PathRequest, PointInventory, Purpose, SearchRun, canonical,
-                               read_facts, tallies)
+from faultsearch.facts import (
+    CONTROL_GROUP,
+    FACT,
+    Facts,
+    NaturalPath,
+    PathRequest,
+    PointInventory,
+    Purpose,
+    RunContext,
+    SearchRun,
+    canonical,
+    read_facts,
+    tallies,
+)
 
 RULES_FILE: Final = "rules.json"
 WORKLOAD_FILE: Final = "workload.json"
@@ -69,6 +81,11 @@ class RunOrigin(BaseModel):
     build: dict[str, JsonValue]
     environment: str
 
+    def context(self, deployment: dict[str, JsonValue]) -> RunContext:
+        return RunContext(source=self.source, system=self.system, revision=self.revision,
+                          sdk_build=self.sdk_build, build=self.build, deployment=deployment,
+                          environment=self.environment)
+
     def search_run(self, directory: Path, root: Path, sequence: int, workload: NamedWorkload, group: str, index: int,
                    purpose: Purpose, phases: tuple[Phase, ...], requests: tuple[PathRequest, ...],
                    natural: NaturalPath | None = None) -> SearchRun:
@@ -110,9 +127,7 @@ def lookup_repetition(facts: Facts, origin: RunOrigin, request: RunRequest, depl
     if not 0 <= index < request.repetitions:
         raise ValueError("the repetition index must be within the request")
     label = request.labels()[index]
-    matches = [run for run in facts.standing_runs() if run.label == label
-               and (run.source == origin.source if request.purpose == Purpose.NATURAL
-                    else run.purpose != Purpose.NATURAL)]
+    matches = [run for run in facts.standing_runs() if run.label == label and run.source == origin.source]
     if len(matches) > 1:
         raise ValueError(f"two search runs have the label {label}")
     through = facts.facts[-1].sequence if facts.facts else 0
@@ -134,8 +149,8 @@ def lookup_repetition(facts: Facts, origin: RunOrigin, request: RunRequest, depl
 def print_repetition_lookup() -> None:
     """Find a standing repetition with the requested execution inputs, or refuse a conflicting label.
 
-    Controls and injected runs have one label across sources. Natural checks keep their own source;
-    they do not enter edge comparisons. A matching run is reused under its actual recorded identity.
+    Repetitions belong to their source. A matching run is reused under its actual recorded identity;
+    conflicting execution inputs of that same identity are refused.
     """
     parser = argparse.ArgumentParser(description=print_repetition_lookup.__doc__)
     parser.add_argument("facts", type=Path, help="The current fact file.")
@@ -154,15 +169,29 @@ def point_inventory(facts: Facts, controls: tuple[str, ...], manifests: Path, co
     """The point inventory of the build the named control runs ran: the manifests of its rewriters, the points its
     deployment configures, and those runs, whose system, revision, SDK build and deployment it takes; control runs
     that disagree on them are an error."""
-    runs = {run.label: run for run in facts.standing_runs() if run.group == CONTROL_GROUP}
-    named = [runs[label] for label in controls]
-    builds = {(run.system, run.revision, run.sdk_build, canonical(run.deployment)) for run in named}
-    if len(builds) != 1:
-        raise ValueError(f"the control runs {controls} ran {len(builds)} builds or deployments, not one")
+    runs = [run for run in facts.standing_runs() if run.group == CONTROL_GROUP]
+    named = []
+    for reference in controls:
+        exact = [run for run in runs if run.identity == reference]
+        matches = exact or [run for run in runs if run.label == reference]
+        if len(matches) != 1:
+            raise ValueError(f"control {reference} resolves to {len(matches)} runs; name its recorded identity")
+        named.append(matches[0])
+    if not named or any(run.context != named[0].context for run in named):
+        raise ValueError(f"the control runs {controls} must share one execution context")
     first = named[0]
-    return PointInventory(sequence=sequence, system=first.system, revision=first.revision, sdk_build=first.sdk_build,
-                          deployment=first.deployment, controls=controls, manifests=read_manifests(manifests),
+    candidate = PointInventory(sequence=sequence, system=first.system, revision=first.revision, sdk_build=first.sdk_build,
+                          deployment=first.deployment, controls=tuple(run.identity for run in named), manifests=read_manifests(manifests),
                           configured=configured)
+    for inventory in facts.inventories():
+        if (inventory.system, inventory.revision, inventory.sdk_build, inventory.deployment) != (
+                candidate.system, candidate.revision, candidate.sdk_build, candidate.deployment):
+            continue
+        if tuple(run.identity for run in facts.inventory_controls(inventory)) == candidate.controls:
+            if (inventory.manifests, inventory.configured) != (candidate.manifests, candidate.configured):
+                raise ValueError(f"inventory {inventory.identity} already records different points for these controls")
+            return inventory.model_copy(update={"sequence": sequence})
+    return candidate
 
 
 def print_search_run() -> None:
@@ -190,7 +219,7 @@ def print_point_inventory() -> None:
     parser = argparse.ArgumentParser(description=print_point_inventory.__doc__)
     parser.add_argument("facts", type=Path, help="A fact file: one fact per line, in sequence order.")
     parser.add_argument("manifests", type=Path, help="The directory of the build's manifests.")
-    parser.add_argument("--control", action="append", required=True, help="A control run the step names, by label.")
+    parser.add_argument("--control", action="append", required=True, help="A recorded control identity; a legacy label must be unique.")
     parser.add_argument("--configured", action="append", default=[], help="A point the deployment configures.")
     parser.add_argument("--sequence", type=int, required=True, help="The fact's number.")
     arguments = parser.parse_args()
