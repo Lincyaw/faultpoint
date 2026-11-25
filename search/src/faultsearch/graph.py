@@ -32,8 +32,18 @@ from faultsearch.catalog import (
     point_manifests,
     point_scoped,
 )
-from faultsearch.chains import (CROSS_LAYER_KEPT, Chain, ChainWitness, Stitcher, Stitching, StitchSource, StitchSources,
-                                Witnesses, beam_search, ranked_chains)
+from faultsearch.chains import (
+    CROSS_LAYER_KEPT,
+    Chain,
+    ChainWitness,
+    Stitcher,
+    Stitching,
+    StitchSource,
+    StitchSources,
+    Witnesses,
+    beam_search,
+    ranked_chains,
+)
 from faultsearch.counterfactual import (
     ControlRecord,
     Group,
@@ -46,11 +56,11 @@ from faultsearch.edges import ERROR, Acceptance, Edge, EffectMap
 from faultsearch.evidence import MappingFeedback
 from faultsearch.facts import (
     CONTROL_GROUP,
-    Facts,
     Equivalence,
+    Facts,
     LoadVariants,
-    PointInventory,
     PathIdentity,
+    PointInventory,
     Purpose,
     SearchRun,
     SystemTopology,
@@ -474,8 +484,9 @@ class EquivalentGraphs:
         adjacency = coo_array((np.ones(len(pairs)), tuple(zip(*pairs, strict=True))),
                               shape=(len(references), len(references)))
         _, components = connected_components(adjacency, directed=False)
-        canonical = {int(component): min(reference for reference, group in zip(references, components, strict=True)
-                                         if group == component) for component in set(components)}
+        canonical: dict[int, tuple[str, str]] = {}
+        for reference, component in zip(references, components, strict=True):
+            canonical.setdefault(int(component), reference)
         return {reference: canonical[int(component)] for reference, component in zip(references, components, strict=True)}
 
     @cached_property
