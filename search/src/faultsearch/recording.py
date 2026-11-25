@@ -14,14 +14,18 @@ from faultsearch.execution import RunRequest, repetition_seed
 from faultsearch.facts import (
     CONTROL_GROUP,
     FACT,
+    Equivalence,
     Facts,
+    GitRevision,
     NaturalPath,
     PathRequest,
     PointInventory,
+    PointReference,
     Purpose,
     RunContext,
     SearchRun,
     canonical,
+    digest,
     read_facts,
     tallies,
 )
@@ -34,6 +38,8 @@ STATUSES_FILE: Final = "statuses.json"
 REFUSAL_FILE: Final = "refusal.txt"
 OBSERVATIONS: Final = "*.jsonl"
 PARAMETERS: Final = TypeAdapter(dict[str, JsonValue])
+PINNED_REVISION: Final = TypeAdapter(GitRevision)
+MANIFEST_IDENTITY_RULE: Final = "identical-pinned-build-and-manifest-entry"
 
 
 class RunFile(BaseModel):
@@ -192,6 +198,61 @@ def point_inventory(facts: Facts, controls: tuple[str, ...], manifests: Path, co
                 raise ValueError(f"inventory {inventory.identity} already records different points for these controls")
             return inventory.model_copy(update={"sequence": sequence})
     return candidate
+
+
+def manifest_equivalences(facts: Facts, left: str, right: str, sequence: int) -> tuple[Equivalence, ...]:
+    """Match unique manifest IDs in identical pinned recorded builds and complete manifests.
+
+    The rule binds both recorded execution context and complete manifest content. Configured and observed
+    points outside the manifests are not mapped, and the runs' measurements remain in their own contexts.
+    """
+    if left == right:
+        raise ValueError("manifest equivalences require two different inventories")
+    left_inventory, = [inventory for inventory in facts.inventories() if inventory.identity == left]
+    right_inventory, = [inventory for inventory in facts.inventories() if inventory.identity == right]
+    left_controls, right_controls = (facts.inventory_controls(inventory)
+                                     for inventory in (left_inventory, right_inventory))
+    voided = facts.voided()
+    if any(run.rules or run.refusal is not None or run.identity in voided for run in (*left_controls, *right_controls)):
+        raise ValueError("manifest equivalences require standing controls without interventions or refused rules")
+    context = left_controls[0].context.model_dump(mode="json", exclude={"source"})
+    if canonical(context) != canonical(right_controls[0].context.model_dump(mode="json", exclude={"source"})):
+        raise ValueError("the inventories have different recorded builds, deployments or environments")
+    PINNED_REVISION.validate_python(left_controls[0].revision)
+    PINNED_REVISION.validate_python(left_controls[0].sdk_build)
+    manifests = [manifest.model_dump(mode="json") for manifest in left_inventory.manifests]
+    if canonical(manifests) != canonical([manifest.model_dump(mode="json") for manifest in right_inventory.manifests]):
+        raise ValueError("the inventories have different complete manifests")
+    points = [point.id for manifest in left_inventory.manifests for point in manifest.points]
+    if len(points) != len(set(points)):
+        raise ValueError("the manifests do not give every point a unique identity")
+    rule = f"{MANIFEST_IDENTITY_RULE}:{digest(context)}:{digest(manifests)}"
+    return tuple(Equivalence(sequence=sequence + index,
+                            left=PointReference(inventory=left, point=point),
+                            right=PointReference(inventory=right, point=point), rule=rule)
+                 for index, point in enumerate(sorted(points)))
+
+
+def print_manifest_equivalences() -> None:
+    """Print one Equivalence fact per JSON line for identical pinned builds and complete manifests.
+
+    Both inventories must have the same recorded context except source, full Git revisions for the system
+    and SDK, and identical complete manifests with unique point IDs. Only manifest points are mapped.
+    Redirect stdout to facts.jsonl and normalize/import it with the target system's pinned faultsearch.
+
+    Examples:
+      faultsearch-manifest-equivalences facts.jsonl --left LEFT --right RIGHT --sequence 1
+      faultsearch-manifest-equivalences facts.jsonl --left LEFT --right RIGHT --sequence 1 > mappings/facts.jsonl
+    """
+    parser = argparse.ArgumentParser(description=print_manifest_equivalences.__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("facts", type=Path, help="Recorded facts, one JSON fact per line.")
+    parser.add_argument("--left", required=True, help="The first standing inventory's identity.")
+    parser.add_argument("--right", required=True, help="The second standing inventory's identity.")
+    parser.add_argument("--sequence", type=int, required=True, help="The first emitted fact's sequence number.")
+    arguments = parser.parse_args()
+    for fact in manifest_equivalences(read_facts(arguments.facts), arguments.left, arguments.right, arguments.sequence):
+        print(FACT.dump_json(fact).decode())
 
 
 def print_search_run() -> None:

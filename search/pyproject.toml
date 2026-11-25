@@ -29,6 +29,7 @@ faultsearch-lookup-repetition = "faultsearch.recording:print_repetition_lookup"
 faultsearch-run-origin-schema = "faultsearch.recording:print_origin_schema"
 faultsearch-run-directory = "faultsearch.recording:print_run_directory"
 faultsearch-point-inventory = "faultsearch.recording:print_point_inventory"
+faultsearch-manifest-equivalences = "faultsearch.recording:print_manifest_equivalences"
 
 [tool.uv.sources]
 faultpoint = { path = "../python", editable = true }
