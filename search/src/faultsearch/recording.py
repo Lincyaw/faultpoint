@@ -1,14 +1,24 @@
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Final
 
+from faultpoint.adapters.store import StoreKind
 from faultpoint.observations import ObservationRecord, read_records
 from faultpoint.rules import RuleSet
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from faultsearch.allocation import Phase
-from faultsearch.catalog import FROZEN, read_manifests
+from faultsearch.catalog import (
+    FROZEN,
+    RPC_CLIENT,
+    RPC_SERVER,
+    RpcPeers,
+    point_kind,
+    point_service,
+    read_manifests,
+)
 from faultsearch.counterfactual import DEFAULT_SEED, NamedWorkload, Statuses
 from faultsearch.execution import RunRequest, repetition_seed
 from faultsearch.facts import (
@@ -17,6 +27,7 @@ from faultsearch.facts import (
     Equivalence,
     Facts,
     GitRevision,
+    LoadVariants,
     NaturalPath,
     PathRequest,
     PointInventory,
@@ -24,6 +35,7 @@ from faultsearch.facts import (
     Purpose,
     RunContext,
     SearchRun,
+    SystemTopology,
     canonical,
     digest,
     read_facts,
@@ -40,6 +52,8 @@ OBSERVATIONS: Final = "*.jsonl"
 PARAMETERS: Final = TypeAdapter(dict[str, JsonValue])
 PINNED_REVISION: Final = TypeAdapter(GitRevision)
 MANIFEST_IDENTITY_RULE: Final = "identical-pinned-build-and-manifest-entry"
+ADAPTER_IDENTITY_RULE: Final = "identical-pinned-build-and-observed-adapter-boundary"
+ADAPTER_KINDS: Final = frozenset({RPC_CLIENT, RPC_SERVER, StoreKind.READ, StoreKind.WRITE})
 
 
 class RunFile(BaseModel):
@@ -200,21 +214,28 @@ def point_inventory(facts: Facts, controls: tuple[str, ...], manifests: Path, co
     return candidate
 
 
-def manifest_equivalences(facts: Facts, left: str, right: str, sequence: int) -> tuple[Equivalence, ...]:
-    """Match unique manifest IDs in identical pinned recorded builds and complete manifests.
+class InventoryBuildMatch(BaseModel):
+    model_config = FROZEN
 
-    The rule binds both recorded execution context and complete manifest content. Configured and observed
-    points outside the manifests are not mapped, and the runs' measurements remain in their own contexts.
-    """
+    left: PointInventory
+    right: PointInventory
+    left_controls: tuple[SearchRun, ...]
+    right_controls: tuple[SearchRun, ...]
+    context_digest: str
+    manifest_digest: str
+
+
+def inventory_build_match(facts: Facts, left: str, right: str) -> InventoryBuildMatch:
+    """Resolve standing inventories of one pinned recorded build and identical complete manifests."""
     if left == right:
-        raise ValueError("manifest equivalences require two different inventories")
+        raise ValueError("equivalences require two different inventories")
     left_inventory, = [inventory for inventory in facts.inventories() if inventory.identity == left]
     right_inventory, = [inventory for inventory in facts.inventories() if inventory.identity == right]
     left_controls, right_controls = (facts.inventory_controls(inventory)
                                      for inventory in (left_inventory, right_inventory))
     voided = facts.voided()
     if any(run.rules or run.refusal is not None or run.identity in voided for run in (*left_controls, *right_controls)):
-        raise ValueError("manifest equivalences require standing controls without interventions or refused rules")
+        raise ValueError("equivalences require standing controls without interventions or refused rules")
     context = left_controls[0].context.model_dump(mode="json", exclude={"source"})
     if canonical(context) != canonical(right_controls[0].context.model_dump(mode="json", exclude={"source"})):
         raise ValueError("the inventories have different recorded builds, deployments or environments")
@@ -226,11 +247,101 @@ def manifest_equivalences(facts: Facts, left: str, right: str, sequence: int) ->
     points = [point.id for manifest in left_inventory.manifests for point in manifest.points]
     if len(points) != len(set(points)):
         raise ValueError("the manifests do not give every point a unique identity")
-    rule = f"{MANIFEST_IDENTITY_RULE}:{digest(context)}:{digest(manifests)}"
+    return InventoryBuildMatch(left=left_inventory, right=right_inventory,
+        left_controls=left_controls, right_controls=right_controls,
+        context_digest=digest(context), manifest_digest=digest(manifests))
+
+
+def manifest_equivalences(facts: Facts, left: str, right: str, sequence: int) -> tuple[Equivalence, ...]:
+    """Match unique manifest IDs in identical pinned recorded builds and complete manifests.
+
+    The rule binds both recorded execution context and complete manifest content. Configured and observed
+    points outside the manifests are not mapped, and the runs' measurements remain in their own contexts.
+    """
+    matched = inventory_build_match(facts, left, right)
+    points = [point.id for manifest in matched.left.manifests for point in manifest.points]
+    rule = f"{MANIFEST_IDENTITY_RULE}:{matched.context_digest}:{matched.manifest_digest}"
     return tuple(Equivalence(sequence=sequence + index,
                             left=PointReference(inventory=left, point=point),
                             right=PointReference(inventory=right, point=point), rule=rule)
                  for index, point in enumerate(sorted(points)))
+
+
+class AdapterPoints(BaseModel):
+    model_config = FROZEN
+
+    owners: dict[str, frozenset[str]]
+
+
+def adapter_points(controls: tuple[SearchRun, ...]) -> AdapterPoints:
+    """The owners of scoped adapter boundaries the current healthy control windows actually executed."""
+    owners: dict[str, set[str]] = defaultdict(set)
+    for run in controls:
+        for tally in run.tallies:
+            if (tally.experiment == run.label and tally.rule is None and tally.count > 0 and tally.scope
+                    and point_kind(tally.point) in ADAPTER_KINDS):
+                owners[tally.point].add(tally.service)
+    return AdapterPoints(owners={point: frozenset(services) for point, services in owners.items()})
+
+
+def adapter_equivalences(facts: Facts, left: str, right: str, sequence: int) -> tuple[Equivalence, ...]:
+    """Match observed SDK adapter boundaries in identical immutable recorded builds without pooling measurements."""
+    matched = inventory_build_match(facts, left, right)
+    if not matched.left_controls[0].build:
+        raise ValueError("adapter equivalences require nonempty immutable recorded build metadata")
+    declared = tuple(Facts(facts=tuple(fact for fact in facts.facts if fact.sequence <= inventory.sequence))
+        for inventory in (matched.left, matched.right))
+    topologies = tuple(prefix.latest(SystemTopology) for prefix in declared)
+    variants = tuple(prefix.latest(LoadVariants) for prefix in declared)
+    workloads = tuple(sorted(canonical(run.workload.model_dump(mode="json")) for run in controls)
+        for controls in (matched.left_controls, matched.right_controls))
+    if (canonical(topologies[0].content()) != canonical(topologies[1].content())
+            or canonical(variants[0].content()) != canonical(variants[1].content()) or workloads[0] != workloads[1]):
+        raise ValueError("adapter equivalences require identical scoped topology, load variants and actual control workloads")
+    observed = tuple(adapter_points(controls) for controls in (matched.left_controls, matched.right_controls))
+    listed = {point.id for manifest in matched.left.manifests for point in manifest.points}
+    points = sorted((observed[0].owners.keys() & observed[1].owners.keys()) - listed)
+    peers = RpcPeers(ports=topologies[0].ports, hosts=topologies[0].hosts)
+    declaration = digest([topologies[0].content(), variants[0].content(), list(workloads[0])])
+    equivalences = []
+    for index, point in enumerate(points):
+        service = point_service(point)
+        if observed[0].owners[point] != {service} or observed[1].owners[point] != {service}:
+            raise ValueError(f"adapter point {point} has ambiguous or inconsistent observed owners")
+        peer = peers.server_point(point) if point_kind(point) == RPC_CLIENT else None
+        if point_kind(point) == RPC_CLIENT and peer is None:
+            raise ValueError(f"adapter client {point} has no explicit unambiguous peer")
+        boundary = digest([service, point, peer])
+        rule = (f"{ADAPTER_IDENTITY_RULE}:{matched.context_digest}:{matched.manifest_digest}:"
+                f"{declaration}:{boundary}")
+        equivalences.append(Equivalence(sequence=sequence + index,
+            left=PointReference(inventory=left, point=point), right=PointReference(inventory=right, point=point),
+            rule=rule))
+    return tuple(equivalences)
+
+
+def print_adapter_equivalences() -> None:
+    """Print Equivalence JSON lines for common scoped RPC and store boundaries in healthy control windows.
+
+    Both inventories require the same nonempty immutable recorded build, complete Git pins and manifests,
+    scoped topology, load variants and actual control workloads. The caller's build metadata identifies
+    the immutable binaries. Boundaries need unique matching observed owners; clients need a known peer.
+    Only rpc_client, rpc_server, store_read and store_write outside manifests are included. Configured-only,
+    preparation-only, injected, unscoped and nonpositive observations do not establish a boundary.
+
+    Examples:
+      faultsearch-adapter-equivalences facts.jsonl --left LEFT --right RIGHT --sequence 1
+      faultsearch-adapter-equivalences facts.jsonl --left LEFT --right RIGHT --sequence 1 > mappings/facts.jsonl
+    """
+    parser = argparse.ArgumentParser(description=print_adapter_equivalences.__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("facts", type=Path, help="Recorded facts, one JSON fact per line.")
+    parser.add_argument("--left", required=True, help="The first standing inventory's identity.")
+    parser.add_argument("--right", required=True, help="The second standing inventory's identity.")
+    parser.add_argument("--sequence", type=int, required=True, help="The first emitted fact's sequence number.")
+    arguments = parser.parse_args()
+    for fact in adapter_equivalences(read_facts(arguments.facts), arguments.left, arguments.right, arguments.sequence):
+        print(FACT.dump_json(fact).decode())
 
 
 def print_manifest_equivalences() -> None:
